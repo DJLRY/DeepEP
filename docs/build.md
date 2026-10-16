@@ -60,8 +60,9 @@ export DEEPEP_BUILD_MEGAMOE=ON
 SDK 的 `build.rdma_backend` 写入 `deepep-sdk.json`，构建缓存与 `--if-needed` 复用会校验该值。
 切换后端需要重新构建 SDK 和 wheel。MegaMoE 构建入口的等价命令是
 `bash experiments/megamoe/scripts/build.sh --rdma-backend XSCALE --rebuild-shmem`。
-用户代码只需 `ranks_per_node=16`；当前跨机范围为两机 EP32、W4A8、实际每卡 B=1～31，
-不增加 `transport` 参数。真实 NPU 精度、通信可见性与性能验证尚待完成，见 [MegaMoE 部署说明](../experiments/megamoe/README.md#3-多机测试)。
+用户代码只需 `ranks_per_node=16`；当前跨机范围为两机 EP32、W4A8（A8W4）或 A8W8、实际每卡 B=1～32，
+不增加 `transport` 参数。A8W8 使用 `mma_type="fp8xfp8"`，暂不支持共享专家和 timer；现有 benchmark 仍只测试 W4A8。
+真实 NPU 精度、通信可见性与性能验证尚待完成，见 [MegaMoE 部署说明](../experiments/megamoe/README.md#3-多机测试)。
 
 已有外部 SDK 时，加载 CANN 环境、设置 `DEEPEP_NPU_ARCH=Ascend950` 并安装 `requirements-build.txt` 后，跳过子模块准备和 SHMEM 构建，改用：
 

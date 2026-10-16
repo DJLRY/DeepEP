@@ -146,9 +146,10 @@ private:
             workspaceSize += static_cast<int64_t>(tilingData->aicNum) * INT_CACHELINE * SIZE_INT_32;
         }
 
-        if (UsesMteLayout(tilingData->topoType) && (tilingData->combineQuantMode != COMBINE_NO_QUANT ||
-                                                    tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4)) {
-            // A8W4 非量化 Combine：每个 slice 按首 M-group 独占一个 64B 计数槽。
+        if (UsesMteLayout(tilingData->topoType) &&
+            (tilingData->combineQuantMode != COMBINE_NO_QUANT ||
+             tilingData->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 || UseHierarchicalRoce(tilingData))) {
+            // Full-row Combine (W4A8 or hierarchical W8A8) owns one counter per slice's first M-group.
             // 用最大 M-group 数预留地址，避免跨 wave 复用槽而让快核提前放行旧 slice。
             // 本区仍位于连续 flag reset 范围内，每次算子调用统一清零；量化路径布局不变。
             gmm2ReadyPtr = base + workspaceSize;

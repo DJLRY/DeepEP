@@ -190,6 +190,13 @@ def weights():
     return prepared
 
 
+def fp8_weights():
+    return (
+        (Tensor(np.zeros((2, 512, 1024)), "float8_e4m3fn"), Tensor(np.full((2, 512, 16, 2), 127), "float8_e8m0fnu")),
+        (Tensor(np.zeros((2, 1024, 256)), "float8_e4m3fn"), Tensor(np.full((2, 1024, 4, 2), 127), "float8_e8m0fnu")),
+    )
+
+
 @pytest.mark.parametrize("bf16", [False, True])
 def test_public_workflow_output_stats_timer_and_preparation_reuse(backend, bf16):
     b = backend.buffer
@@ -451,25 +458,33 @@ def hierarchical_buffer(backend, *, size=32, mma_type="fp8xfp4"):
 
     group = StoreGroup(None, 0, size, prefix="hierarchical-api-test")
     group.all_gather = lambda value, stage: [value] * size
-    buffer = api.SymmBuffer(group, size * 2, 32, 2, 1024, 256, ranks_per_node=16, mma_type=mma_type)
+    buffer = api.SymmBuffer(group, size * 2, 33, 2, 1024, 256, ranks_per_node=16, mma_type=mma_type)
     buffer.topk_idx.data[:] = [0, size]
     buffer.topk_weights.data[:] = [0.4, 0.6]
     return buffer
 
 
-def test_hierarchical_sequence_survives_plan_recreation_and_old_epoch_wrap(backend):
-    b = hierarchical_buffer(backend)
+@pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8"])
+def test_hierarchical_sequence_survives_plan_recreation_and_old_epoch_wrap(backend, mma_type):
+    b = hierarchical_buffer(backend, mma_type=mma_type)
     assert b._runtime.ranks_per_node == 16 and b._hierarchical_roce
-    pairs = weights()
+    pairs = weights() if mma_type == "fp8xfp4" else fp8_weights()
     try:
         for sequence in range(1, 260):
-            bs = (1, 7, 31)[sequence % 3]
-            api.fp8_fp4_mega_moe(Tensor(np.zeros((bs, 1024)), "bfloat16"), *pairs, b)
+            bs = (1, 7, 31, 32)[sequence % 4]
+            api.mega_moe(
+                (b.x[:bs], b.x_sf[:bs]),
+                b.topk_idx[:bs],
+                b.topk_weights[:bs],
+                *pairs,
+                b,
+                out=Tensor(np.zeros((bs, 1024)), "bfloat16"),
+            )
             launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
             assert launch[-2] == sequence and b._sequence == sequence
             assert b._plan_bs == bs
-        with pytest.raises(ValueError, match=r"BS in \[1,31\]"):
-            b.prepare(32)
+        with pytest.raises(ValueError, match=r"BS in \[1,32\]"):
+            b.prepare(33)
         assert b._sequence == 259
     finally:
         b.destroy()
@@ -501,7 +516,7 @@ def test_hierarchical_launch_failure_and_sequence_exhaustion(backend, monkeypatc
         b.destroy()
 
 
-@pytest.mark.parametrize("size,mma_type", [(64, "fp8xfp4"), (32, "fp8xfp8")])
+@pytest.mark.parametrize("size,mma_type", [(64, "fp8xfp4"), (64, "fp8xfp8")])
 def test_hierarchical_unsupported_configuration_fails_collectively(backend, size, mma_type):
     with pytest.raises(ValueError, match="MTE\\+RoCE MegaMoE requires EP32"):
         hierarchical_buffer(backend, size=size, mma_type=mma_type)
@@ -517,3 +532,39 @@ def test_sixteen_rank_single_host_keeps_mte(backend):
         assert launch[-2] == 0 and b._sequence == 0
     finally:
         b.destroy()
+
+
+@pytest.mark.parametrize("bf16", [False, True])
+def test_hierarchical_a8w8_bs32_uses_fp8_weights_without_layout_conversion(backend, bf16):
+    b = hierarchical_buffer(backend, mma_type="fp8xfp8")
+    pairs = fp8_weights()
+    try:
+        b.prepare(32)
+        x = Tensor(np.ones((32, 1024)), "bfloat16") if bf16 else (b.x[:32], b.x_sf[:32])
+        out = Tensor(np.zeros((32, 1024)), "bfloat16")
+        y, stats = api.mega_moe(x, b.topk_idx[:32], b.topk_weights[:32], *pairs, b, out=out)
+        assert y is out and stats.shape == (2,)
+        launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
+        assert launch[4] is pairs[0][0] and launch[5] is pairs[1][0]
+        assert (launch[1] is None) == bf16
+        assert launch[-2] == 1
+        assert not any(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events)
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("protocol", [5, 6])
+def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypatch, protocol):
+    api._extension.cache_clear()
+    core = SimpleNamespace(create_megamoe_runtime=lambda: None)
+    extension = SimpleNamespace(api_protocol=protocol)
+    monkeypatch.setattr(api, "require_native", lambda _: core)
+    monkeypatch.setattr(api.importlib, "import_module", lambda _: extension)
+    try:
+        if protocol == 5:
+            with pytest.raises(RuntimeError, match="versions differ"):
+                api._extension()
+        else:
+            assert api._extension() is extension
+    finally:
+        api._extension.cache_clear()

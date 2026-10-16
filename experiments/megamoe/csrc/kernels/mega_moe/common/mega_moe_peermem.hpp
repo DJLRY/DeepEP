@@ -56,7 +56,7 @@ HOST_DEVICE bool UseHierarchicalRoce(const MegaMoeTilingData* t)
 
 constexpr uint32_t HIERARCHICAL_RANKS_PER_HOST = 16U;
 constexpr uint32_t HIERARCHICAL_WORLD_SIZE = 32U;
-constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 31U;
+constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 32U;
 constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
 constexpr uint32_t HIERARCHICAL_ROCE_UB_BYTES = 256U;
 
@@ -201,12 +201,15 @@ HOST_DEVICE int64_t CalcRailTopkIdsRecvSize(const MegaMoeTilingData* tilingData)
         ALIGN_512);
 }
 
-// Rail grouping follows the donor's eight-rank servers. A partial final server
-// falls back to direct routing; single-server EP2..8 is also supported.
+// Legacy MTE enables decode rails for W4A8. Hierarchical RoCE uses rails for
+// both W4A8 and W8A8; the grouping follows the selected physical host size.
 HOST_DEVICE bool UseDecodeRailRouting(const MegaMoeTilingData* t)
 {
     const int64_t ranksPerServer = RailServerSize(t);
-    return UsesMteLayout(t->topoType) && UseDecodeInputReady(t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4, t->bs) &&
+    const bool decode = UseHierarchicalRoce(t)
+                            ? t->bs <= HIERARCHICAL_MAX_TOKENS
+                            : UseDecodeInputReady(t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4, t->bs);
+    return UsesMteLayout(t->topoType) && decode &&
            (t->epWorldSize <= ranksPerServer || t->epWorldSize % ranksPerServer == 0) &&
            t->blockAivNum > CalcServerNum(t->epWorldSize, ranksPerServer);
 }

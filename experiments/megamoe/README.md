@@ -74,9 +74,9 @@ buffer = SymmBuffer(
 
 约束：EP=2～128，E 可整除 EP 且每卡最多 128 个路由专家；S=0～8；B=1～65536；
 H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(32,E)。
-下面的 16 卡跨机路径另限 EP32、W4A8 和实际 B=1～31。
+下面的 16 卡跨机路径另限 EP32、W4A8（A8W4）或 A8W8 和实际 B=1～32。
 各 rank 必须同序、同 B 调用；仅推理，不支持反向、空/不等长 B 或图捕获。
-`mma_type="fp8xfp8"` 是保留入口，不支持共享专家/timer；**下文 benchmark 固定测试 W4A8，不提供权重 dtype 开关**。
+`mma_type="fp8xfp8"` 使用 A8W8 路由专家，不支持共享专家/timer；**下文 benchmark 固定测试 W4A8，不提供权重 dtype 开关**。
 
 兼容入口 `mega_moe(x, ids, weights, w1, w2, buffer, ...)` 返回 `(y, per_call_counts)`。
 接口签名参照 DeepGEMM `78b6900`。本实现使用 int32 路由 ID、E8M0 输入 scale，
@@ -166,8 +166,9 @@ bash experiments/megamoe/scripts/build.sh --rdma-backend XSCALE --rebuild-shmem
 `ranks_per_node=0` 保留原有默认行为，不自动检测16卡平台。两机路径要求一台机器对应 rank 0～15、
 另一台对应 rank 16～31，gateway 配对为 `0↔16`、`1↔17`、…、`15↔31`。
 初始化会集体验证 Linux 主机身份、设备唯一性、rank 分组、SDK 后端及库身份；不匹配即报错。
-两机路径当前只接受 `mma_type="fp8xfp4"`（W4A8）、实际每卡 B=1～31；
-FP8 和内部量化的 BF16 输入均沿用原接口，容量可大于实际 B。B≥32、W8A8 及更多16卡主机暂不支持。
+两机路径支持 `mma_type="fp8xfp4"`（W4A8/A8W4）或 `"fp8xfp8"`（A8W8），实际每卡 B=1～32；
+FP8 和内部量化的 BF16 输入均沿用原接口，容量可大于实际 B。B>32 及更多16卡主机暂不支持。
+A8W8 当前只运行路由专家，`num_shared_experts` 必须为0，不能传入 timer。
 
 在两台已分配设备的机器上分别执行下列命令，只将 `NODE_RANK` 改为0或1。
 地址和端口是占位示例，需替换为实际配置；两台机器各启动16个进程：
@@ -183,25 +184,57 @@ torchrun --nnodes=2 --nproc-per-node=16 --node-rank="$NODE_RANK" \
 ```
 
 示例使用 B=17，并从 `LOCAL_WORLD_SIZE` 传入 `ranks_per_node=16`。它检查输出有限性，
-完整精度比较仍需 benchmark 的 CPU Golden。共享存储上先生成所需 case 的 Golden，再在两台机器启动：
+该 example 以及现有 benchmark 均固定使用 W4A8，没有 `--mma-type` 开关。
+W4A8 的完整精度比较需要 benchmark 的 CPU Golden。共享存储上先生成所需 case 的 Golden，再在两台机器启动：
 
 ```bash
 # 仅生成一次；参数须与后续 benchmark 完全一致。
 python -m deep_ep_experimental.megamoe.golden --config deepseek_v4_pro \
-  --bs-values 1,17,31 --ep-size 32 --ranks 0-31 --input bf16 --routing balanced \
+  --bs-values 1,17,31,32 --ep-size 32 --ranks 0-31 --input bf16 --routing balanced \
   --golden-dir /path/to/shared/golden
 
 # 每台机器分别运行，沿用上面的 MASTER_*、NODE_RANK 和 SHMEM 环境。
 torchrun --nnodes=2 --nproc-per-node=16 --node-rank="$NODE_RANK" \
   --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" --max-restarts=0 \
   --module deep_ep_experimental.megamoe.benchmark --config deepseek_v4_pro \
-  --bs-values 1,17,31 --mode accuracy --input bf16 --routing balanced \
+  --bs-values 1,17,31,32 --mode accuracy --input bf16 --routing balanced \
   --golden-dir /path/to/shared/golden --output-dir /path/to/new/accuracy-run
 ```
 
 性能测试将 `--mode accuracy` 改为 `--mode perf`，并选择新的输出目录；计时范围仍遵循下文说明。
 还应覆盖 FP8 输入、random/skewed 路由、S=0/1、重复调用及 B 切换。
 本分支的真实 CANN 编译、两机 NPU 精度、RDMA 到达可见性和性能验收仍待完成；CPU 测试不代表设备通过。
+
+A8W8 使用公开 `mega_moe` 接口。下面片段假定32个进程已设置各自 NPU、endpoint 和 `group`，
+模型已提供同一 NPU 上的连续输入、路由及原始 FP8 ND 权重：
+
+```python
+from deep_ep_experimental.megamoe import SymmBuffer, mega_moe, transform_weights_for_mega_moe
+
+B = 32
+# x_bf16: BF16 [B,H]；ids: int32 [B,K]；weights: FP32 [B,K]。
+# E 为全局路由专家数，L=E/32。
+# raw_w1: (FP8 E4M3 [L,2I,H], E8M0 [L,2I,H/64,2])。
+# raw_w2: (FP8 E4M3 [L,H,I], E8M0 [L,H,I/64,2])。
+buffer = SymmBuffer(
+    group, num_experts=E, num_max_tokens_per_rank=B, num_topk=K,
+    hidden=H, intermediate_hidden=I, num_shared_experts=0,
+    mma_type="fp8xfp8", ranks_per_node=16,
+)
+w1, w2 = transform_weights_for_mega_moe(raw_w1, raw_w2)
+buffer.topk_idx[:B].copy_(ids)
+buffer.topk_weights[:B].copy_(weights)
+buffer.validate_inputs(B, x=x_bf16)
+buffer.prepare(B)
+y, per_call_counts = mega_moe(
+    x_bf16, buffer.topk_idx[:B], buffer.topk_weights[:B], w1, w2, buffer,
+)
+# 所有 rank 成功完成后，同序销毁；异常通知/退出按 example.py 的处理方式。
+buffer.destroy()
+group.close()
+```
+
+A8W8 的完整数值与性能验证需使用匹配 FP8 权重的模型参考，不能将上述 W4A8 Golden 当作 A8W8 结果。
 
 ### 原有每机8卡：配置与启动
 

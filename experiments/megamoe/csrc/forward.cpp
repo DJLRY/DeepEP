@@ -134,9 +134,10 @@ uint64_t HostFlagElements(const MegaMoeTilingData& t)
         // Pairwise GMM2/combine publishes one sequence per AIC.
         count += static_cast<uint64_t>(t.aicNum) * MegaMoeImpl::INT_CACHELINE;
     }
-    if (MegaMoeImpl::UsesMteLayout(t.topoType) && (t.combineQuantMode != MegaMoeImpl::COMBINE_NO_QUANT ||
-                                                   t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4)) {
-        // Match WorkspaceInfo: the atomic A8W4 path owns one counter per M-group,
+    if (MegaMoeImpl::UsesMteLayout(t.topoType) &&
+        (t.combineQuantMode != MegaMoeImpl::COMBINE_NO_QUANT ||
+         t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 || MegaMoeImpl::UseHierarchicalRoce(&t))) {
+        // Match WorkspaceInfo: full-row Combine owns one counter per M-group,
         // while quantized Combine retains one ready slot per AIC.
         const uint64_t ready_slots_per_expert = t.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT
                                                     ? wave_slots
@@ -257,9 +258,9 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     t.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
     const bool hierarchical = ranks_per_node == MegaMoeImpl::HIERARCHICAL_RANKS_PER_HOST && world > ranks_per_node;
     t.topoType = hierarchical ? MegaMoeImpl::TOPO_TYPE_MTE_ROCE : MegaMoeImpl::TOPO_TYPE_MTE;
-    TORCH_CHECK(!hierarchical || (world == MegaMoeImpl::HIERARCHICAL_WORLD_SIZE && is_a8w4 &&
-                                  bs <= MegaMoeImpl::HIERARCHICAL_MAX_TOKENS),
-                "MTE+RoCE MegaMoE requires two 16-rank hosts, FP8xFP4 and BS in [1,31]");
+    TORCH_CHECK(
+        !hierarchical || (world == MegaMoeImpl::HIERARCHICAL_WORLD_SIZE && bs <= MegaMoeImpl::HIERARCHICAL_MAX_TOKENS),
+        "MTE+RoCE MegaMoE requires two 16-rank hosts and BS in [1,32]");
 #ifndef DEEPEP_MEGAMOE_ROCE
     TORCH_CHECK(!hierarchical, "Rebuild MegaMoE with a RoCE-enabled SHMEM SDK (XSCALE or HNS_1825)");
 #endif

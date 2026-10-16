@@ -164,7 +164,7 @@ class CombineMessages:
         return result
 
 
-@pytest.mark.parametrize("bs", [1, 2, 7, 31])
+@pytest.mark.parametrize("bs", [1, 2, 7, 31, 32])
 @pytest.mark.parametrize("topk", [1, 8, 32])
 @pytest.mark.parametrize("pattern", ["local", "remote", "mixed", "duplicate-rank"])
 def test_hierarchical_messages_match_direct_routing(bs, topk, pattern):
@@ -237,6 +237,45 @@ def test_late_rows_do_not_block_ready_runs_or_merge_over_holes():
     assert [run for _, source, run in model.puts if source == 5][-2:] == [(5,), (2,)]
 
 
+def test_token_31_and_topk_31_preserve_dispatch_and_combine_payloads():
+    # Only the last route crosses hosts. The independent route model must retain
+    # its source/token identity; the production path represents these two
+    # coordinates with the high bits of separate uint32 masks.
+    ids = routing(32, 32, "local")
+    for source in range(WORLD):
+        ids[source, 31, 31] = pair(source) * EXPERTS_PER_RANK + 31
+    records = input_records(32, seed=3131)
+    transfers, consumers = hierarchical_dispatch(ids, records)
+    assert transfers == {(source, 31, 1 - host(source)) for source in range(WORLD)}
+    assert consumers == {(owner, expert, key): records[key[:2]] for key, owner, expert in routes(ids)}
+
+    model = CombineMessages(ids, sequence=3131)
+    expected_remote = {(source, 31, 31) for source in range(WORLD)}
+    assert model.pending == expected_remote
+    assert model.poll() == 0
+    last_rows = {}
+    # Delay source rank31's final contribution while all other gateways progress.
+    for source in range(WORLD - 1):
+        row = bf16(np.array([source + 0.25, -source - 0.5], np.float32))
+        last_rows[source] = row
+        model.produce((source, 31, 31), row)
+    assert model.poll() == WORLD - 1
+    assert model.pending == {(31, 31, 31)}
+    assert all(run == (1023,) for _, _, run in model.puts)
+    model.network_progress(random.Random(3131))
+    assert (31, 31, 31) not in model.inbox
+    assert model.poll() == 0
+    last_rows[31] = bf16(np.array([31.25, -31.5], np.float32))
+    model.produce((31, 31, 31), last_rows[31])
+    assert model.poll() == 1
+    model.network_progress(random.Random(31))
+    assert not model.pending
+    assert len(model.puts) == WORLD
+    for source, row in last_rows.items():
+        assert model.inbox[source, 31, 31] == (row.view(np.uint32) >> 16).astype(np.uint16).tobytes()
+    assert model.poll() == 0  # the high-bit row must not be retransmitted
+
+
 def test_fp32_source_accumulation_keeps_topk_order():
     ids = routing(1, 8, "mixed")
     model = CombineMessages(ids, 9)
@@ -254,10 +293,16 @@ def test_fp32_source_accumulation_keeps_topk_order():
 def test_repeated_calls_ignore_old_epoch_after_legacy_marker_wrap():
     memory = PersistentGatewayMemory()
     scheduler = random.Random(83)
-    calls = [(31, 1, "remote"), (1, 128, "local"), (7, 129, "mixed"), (2, 256, "remote"), (31, 257, "duplicate-rank")]
-    assert ((calls[0][1] & 127) | 128) == ((calls[-1][1] & 127) | 128)
-    for bs, sequence, pattern in calls:
-        ids = routing(bs, 8, pattern)
+    calls = [
+        (32, 32, 1, "remote"),
+        (1, 32, 128, "local"),
+        (7, 8, 129, "mixed"),
+        (2, 32, 256, "remote"),
+        (32, 32, 257, "duplicate-rank"),
+    ]
+    assert ((calls[0][2] & 127) | 128) == ((calls[-1][2] & 127) | 128)
+    for bs, topk, sequence, pattern in calls:
+        ids = routing(bs, topk, pattern)
         model = CombineMessages(ids, sequence, memory)
         assert model.poll() == 0  # stale flags/rows from prior shapes cannot satisfy this call
         value = bf16(np.array([sequence, -sequence, bs], np.float32))
@@ -267,7 +312,7 @@ def test_repeated_calls_ignore_old_epoch_after_legacy_marker_wrap():
             model.produce(key, value)
         model.poll()
         model.network_progress(scheduler)
-        output = model.source_results(np.full(ids.shape, 0.125, np.float32))
+        output = model.source_results(np.full(ids.shape, 1 / topk, np.float32))
         np.testing.assert_array_equal(output, np.broadcast_to(value, output.shape))
 
 
@@ -342,3 +387,185 @@ def test_every_expert_source_pair_uses_only_local_mte_then_paired_rdma():
             assert host(mte_destination) == host(owner)
             if mte_destination != source:
                 assert pair(mte_destination) == source
+
+
+def a8w8_gmm2_assignments(tile_count, aic_count, start_block):
+    """RunGmm2Generic/Gmm2AicMmadGeneric's cyclic tile ownership.
+
+    Empty ranges model HandleWaveProblemWithoutWork: those AICs advance their
+    cursor without reaching NotifyTokenCombineSliceReady.
+    """
+    return {
+        aic: tuple(range((aic + aic_count - start_block) % aic_count, tile_count, aic_count))
+        for aic in range(aic_count)
+    }
+
+
+class FullRowSliceCompletion:
+    """Opaque tile payloads plus FIX completion and one notification per AIC.
+
+    This models the dependency contract of NotifyTokenCombineSliceReady and
+    SendHierarchicalCombineSlice, not Cube arithmetic or hardware atomics.
+    """
+
+    def __init__(self, assignments, coordinates, required_producers):
+        self.assignments = assignments
+        self.coordinates = coordinates
+        self.required_producers = required_producers
+        self.visible = {}
+        self.notified = set()
+
+    def complete_fix(self, aic, tile):
+        assert tile in self.assignments[aic]
+        assert tile not in self.visible
+        self.visible[tile] = self.coordinates[tile]
+
+    def notify(self, aic):
+        assert self.assignments[aic], "idle AIC must not increment the ready counter"
+        assert aic not in self.notified, "one notification per producer, not per tile"
+        assert set(self.assignments[aic]) <= self.visible.keys(), "FIX writes must finish before notifying"
+        self.notified.add(aic)
+
+    def ready(self):
+        return len(self.notified) == self.required_producers
+
+    def send_rows(self):
+        assert self.ready()
+        return set(self.visible.values())
+
+
+@pytest.mark.parametrize("aic_count", [24, 32, 36])
+@pytest.mark.parametrize("rows", [1, 32, 255, 256, 257, 1024])
+@pytest.mark.parametrize("width", [1024, 1088, 8192])
+def test_a8w8_full_row_ready_counts_only_producers_after_every_n_tile(aic_count, rows, width):
+    row_groups = tuple(range(0, rows, 256))
+    column_tiles = tuple(range(0, width, 256))
+    required = {(m, n) for m in row_groups for n in column_tiles}
+    producer_count = min(((rows + 255) // 256) * ((width + 255) // 256), aic_count)
+    for start_block in range(aic_count):
+        assignments = a8w8_gmm2_assignments(len(required), aic_count, start_block)
+        participants = {aic for aic, tiles in assignments.items() if tiles}
+        assert len(participants) == producer_count
+        ownership = Counter(tile for tiles in assignments.values() for tile in tiles)
+        assert ownership == Counter({tile: 1 for tile in range(len(required))})
+        # Independent inverse check: advancing around the physical AIC ring once
+        # per tile must recover exactly the owners found by the strided loops.
+        for aic, tiles in assignments.items():
+            assert all((tile + start_block) % aic_count == aic for tile in tiles)
+
+        scheduler = random.Random(aic_count * 100000 + rows * 100 + width + start_block)
+        coordinates = sorted(required)
+        # Producer counting depends on coverage, not CATLASS's tile swizzle.
+        # Exercise arbitrary bijections from scheduled IDs to M/N coordinates.
+        scheduler.shuffle(coordinates)
+        model = FullRowSliceCompletion(assignments, coordinates, producer_count)
+        delayed = coordinates.index((row_groups[-1], column_tiles[-1]))
+        delayed_owner = next(aic for aic, tiles in assignments.items() if delayed in tiles)
+        completions = [(aic, tile) for aic, tiles in assignments.items() for tile in tiles if tile != delayed]
+        scheduler.shuffle(completions)
+        for aic, tile in completions:
+            model.complete_fix(aic, tile)
+            if aic != delayed_owner and aic not in model.notified and set(assignments[aic]) <= model.visible.keys():
+                model.notify(aic)
+            assert not model.ready()
+        for idle in set(assignments) - participants:
+            with pytest.raises(AssertionError, match="idle AIC"):
+                model.notify(idle)
+        assert len(model.notified) == producer_count - 1
+        assert set(model.visible.values()) == required - {(row_groups[-1], column_tiles[-1])}
+        with pytest.raises(AssertionError, match="FIX writes"):
+            model.notify(delayed_owner)
+        with pytest.raises(AssertionError):
+            model.send_rows()
+
+        model.complete_fix(delayed_owner, delayed)
+        assert not model.ready()  # tile visibility alone does not publish the counter
+        model.notify(delayed_owner)
+        assert model.ready()
+        assert model.send_rows() == required
+        for m in row_groups:
+            arrived_columns = {n for row, n in model.send_rows() if row == m}
+            assert arrived_columns == set(column_tiles)
+            # H1088 ends in a 64-column N tile. That producer is required even
+            # though the tile is not full; the valid full-row payload ends at H.
+            valid_columns = [column for n in arrived_columns for column in range(n, min(n + 256, width))]
+            assert Counter(valid_columns) == Counter(range(width))
+            assert max(valid_columns) == width - 1
+        with pytest.raises(AssertionError, match="one notification"):
+            model.notify(delayed_owner)
+
+
+def a8w8_qp_phase_dependencies(rank, *, combine_owner=1, handoff_barrier=True):
+    """Phase/resource model for Process, TryProgressRemoteCombine and final drain."""
+    dispatch_owner = 1 - host(rank)
+    graph = {
+        "quantized-input": set(),
+        "dispatch-put": {"quantized-input"},
+        "dispatch-payload-quiet": {"dispatch-put"},
+        "dispatch-commit": {"dispatch-payload-quiet"},
+        "dispatch-commit-quiet": {"dispatch-commit"},
+        "incoming-commit": set(),
+        "dispatch-receive": {"dispatch-commit-quiet", "incoming-commit"},
+        "input-finish-aiv0": set(),
+        "input-finish-aiv1": set(),
+        "all-core-input-barrier": {"dispatch-receive", "input-finish-aiv0", "input-finish-aiv1"},
+        "aic-fix-next-wave-aiv0": {"all-core-input-barrier"},
+        "combine-progress": {"all-core-input-barrier"} if handoff_barrier else set(),
+        "local-producers-finished": {"combine-progress", "aic-fix-next-wave-aiv0"},
+        "host-finish-barrier": {"local-producers-finished"},
+        "combine-final-drain": {"host-finish-barrier"},
+        "combine-payload-quiet": {"combine-final-drain"},
+        "combine-commit": {"combine-payload-quiet"},
+        "combine-commit-quiet": {"combine-commit"},
+    }
+    actions = {}
+    for event in (
+        "dispatch-put",
+        "dispatch-payload-quiet",
+        "dispatch-commit",
+        "dispatch-commit-quiet",
+        "combine-progress",
+        "combine-final-drain",
+        "combine-payload-quiet",
+        "combine-commit",
+        "combine-commit-quiet",
+    ):
+        owner = dispatch_owner if event.startswith("dispatch-") else combine_owner
+        actions[event] = owner, {"qp1", "cq1", ("ub-tail", owner), ("event7", owner)}
+    actions["aic-fix-next-wave-aiv0"] = "aic", {("ub-tail", 0)}
+    return graph, actions
+
+
+def unordered_resource_conflicts(graph, actions):
+    events = list(actions)
+    return {
+        (left, right)
+        for index, left in enumerate(events)
+        for right in events[index + 1 :]
+        if actions[left][1] & actions[right][1]
+        and left not in ancestors(graph, right)
+        and right not in ancestors(graph, left)
+    }
+
+
+@pytest.mark.parametrize("rank", [0, 15, 16, 31])
+def test_a8w8_qp_handoff_and_aiv1_scratch_allow_next_wave_fix_overlap(rank):
+    graph, actions = a8w8_qp_phase_dependencies(rank)
+    assert actions["dispatch-put"][0] == 1 - host(rank)
+    assert all(actions[event][0] == 1 for event in actions if event.startswith("combine-"))
+    assert "dispatch-commit-quiet" in ancestors(graph, "combine-progress")
+    assert "all-core-input-barrier" in ancestors(graph, "combine-progress")
+    assert "host-finish-barrier" in ancestors(graph, "combine-final-drain")
+    assert "combine-commit-quiet" not in ancestors(graph, "combine-progress")
+    assert not unordered_resource_conflicts(graph, actions)
+    # FIX may continue on AIV0's UB while the communication owner progresses.
+    # Neither action must wait for the other, and their resources must be disjoint.
+    assert "aic-fix-next-wave-aiv0" not in ancestors(graph, "combine-progress")
+    assert "combine-progress" not in ancestors(graph, "aic-fix-next-wave-aiv0")
+    assert actions["aic-fix-next-wave-aiv0"][1].isdisjoint(actions["combine-progress"][1])
+
+    missing_barrier = a8w8_qp_phase_dependencies(rank, handoff_barrier=False)
+    assert unordered_resource_conflicts(*missing_barrier)
+    if host(rank) == 1:
+        old_owner = a8w8_qp_phase_dependencies(rank, combine_owner=1 - host(rank))
+        assert ("combine-progress", "aic-fix-next-wave-aiv0") in unordered_resource_conflicts(*old_owner)

@@ -31,7 +31,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 5:
+    if getattr(extension, "api_protocol", None) != 6:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -110,8 +110,8 @@ class SymmBuffer:
             if ranks_per_node and size % ranks_per_node:
                 raise ValueError("ranks_per_node must divide EP (contiguous node-major ranks)")
             if ranks_per_node == 16 and size > 16:
-                if size != 32 or mma_type != "fp8xfp4":
-                    raise ValueError("MTE+RoCE MegaMoE requires EP32 on two 16-rank hosts and FP8xFP4 weights")
+                if size != 32:
+                    raise ValueError("MTE+RoCE MegaMoE requires EP32 on two 16-rank hosts")
         except (TypeError, ValueError) as failure:
             error = str(failure)
         # 在进入 SHMEM 之前共同校验布局，不能各 rank 各自选择通信偏移。
@@ -174,8 +174,8 @@ class SymmBuffer:
 
     def _prepare(self, bs):
         integer("BS", bs, 1, self.num_max_tokens_per_rank)
-        if self._hierarchical_roce and bs >= 32:
-            raise ValueError("MTE+RoCE MegaMoE currently supports decode BS in [1,31]")
+        if self._hierarchical_roce and bs > 32:
+            raise ValueError("MTE+RoCE MegaMoE currently supports decode BS in [1,32]")
         if self._plan_bs == bs:
             return
         # 只保留当前 BS 的计划，不让不同 BS 的最坏容量 workspace 累积占满 HBM。
