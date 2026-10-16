@@ -50,7 +50,9 @@ def source_patches(source):
     return [{"kind": "local-worktree", "sha256": digest.hexdigest()}]
 
 
-def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=False):
+def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=False, rdma_backend="NONE"):
+    if rdma_backend not in {"NONE", "XSCALE", "HNS_1825"}:
+        raise ValueError("rdma_backend must be NONE, XSCALE or HNS_1825")
     if platform.system() != "Linux":
         raise RuntimeError("SHMEM compilation requires Linux and the pinned CANN SDK")
     root = Path(root).resolve()
@@ -94,8 +96,12 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
             "cann_timestamp": version.get("timestamp", "unknown"),
             "target": lock["target"],
             "source_patches": patches,
+            "rdma_backend": rdma_backend,
         }
-        if identity.get("revision") != revision or identity.get("build") != expected_build:
+        # SDKs recorded before the RoCE option are MTE-only builds.
+        recorded_build = dict(identity.get("build", {}))
+        recorded_build.setdefault("rdma_backend", "NONE")
+        if identity.get("revision") != revision or recorded_build != expected_build:
             raise RuntimeError(
                 "Existing SHMEM build identity changed; stop SDK users and rebuild explicitly "
                 "with --rebuild (cluster launcher: --rebuild-shmem)"
@@ -114,7 +120,9 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
             "SHMEM build/install already exists; reuse its SDK, or stop users of that SDK "
             "and pass --rebuild to regenerate it (then rebuild dependent wheels)"
         )
-    print(f"[SHMEM] source={revision} CANN={version['Version']} target={lock['target']}", flush=True)
+    print(
+        f"[SHMEM] source={revision} CANN={version['Version']} target={lock['target']} RDMA={rdma_backend}", flush=True
+    )
     if patches:
         print(f"[SHMEM] Building local source modifications: {json.dumps(patches)}", flush=True)
     git_executable = shutil.which("git")
@@ -131,8 +139,11 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
         build_env = dict(os.environ, CMAKE_BUILD_PARALLEL_LEVEL=jobs)
         build_env["PATH"] = git_dir + os.pathsep + build_env.get("PATH", os.defpath)
         # -e 防止上游中间命令失败后继续打包，随后误登记旧库为成功产物。
+        command = ["bash", "-e", "scripts/build.sh", "-soc_type", lock["target"]]
+        if rdma_backend != "NONE":
+            command.extend(["-enable_rdma", "-rdma_backend", rdma_backend])
         subprocess.run(
-            ["bash", "-e", "scripts/build.sh", "-soc_type", lock["target"]],
+            command,
             cwd=source,
             env=build_env,
             check=True,
@@ -148,6 +159,7 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
             "cann_timestamp": version.get("timestamp", "unknown"),
             "target": lock["target"],
             "source_patches": patches,
+            "rdma_backend": rdma_backend,
         },
     )
     print(f"[SHMEM] SDK identity: {manifest}", flush=True)
@@ -160,9 +172,20 @@ if __name__ == "__main__":
     parser.add_argument("--rebuild", action="store_true", help="Regenerate this submodule's build/install artifacts")
     parser.add_argument("--if-needed", action="store_true", help="Reuse a verified SDK from this CANN build")
     parser.add_argument(
+        "--rdma-backend",
+        choices=("NONE", "XSCALE", "HNS_1825"),
+        default="NONE",
+        help="Build the selected Ascend950 RoCE NIC backend (default: MTE-only SDK)",
+    )
+    parser.add_argument(
         "--allow-local-changes",
         action="store_true",
         help="Build local edits on the pinned commit and record their source fingerprint",
     )
     args = parser.parse_args()
-    prepare(rebuild=args.rebuild, if_needed=args.if_needed, allow_local_changes=args.allow_local_changes)
+    prepare(
+        rebuild=args.rebuild,
+        if_needed=args.if_needed,
+        allow_local_changes=args.allow_local_changes,
+        rdma_backend=args.rdma_backend,
+    )

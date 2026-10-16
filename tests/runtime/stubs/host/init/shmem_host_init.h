@@ -7,6 +7,7 @@ constexpr int ACLSHMEM_MAX_IP_PORT_LEN = 64;
 constexpr int ACLSHMEM_STATUS_NOT_INITIALIZED = 0;
 constexpr int ACLSHMEM_DATA_OP_MTE = 1;
 constexpr int ACLSHMEM_DATA_OP_UDMA = 8;
+constexpr int ACLSHMEM_DATA_OP_ROCE = 2;
 using data_op_engine_type_t = int;
 constexpr int ACLSHMEMX_INIT_WITH_DEFAULT = 1;
 constexpr int ACLSHMEMX_INIT_WITH_MPI = 2;

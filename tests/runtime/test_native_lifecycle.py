@@ -11,8 +11,8 @@ import sys
 import pytest
 
 
-@pytest.fixture(scope="module")
-def lifecycle_binary(tmp_path_factory):
+@pytest.fixture(scope="module", params=[False, True], ids=["mte-sdk", "roce-sdk"])
+def lifecycle_binary(tmp_path_factory, request):
     root = Path(__file__).resolve().parents[2]
     compiler = shutil.which("g++")
     if sys.platform != "linux" or compiler is None or not (root / "csrc").is_dir():
@@ -26,6 +26,7 @@ def lifecycle_binary(tmp_path_factory):
             "-Wextra",
             "-Werror",
             "-O2",
+            *(["-DDEEPEP_MEGAMOE_ROCE=1"] if request.param else []),
             "-I" + str(root / "tests/runtime/stubs"),
             "-I" + str(root / "csrc"),
             str(root / "csrc/runtime/session.cpp"),
@@ -54,6 +55,7 @@ def lifecycle_binary(tmp_path_factory):
         "normal",
         "udma",
         "megamoe",
+        "megamoe-roce",
         "low-latency",
         "ll-rank-bias-16",
         "ll-rank-bias-32",

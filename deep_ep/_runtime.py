@@ -79,6 +79,7 @@ class Runtime:
         world_size=None,
         bootstrap="default",
         combine_only=False,
+        ranks_per_node=0,
     ):
         global _OWNER
         native = require_native("Runtime.__init__")
@@ -109,7 +110,7 @@ class Runtime:
         self.bootstrap = bootstrap
         store_group = self._megamoe and isinstance(group, StoreGroup)
         if self._megamoe and (group is None or udma):
-            raise ValueError("MegaMoE requires a ProcessGroup or StoreGroup and the MTE runtime")
+            raise ValueError("MegaMoE requires a ProcessGroup or StoreGroup and its dedicated runtime")
         if store_group:
             if rank is not None or world_size is not None:
                 raise ValueError("Pass either group or rank/world_size, not both")
@@ -119,6 +120,7 @@ class Runtime:
         factory = native.Runtime
         if self._megamoe:
             integer("world_size", size, 2, 128)
+            integer("ranks_per_node", ranks_per_node, 0, size)
             factory = getattr(native, "create_megamoe_runtime", None)
             if factory is None:
                 raise RuntimeError("Rebuild with DEEPEP_BUILD_MEGAMOE=ON")
@@ -127,6 +129,7 @@ class Runtime:
 
             if size not in WORLD_SIZES:
                 raise ValueError("Runtime supports EP2/4/8/16/32/64/128/256/512")
+        self.use_roce = self._megamoe and ranks_per_node == 16 and size > 16
         if group is not None and not store_group:
             import torch
             import torch.distributed as dist
@@ -158,9 +161,13 @@ class Runtime:
                             digest(host_id) if host_id else 0,
                             digest(os.environ.get("ASCEND_RT_VISIBLE_DEVICES", "")),
                             self.device,
+                            ranks_per_node,
+                            {"XSCALE": 1, "HNS_1825": 2}.get(getattr(native, "shmem_rdma_backend", "NONE"), 0)
+                            if getattr(native, "shmem_sdk_matches", False)
+                            else 0,
                         ]
                     )
-                local_values.append(int(udma) + 2 * int(combine_only) + 4 * int(dense_qps))
+                local_values.append(int(udma) + 2 * int(combine_only) + 4 * int(dense_qps) + 8 * int(self.use_roce))
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
                 else:
@@ -175,8 +182,10 @@ class Runtime:
                 if any(value[:3] != values[0][:3] for value in values):
                     raise ValueError("Ranks disagree on workspace capacity, timeout or bootstrap endpoint")
                 if any(value[-1] != values[0][-1] for value in values):
-                    raise ValueError("Ranks disagree on MTE/URMA runtime engines or QP configuration")
+                    raise ValueError("Ranks disagree on MTE/URMA/RoCE runtime engines or QP configuration")
                 if self._megamoe:
+                    if any(value[7] != values[0][7] for value in values):
+                        raise ValueError("Ranks disagree on ranks_per_node")
                     invalid_hosts = [i for i, value in enumerate(values) if value[4] == 0]
                     if invalid_hosts:
                         raise RuntimeError(
@@ -197,6 +206,21 @@ class Runtime:
                                 f"{peer_rank} use local device {value[6]} on the same Linux host"
                             )
                         devices[key] = peer_rank
+                    if ranks_per_node == 16:
+                        if size not in (16, 32):
+                            raise ValueError("MegaMoE with ranks_per_node=16 supports EP16 or two-host EP32")
+                        host_ranks = [[i for i, value in enumerate(values) if value[4] == host] for host in hosts]
+                        expected = [list(range(start, start + 16)) for start in range(0, size, 16)]
+                        if sorted(host_ranks) != expected:
+                            raise ValueError("ranks_per_node=16 requires contiguous groups of 16 ranks per Linux host")
+                    if self.use_roce:
+                        if any(value[8] == 0 for value in values):
+                            raise RuntimeError(
+                                "MegaMoE cross-host ranks_per_node=16 requires an XSCALE or HNS_1825 SHMEM SDK "
+                                "matching the wheel; rebuild SHMEM with --rdma-backend and rebuild the wheel"
+                            )
+                        if any(value[8] != values[0][8] for value in values):
+                            raise ValueError("Ranks disagree on SHMEM RDMA backend")
             self.rank, self.world_size = rank, size
             self.capacity = capacity
             self.notify_lock = threading.RLock()
@@ -211,6 +235,8 @@ class Runtime:
                 else (
                     native.Runtime(rank, size, capacity, address, timeout, udma)
                     if udma
+                    else factory(rank, size, capacity, address, timeout, True)
+                    if self.use_roce
                     else factory(rank, size, capacity, address, timeout)
                 )
             )

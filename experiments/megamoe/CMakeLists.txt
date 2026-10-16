@@ -37,6 +37,9 @@ set(kernel_flags
     -DCATLASS_ARCH=3510 -DASCEND_DEEPEP_DIRECT_TENSOR_INPUT=1
     -DASCEND_DEEPEP_DISABLE_MEGA_MOE_EXCEPTION_DUMP=1 -DENABLE_TENSOR_API
     -DNOT_DYNAMIC_COMPILE -DHIGH_PERFORMANCE=1 -DDETERMINISTIC_MODE=0 -DL2_CACHE_HINT)
+if(NOT DEEPEP_SHMEM_RDMA_BACKEND STREQUAL "NONE")
+    list(APPEND kernel_flags -DDEEPEP_MEGAMOE_ROCE=1 "-DACLSHMEMI_RDMA_K_BACKEND_${DEEPEP_SHMEM_RDMA_BACKEND}=1")
+endif()
 if(DEEPEP_MEGAMOE_TIMER)
     list(APPEND kernel_flags -DDEEPEP_MEGAMOE_TIMER=1)
 endif()
@@ -68,6 +71,10 @@ target_include_directories(megamoe_ext PRIVATE ${beta_include} ${TORCH_INCLUDE_D
 separate_arguments(torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 target_compile_options(megamoe_ext PRIVATE ${torch_flags} -O2 -fstack-protector-strong)
 target_compile_definitions(megamoe_ext PRIVATE CATLASS_ARCH=3510)
+if(NOT DEEPEP_SHMEM_RDMA_BACKEND STREQUAL "NONE")
+    target_compile_definitions(megamoe_ext PRIVATE DEEPEP_MEGAMOE_ROCE=1
+        "ACLSHMEMI_RDMA_K_BACKEND_${DEEPEP_SHMEM_RDMA_BACKEND}=1")
+endif()
 if(DEEPEP_MEGAMOE_TIMER)
     target_compile_definitions(megamoe_ext PRIVATE DEEPEP_MEGAMOE_TIMER=1)
 endif()

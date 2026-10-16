@@ -40,8 +40,59 @@ namespace MegaMoeImpl {
 constexpr int64_t PEERMEM_DATA_OFFSET = 1024 * 60LL;
 
 // 通信拓扑：决定窗口数据区按 MTE 还是 URMA 布局推进。
-constexpr int64_t TOPO_TYPE_MTE = 0U;   // mte
-constexpr int64_t TOPO_TYPE_URMA = 1U;  // urma
+constexpr int64_t TOPO_TYPE_MTE = 0U;       // mte
+constexpr int64_t TOPO_TYPE_URMA = 1U;      // urma
+constexpr int64_t TOPO_TYPE_MTE_ROCE = 2U;  // local MTE, paired cross-host RoCE
+
+HOST_DEVICE bool UsesMteLayout(int64_t topology)
+{
+    return topology == TOPO_TYPE_MTE || topology == TOPO_TYPE_MTE_ROCE;
+}
+
+HOST_DEVICE bool UseHierarchicalRoce(const MegaMoeTilingData* t)
+{
+    return t->topoType == TOPO_TYPE_MTE_ROCE;
+}
+
+constexpr uint32_t HIERARCHICAL_RANKS_PER_HOST = 16U;
+constexpr uint32_t HIERARCHICAL_WORLD_SIZE = 32U;
+constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 31U;
+constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
+constexpr uint32_t HIERARCHICAL_ROCE_UB_BYTES = 256U;
+
+// Every flag owns a full L2 line. Network writers, local publishers and consumers
+// must never share a line with payload or with a different flag producer.
+enum class HierarchicalSignal : uint32_t {
+    Sequence,
+    LocalRailPacked,
+    NetMetaCommit,
+    MetaReady,
+    NetPayloadCommit,
+    RelayPayloadReady,
+    TxDone,
+    CombineCommit,
+    Count
+};
+
+HOST_DEVICE uint32_t HierarchicalHost(uint32_t rank)
+{
+    return rank / HIERARCHICAL_RANKS_PER_HOST;
+}
+
+HOST_DEVICE uint32_t HierarchicalGateway(uint32_t source)
+{
+    return source ^ HIERARCHICAL_RANKS_PER_HOST;
+}
+
+HOST_DEVICE uint32_t HierarchicalSendJob(uint32_t rank)
+{
+    return 1U - HierarchicalHost(rank);
+}
+
+HOST_DEVICE uint64_t HierarchicalSignalOffset(HierarchicalSignal signal)
+{
+    return static_cast<uint64_t>(signal) * HIERARCHICAL_FLAG_BYTES;
+}
 
 // ============================ 各区尺寸（host / device 共用） ============================
 
@@ -103,6 +154,16 @@ HOST_DEVICE int64_t CalcMteExpertCountRecvSize(int64_t moeExpertPerRank, int64_t
 // ============================ Rail topkIds 中转区（MTE 路径） ============================
 // 每服务器卡数。rank r 的 rail rank 在目标 server u 上为 u * SERVER_SIZE + r % SERVER_SIZE。
 constexpr int64_t MEGA_MOE_SERVER_SIZE = 8;
+
+HOST_DEVICE int64_t RailServerSize(uint32_t ranksPerNode)
+{
+    return ranksPerNode == HIERARCHICAL_RANKS_PER_HOST ? HIERARCHICAL_RANKS_PER_HOST : MEGA_MOE_SERVER_SIZE;
+}
+
+HOST_DEVICE int64_t RailServerSize(const MegaMoeTilingData* t)
+{
+    return RailServerSize(t->dispatchRanksPerNode);
+}
 // Platform contract: an aligned 512B peer-write packet becomes visible as a unit.
 // Reserve the last int32 of EVERY packet for (epoch << 24) | totalItems.
 // Slot and packet starts must remain 512B aligned; checking only the last packet is unsafe.
@@ -110,9 +171,9 @@ constexpr uint32_t RAIL_PACKET_BYTES = 512U;
 constexpr uint32_t RAIL_PACKET_WORDS = RAIL_PACKET_BYTES / sizeof(int32_t);
 constexpr uint32_t RAIL_PACKET_DATA_WORDS = RAIL_PACKET_WORDS - 1U;
 
-HOST_DEVICE int64_t CalcServerNum(int64_t epWorldSize)
+HOST_DEVICE int64_t CalcServerNum(int64_t epWorldSize, int64_t ranksPerServer = MEGA_MOE_SERVER_SIZE)
 {
-    return Ops::Base::CeilDiv(epWorldSize, MEGA_MOE_SERVER_SIZE);
+    return Ops::Base::CeilDiv(epWorldSize, ranksPerServer);
 }
 
 // 每个 512B 包含 127 个 topkId 和 1 个标记，空输入也发送一个带标记的包。
@@ -135,17 +196,19 @@ HOST_DEVICE int64_t CalcRailTopkIdsSlotBytes(const MegaMoeTilingData* tilingData
 HOST_DEVICE int64_t CalcRailTopkIdsRecvSize(const MegaMoeTilingData* tilingData)
 {
     return Ops::Base::CeilAlign(
-        CalcServerNum(static_cast<int64_t>(tilingData->epWorldSize)) * CalcRailTopkIdsSlotBytes(tilingData), ALIGN_512);
+        CalcServerNum(static_cast<int64_t>(tilingData->epWorldSize), RailServerSize(tilingData)) *
+            CalcRailTopkIdsSlotBytes(tilingData),
+        ALIGN_512);
 }
 
 // Rail grouping follows the donor's eight-rank servers. A partial final server
 // falls back to direct routing; single-server EP2..8 is also supported.
 HOST_DEVICE bool UseDecodeRailRouting(const MegaMoeTilingData* t)
 {
-    return t->topoType == TOPO_TYPE_MTE &&
-           UseDecodeInputReady(t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4, t->bs) &&
-           (t->epWorldSize <= MEGA_MOE_SERVER_SIZE || t->epWorldSize % MEGA_MOE_SERVER_SIZE == 0) &&
-           t->blockAivNum > CalcServerNum(t->epWorldSize);
+    const int64_t ranksPerServer = RailServerSize(t);
+    return UsesMteLayout(t->topoType) && UseDecodeInputReady(t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4, t->bs) &&
+           (t->epWorldSize <= ranksPerServer || t->epWorldSize % ranksPerServer == 0) &&
+           t->blockAivNum > CalcServerNum(t->epWorldSize, ranksPerServer);
 }
 
 // Host buffer budgeting and device UB binding must use the same relay bound.
@@ -153,7 +216,8 @@ HOST_DEVICE uint32_t CalcSendMaskExpertCapacity(const MegaMoeTilingData* t, uint
 {
     uint32_t capacity = Ops::Base::CeilDiv(t->epWorldSize * t->moeExpertPerRank, routeCores);
     if (UseDecodeRailRouting(t)) {
-        uint32_t serverRanks = t->epWorldSize < MEGA_MOE_SERVER_SIZE ? t->epWorldSize : MEGA_MOE_SERVER_SIZE;
+        const uint32_t ranksPerServer = static_cast<uint32_t>(RailServerSize(t));
+        uint32_t serverRanks = t->epWorldSize < ranksPerServer ? t->epWorldSize : ranksPerServer;
         uint32_t serverExperts = serverRanks * t->moeExpertPerRank;
         capacity = capacity > serverExperts ? capacity : serverExperts;
     }
@@ -202,6 +266,7 @@ struct PeermemSizeParams {
     bool isQuantCombine;
     int64_t topoType;
     bool reserveDecodeRail = false;
+    uint32_t ranksPerNode = 0U;
 };
 
 /*
@@ -212,7 +277,7 @@ struct PeermemSizeParams {
 HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams& params)
 {
     int64_t routeRecvSize = 0;
-    if (params.topoType == TOPO_TYPE_MTE) {
+    if (UsesMteLayout(params.topoType)) {
         int64_t routeIndexAlignSize =
             Ops::Base::CeilAlign(params.numMaxTokensPerRank * static_cast<int64_t>(sizeof(int32_t)), ALIGN_32);
         routeRecvSize = CalcRouteIndexRecvSize(routeIndexAlignSize, params.moeExpertPerRank, params.epWorldSize);
@@ -220,12 +285,12 @@ HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams& params)
         int64_t maskAlignSize = CalcDispatchMaskAlignSizeBy(params.numMaxTokensPerRank, params.topK);
         routeRecvSize = CalcMaskRecvSize(maskAlignSize, params.moeExpertPerRank, params.epWorldSize);
     }
-    const bool rail = params.topoType == TOPO_TYPE_MTE && params.reserveDecodeRail;
+    const bool rail = UsesMteLayout(params.topoType) && params.reserveDecodeRail;
     int64_t expertCountRecvSize = rail ? CalcMteExpertCountRecvSize(params.moeExpertPerRank, params.epWorldSize)
                                        : CalcExpertCountRecvSize(params.moeExpertPerRank, params.epWorldSize);
-    int64_t railBytes =
-        rail ? CalcServerNum(params.epWorldSize) * CalcRailTopkIdsSlotDataBytes(params.numMaxTokensPerRank, params.topK)
-             : 0;
+    int64_t railBytes = rail ? CalcServerNum(params.epWorldSize, RailServerSize(params.ranksPerNode)) *
+                                   CalcRailTopkIdsSlotDataBytes(params.numMaxTokensPerRank, params.topK)
+                             : 0;
 
     int64_t tokenScaleBytes =
         CalcQuantTokenScaleBytes(params.h, params.elemsPerByte, params.topK, params.topkWeightsPrefetch);
@@ -233,12 +298,17 @@ HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams& params)
     int64_t combineTokenBytes = CalcCombineTokenBytes(params.h, params.yDtypeSize, params.isQuantCombine);
     int64_t combineSendSize =
         Ops::Base::CeilAlign(params.numMaxTokensPerRank * params.topK * combineTokenBytes, ALIGN_512);
-    return PEERMEM_DATA_OFFSET + routeRecvSize + expertCountRecvSize + railBytes + quantTokenScaleSize +
-           combineSendSize;
+    int64_t bytes =
+        PEERMEM_DATA_OFFSET + routeRecvSize + expertCountRecvSize + railBytes + quantTokenScaleSize + combineSendSize;
+    if (params.topoType == TOPO_TYPE_MTE_ROCE) {
+        bytes += quantTokenScaleSize + combineSendSize;
+        bytes += params.numMaxTokensPerRank * params.topK * HIERARCHICAL_FLAG_BYTES;
+        bytes += static_cast<int64_t>(HierarchicalSignal::Count) * HIERARCHICAL_FLAG_BYTES;
+    }
+    return bytes;
 }
 
-#if defined(__DAV_C310_CUBE__) || defined(__DAV_C310_VEC__)
-// device 侧窗口各区基址；偏移推进顺序即上方 CalcPeermemLeastSize 的分段顺序。
+// Shared host/device layout; offsets follow CalcPeermemLeastSize above.
 struct PeermemInfo {
     GM_ADDR rankSyncInWorldPtr;
     GM_ADDR maskRecvPtr;
@@ -248,15 +318,19 @@ struct PeermemInfo {
     GM_ADDR dispatchRecivePtr;
     GM_ADDR dispatchFlagPtr;
     GM_ADDR combineSendPtr;
+    GM_ADDR relayPayloadPtr{nullptr};
+    GM_ADDR gatewayCombinePtr{nullptr};
+    GM_ADDR gatewayCombineReadyPtr{nullptr};
+    GM_ADDR hierarchicalControlPtr{nullptr};
 
-    __aicore__ inline PeermemInfo() = default;
-    __aicore__ inline PeermemInfo(GM_ADDR base, const MegaMoeTilingData* tilingData, uint32_t elemsPerByte = 1,
-                                  uint32_t serverNum = 1)
+    HOST_DEVICE PeermemInfo() = default;
+    HOST_DEVICE PeermemInfo(GM_ADDR base, const MegaMoeTilingData* tilingData, uint32_t elemsPerByte = 1,
+                            uint32_t serverNum = 1)
     {
         rankSyncInWorldPtr = base;
         int64_t offset = PEERMEM_DATA_OFFSET;
         maskRecvPtr = base + offset;
-        if (tilingData->topoType == TOPO_TYPE_MTE) {
+        if (UsesMteLayout(tilingData->topoType)) {
             offset += CalcRouteIndexRecvSize(CalcDispatchRouteIndexAlignSize(tilingData),
                                              static_cast<int64_t>(tilingData->moeExpertPerRank),
                                              static_cast<int64_t>(tilingData->epWorldSize));
@@ -278,7 +352,7 @@ struct PeermemInfo {
         int64_t tokenScaleBytes =
             CalcQuantTokenScaleBytes(static_cast<int64_t>(tilingData->h), elemsPerByte,
                                      static_cast<int64_t>(tilingData->topK), tilingData->topkWeightsPrefetch == 1);
-        if (tilingData->topoType == TOPO_TYPE_MTE) {
+        if (UsesMteLayout(tilingData->topoType)) {
             quantTokenScalePtr = base + offset;
             offset += Ops::Base::CeilAlign(static_cast<int64_t>(tilingData->numMaxTokensPerRank) * tokenScaleBytes,
                                            ALIGN_512);
@@ -292,8 +366,29 @@ struct PeermemInfo {
                 static_cast<int64_t>(serverNum) * tilingData->bs * static_cast<int64_t>(sizeof(uint64_t)), ALIGN_512);
         }
         combineSendPtr = base + offset;
+        if (UseHierarchicalRoce(tilingData)) {
+            const int64_t combineBytes = Ops::Base::CeilAlign(
+                static_cast<int64_t>(tilingData->numMaxTokensPerRank) * tilingData->topK * tilingData->h * 2,
+                ALIGN_512);
+            offset += combineBytes;
+            relayPayloadPtr = base + offset;
+            offset += Ops::Base::CeilAlign(static_cast<int64_t>(tilingData->numMaxTokensPerRank) * tokenScaleBytes,
+                                           ALIGN_512);
+            gatewayCombinePtr = base + offset;
+            offset += combineBytes;
+            gatewayCombineReadyPtr = base + offset;
+            offset +=
+                static_cast<int64_t>(tilingData->numMaxTokensPerRank) * tilingData->topK * HIERARCHICAL_FLAG_BYTES;
+            hierarchicalControlPtr = base + offset;
+        }
     }
 };
+
+#if defined(__DAV_C310_CUBE__) || defined(__DAV_C310_VEC__)
+__aicore__ inline __gm__ int32_t* HierarchicalSignalAddress(const PeermemInfo& info, HierarchicalSignal signal)
+{
+    return reinterpret_cast<__gm__ int32_t*>(info.hierarchicalControlPtr + HierarchicalSignalOffset(signal));
+}
 #endif
 
 }  // namespace MegaMoeImpl

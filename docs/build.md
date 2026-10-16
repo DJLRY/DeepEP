@@ -47,6 +47,22 @@ python -m pip install -r requirements-build.txt
 准备脚本默认要求 SHMEM 源码干净且提交与锁文件一致；已有 build/install 时要求显式 `--rebuild`（会再生成这些构建产物）。
 更换 SDK 前停止使用它的作业，之后重建 wheel。完整边界及离线依赖见 [第三方依赖](../third-party/README.md)。
 
+MegaMoE 两机各16卡的 EP32 Decode 使用机内 MTE＋跨机 RoCE，需要按实际网卡启用 SDK 后端：
+
+```bash
+# 新 SDK 可省略 --rebuild；已有构建需先停止使用它的作业。
+python scripts/build_shmem.py --rdma-backend XSCALE --rebuild
+# HNS 1825 网卡使用 --rdma-backend HNS_1825。
+export DEEPEP_BUILD_MEGAMOE=ON
+```
+
+`--rdma-backend` 默认 `NONE`，不启用 RoCE；原有8卡分组和16卡单机继续使用 MTE。
+SDK 的 `build.rdma_backend` 写入 `deepep-sdk.json`，构建缓存与 `--if-needed` 复用会校验该值。
+切换后端需要重新构建 SDK 和 wheel。MegaMoE 构建入口的等价命令是
+`bash experiments/megamoe/scripts/build.sh --rdma-backend XSCALE --rebuild-shmem`。
+用户代码只需 `ranks_per_node=16`；当前跨机范围为两机 EP32、W4A8、实际每卡 B=1～31，
+不增加 `transport` 参数。真实 NPU 精度、通信可见性与性能验证尚待完成，见 [MegaMoE 部署说明](../experiments/megamoe/README.md#3-多机测试)。
+
 已有外部 SDK 时，加载 CANN 环境、设置 `DEEPEP_NPU_ARCH=Ascend950` 并安装 `requirements-build.txt` 后，跳过子模块准备和 SHMEM 构建，改用：
 
 ```bash
@@ -58,6 +74,11 @@ python scripts/record_shmem_sdk.py --sdk "$SHMEM_ROOT" \
   --revision "$(python -c 'import json; print(json.load(open("dependencies.lock.json"))["shmem"]["revision"])')"
 # 启用 MegaMoE 且不用仓内子模块时，再设置 CATLASS_ROOT=/path/to/pinned/catlass。
 ```
+
+外部 RoCE SDK 在首次登记时须追加 `--rdma-backend XSCALE` 或 `--rdma-backend HNS_1825`，
+声明提供方实际构建的后端。该选项不会给现有库增加 RDMA 能力；已有 manifest 不能覆盖或手改。
+缺少 backend 字段的旧 SDK 身份按 `NONE` 处理。CMake 从 SDK 身份自动配置 MegaMoE 的匹配后端，
+16卡跨机初始化还会校验实际加载的 SHMEM 库与 wheel 记录一致。
 
 sdist 不携带子模块，解包后构建需显式设置 SHMEM_ROOT，以及启用 MegaMoE 时所需的 CATLASS_ROOT；EpGmmFused 的外部源码路径按其构建说明设置。
 下方自动化验证入口会将原 checkout 的默认依赖路径固定为绝对路径，确保 sdist 重建使用相同 SDK。

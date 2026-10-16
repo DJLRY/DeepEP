@@ -189,8 +189,14 @@ __aicore__ inline void CopyTokensAndMetaForDispatch(const TokenDispatchConfig& c
     int32_t bufferCount = bufferConfig.bufferCount;
 
     GlobalTensor<ActivationType> remoteRankGlobalTensor;
-    remoteRankGlobalTensor.SetGlobalBuffer(
-        reinterpret_cast<__gm__ ActivationType*>(winRankAddr[remoteRankIdx] + context.quantWinOffset));
+    GM_ADDR payload;
+    if (UseHierarchicalRoce(params.tilingData) && winRankAddr[remoteRankIdx] == nullptr) {
+        const uint64_t relayOffset = params.peermemInfo.relayPayloadPtr - params.peermemInfo.rankSyncInWorldPtr;
+        payload = winRankAddr[HierarchicalGateway(remoteRankIdx)] + relayOffset;
+    } else {
+        payload = winRankAddr[remoteRankIdx] + context.quantWinOffset;
+    }
+    remoteRankGlobalTensor.SetGlobalBuffer(reinterpret_cast<__gm__ ActivationType*>(payload));
     for (int32_t issueIdx = 0; issueIdx < copyNum; ++issueIdx) {
         // 单槽没有读写重叠空间，必须先写出；否则 reuse 会等一个尚未发布的 MTE3 事件。
         if (bufferCount == 1 && progress.pendingRow >= 0) {
@@ -633,6 +639,28 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
     int32_t expectEpoch = (ReadGmByPassDCache(launchCountSlot0) & 0x7F) | 0x80;
     if (UseDecodeRailRouting(params.tilingData)) {
         LoadMteExpertCounts(common, params, scratch, static_cast<uint32_t>(expectEpoch));
+        if (UseHierarchicalRoce(params.tilingData)) {
+            // Counts may arrive before the paired payload. Only wait for gateways
+            // that actually supply this rank; route metadata retains original S.
+            const uint64_t readyOffset = params.peermemInfo.hierarchicalControlPtr -
+                                         params.peermemInfo.rankSyncInWorldPtr +
+                                         HierarchicalSignalOffset(HierarchicalSignal::RelayPayloadReady);
+            for (uint32_t source = 0; source < common.worldSize; ++source) {
+                if (HierarchicalHost(source) == HierarchicalHost(common.rankId)) {
+                    continue;
+                }
+                bool needed = false;
+                for (uint32_t expert = 0; expert < common.moeExpertPerRank; ++expert) {
+                    needed |= scratch.cumsumInfoTensor.GetValue(expert * common.worldSize + source) != 0;
+                }
+                if (needed) {
+                    auto* ready =
+                        reinterpret_cast<__gm__ int32_t*>(g_winRankAddr_[HierarchicalGateway(source)] + readyOffset);
+                    WaitUntilGmFlagEquals(ready, static_cast<int32_t>(params.tilingData->hierarchicalSequence));
+                }
+            }
+            SyncFuncStatic<HardEvent::S_MTE2, 7U>();
+        }
     } else {
         GlobalTensor<int32_t> expertCountGlobal;
         expertCountGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.expertCountRecvPtr));

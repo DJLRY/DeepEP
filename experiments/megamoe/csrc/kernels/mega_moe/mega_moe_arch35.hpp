@@ -29,11 +29,13 @@
 #include "epilogue/block_epilogue_activation_mx_quant.hpp"
 #include "stage/mega_moe_token_quant.hpp"
 #include "stage/mega_moe_send_mask.hpp"
+#include "stage/mega_moe_hierarchical_dispatch.hpp"
 #include "stage/mega_moe_workspace_reset.hpp"
 #include "stage/mega_moe_shared_expert_input.hpp"
 #include "stage/mega_moe_token_dispatch.hpp"
 #include "stage/mega_moe_gmm1_activation.hpp"
 #include "stage/mega_moe_gmm2_combine.hpp"
+#include "stage/mega_moe_hierarchical_combine.hpp"
 #include "stage/mega_moe_unpermute.hpp"
 #include "mc2_common/quantize_functions.hpp"
 
@@ -91,6 +93,16 @@ protected:
     __aicore__ inline void InitQuantTokenBufferConfig();
     __aicore__ inline UnpermuteBufferConfig InitTokenUnpermuteBuffers();
     __aicore__ inline void ProcessInputPreparationStage();
+    __aicore__ inline bool TryProgressRemoteCombine()
+    {
+        if constexpr (g_coreType == AIV) {
+            if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob(rankId_)) {
+                return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_,
+                                                      HierarchicalRoceScratch(params_));
+            }
+        }
+        return false;
+    }
     template <bool SourceGmm1Fused>
     __aicore__ inline void RunGmm2CombineForExpert(ExpertLoopState& state, GMMAddrInfo& gmmAddrInfo,
                                                    uint32_t& startBlockIdx, uint32_t tokenStartIndexInExpert,
@@ -182,6 +194,7 @@ protected:
     SharedBlockEpilogue sharedEpilogueOp_;
     TokenDispatchScratch<ActivationType> tokenDispatchScratch_;
     WaveCombineScratch waveCombineScratch_;
+    HierarchicalCombineProgress hierarchicalCombine_{};
     TokenUnpermuteScratch tokenUnpermuteScratch_;
     MegaMoeImpl::ExceptionDumpEngine exceptionDump_;
     AscendTimerDevice timer_;
@@ -249,7 +262,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Init(
     rankId_ = mc2Context_->epRankId;
     GM_ADDR dumpBase = reinterpret_cast<GM_ADDR>(mc2Context_->epHcclBuffer_[rankId_]);
     for (int i = 0; i < worldSize_; i++) {
-        g_winRankAddr_[i] = reinterpret_cast<GM_ADDR>(mc2Context_->epHcclBuffer_[i]) + EXCEPTION_DUMP_REGION_SIZE;
+        GM_ADDR peerBase = reinterpret_cast<GM_ADDR>(mc2Context_->epHcclBuffer_[i]);
+        g_winRankAddr_[i] = peerBase == nullptr ? nullptr : peerBase + EXCEPTION_DUMP_REGION_SIZE;
     }
     params_.aGmAddr = x;
     params_.inputScaleGmAddr = scales;
@@ -876,8 +890,13 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
         if constexpr (g_coreType == AIV) {
             timer_.Start(AscendTimer::AIV_ROUTE_MASK);
         }
-        GatherAndSendExpertCompactRoutes(aivJob_, commonConfig_, params_, g_winRankAddr_, sendMaskConfig_,
-                                         sendMaskScratch_);
+        if (UseHierarchicalRoce(params_.tilingData)) {
+            GatherAndPostHierarchicalDispatch(aivJob_, commonConfig_, params_, g_winRankAddr_, sendMaskConfig_,
+                                              sendMaskScratch_);
+        } else {
+            GatherAndSendExpertCompactRoutes(aivJob_, commonConfig_, params_, g_winRankAddr_, sendMaskConfig_,
+                                             sendMaskScratch_);
+        }
         if constexpr (g_coreType == AIV) {
             timer_.End(AscendTimer::AIV_ROUTE_MASK);
         }
@@ -892,6 +911,9 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
     if (sharedExpertNum_ > 0) {
         PrepareSharedExpertInput<ActivationType, QuantScaleOutType, A_ELEMS_PER_BYTE>(
             aivJob_, commonConfig_, params_, quantProcessConfig_, sharedExpertPrepareScratch_);
+    }
+    if (UseHierarchicalRoce(params_.tilingData)) {
+        FinishHierarchicalDispatch(aivJob_, commonConfig_, params_);
     }
     if (decodeInputReady_) {
         // Route published old+1. The public barrier below makes slot 0's
@@ -974,6 +996,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
     if constexpr (g_coreType == AIV) {
         timer_.Start(AscendTimer::AIV_EXPORT_SYNC);
         ExportCompactExpertTokenCounts(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
+        TryProgressRemoteCombine();
         PipeBarrier<PIPE_ALL>();
         SyncAll<true>();
         timer_.End(AscendTimer::AIV_EXPORT_SYNC);
@@ -988,7 +1011,27 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
     if constexpr (g_coreType == AIV) {
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::CROSS_RANK_SYNC_OUTPUT);
         timer_.Start(AscendTimer::AIV_FINAL_CROSS_RANK_WAIT);
-        CrossRankSyncInWorldSize(params_.peermemInfo.rankSyncInWorldPtr, rankId_, worldSize_, aivJob_);
+        if (UseHierarchicalRoce(params_.tilingData)) {
+            // The host barrier closes every local producer and Dispatch reader,
+            // including ranks with no rows for this gateway. The reciprocal
+            // commits then close the two-host buffer lifetime before reuse.
+            CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
+            if (aivJob_.jobIndex == HierarchicalSendJob(rankId_)) {
+                auto* scratch = HierarchicalRoceScratch(params_);
+                DrainHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch);
+                RocePublishCommit(reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(
+                                      params_.peermemInfo, HierarchicalSignal::CombineCommit)),
+                                  reinterpret_cast<GM_ADDR>(
+                                      HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::Sequence)),
+                                  HierarchicalGateway(rankId_), scratch);
+                RoceWaitCommit(HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::CombineCommit),
+                               params_.tilingData->hierarchicalSequence);
+            }
+            PipeBarrier<PIPE_ALL>();
+            SyncAll<true>();
+        } else {
+            CrossRankSyncInWorldSize(params_.peermemInfo.rankSyncInWorldPtr, rankId_, worldSize_, aivJob_);
+        }
         timer_.End(AscendTimer::AIV_FINAL_CROSS_RANK_WAIT);
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::UNPERMUTE);
         MegaMoeUnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();

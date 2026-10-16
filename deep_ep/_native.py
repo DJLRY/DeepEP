@@ -47,6 +47,7 @@ def _load_native():
     expected = info["shmem"]["sha256"]["lib/libshmem.so"]
     with library.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
+    module.shmem_sdk_matches = digest == expected
     if digest != expected:
         warnings.warn(
             "Loaded SHMEM library differs from the SDK used to build this wheel", RuntimeWarning, stacklevel=2

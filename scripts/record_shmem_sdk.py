@@ -24,7 +24,14 @@ def record(sdk, revision, *, build_info=None):
         normalized = header.read_bytes().replace(b"\r\n", b"\n")
         if hashlib.sha256(normalized).hexdigest() != digest:
             raise ValueError(f"SDK public header mismatch: {relative}")
-    files = sorted((sdk / "include").rglob("*.h")) + [sdk / "lib/libshmem.so"]
+    if build_info is not None and build_info.get("rdma_backend", "NONE") not in {"NONE", "XSCALE", "HNS_1825"}:
+        raise ValueError("SDK rdma_backend must be NONE, XSCALE or HNS_1825")
+    files = sorted(
+        path
+        for directory in ("include", "src")
+        for path in (sdk / directory).rglob("*")
+        if path.is_file() and path.suffix in {".h", ".hpp"}
+    ) + [sdk / "lib/libshmem.so"]
     hashes = {}
     for path in files:
         if not path.resolve().is_relative_to(sdk) or not path.is_file():
@@ -48,6 +55,8 @@ def check(sdk):
     recorded = json.loads(manifest.read_text())
     if recorded.get("revision") != lock["revision"]:
         raise ValueError("SDK source revision must match dependencies.lock.json")
+    if recorded.get("build", {}).get("rdma_backend", "NONE") not in {"NONE", "XSCALE", "HNS_1825"}:
+        raise ValueError("SDK rdma_backend must be NONE, XSCALE or HNS_1825")
     for relative, expected in lock["header_sha256_lf"].items():
         data = (sdk / "include" / relative).read_bytes().replace(b"\r\n", b"\n")
         if hashlib.sha256(data).hexdigest() != expected:
@@ -71,5 +80,17 @@ if __name__ == "__main__":
     mode = parser.add_mutually_exclusive_group(required=True)
     mode.add_argument("--revision", help="SDK provider's source revision attestation")
     mode.add_argument("--check", action="store_true", help="verify an existing SDK identity without modifying it")
+    parser.add_argument(
+        "--rdma-backend",
+        choices=("NONE", "XSCALE", "HNS_1825"),
+        default="NONE",
+        help="SDK provider's RoCE backend attestation when recording an SDK",
+    )
     args = parser.parse_args()
-    print(check(args.sdk) if args.check else record(args.sdk, args.revision))
+    if args.check and args.rdma_backend != "NONE":
+        parser.error("--rdma-backend is only used with --revision")
+    print(
+        check(args.sdk)
+        if args.check
+        else record(args.sdk, args.revision, build_info={"rdma_backend": args.rdma_backend})
+    )

@@ -306,7 +306,10 @@ def test_cache_survives_source_edits_but_not_toolchain_changes(build):
 
 
 @pytest.mark.parametrize("beta,timer", [(False, False), (True, False), (True, True)])
-def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkeypatch, tmp_path, beta, timer):
+@pytest.mark.parametrize("rdma_backend", ["NONE", "XSCALE", "HNS_1825"])
+def test_packaging_uses_cmake_capabilities_and_removes_old_library(
+    build, monkeypatch, tmp_path, beta, timer, rdma_backend
+):
     from setuptools import Distribution, Extension
 
     # This CPU-only test mocks the build tools, including their discovery paths.
@@ -324,6 +327,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
         "compiler_path": "/tools/c++",
         "ASCEND_HOME_PATH": "/sdk/cann",
         "SHMEM_ROOT": "/sdk/shmem",
+        "shmem": {"rdma_backend": rdma_backend},
         "build_type": "RelWithDebInfo",
         "python_executable": "/private/python",
         "build_environment": {"CXXFLAGS": "-I/private/include"},
@@ -359,6 +363,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(build, monkey
     command.build_extension(ext)
     assert "-DCMAKE_BUILD_TYPE=RelWithDebInfo" in calls[0]
     assert "-DDEEPEP_DEVICE_JOBS=6" in calls[0]
+    assert f"-DDEEPEP_SHMEM_RDMA_BACKEND={rdma_backend}" in calls[0]
     assert f"-DDEEPEP_BUILD_MEGAMOE={'ON' if beta else 'OFF'}" in calls[0]
     assert f"-DDEEPEP_MEGAMOE_TIMER={'ON' if timer else 'OFF'}" in calls[0]
     assert f"-Dpybind11_DIR={pybind11_cmake_dir}" in calls[0]

@@ -13,6 +13,8 @@ int initialized = 0, allocations = 0, frees = 0, finalized = 0, barriers = 0, me
 int init_status = 0, memset_status = 0, finalize_status = 0;
 bool allocation_failure = false;
 int qp_count = 0;
+int qp_engine = 0;
+size_t workspace_alignment = 0;
 int expected_world = 2;
 uint64_t expected_bytes = 2 << 20;
 int storage = 0, context_token = 0, another_context = 0;
@@ -51,7 +53,7 @@ int aclshmemx_init_status()
 int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
 {
     assert(attr->n_pes == expected_world && attr->local_mem_size == expected_bytes);
-    assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | (qp_count ? ACLSHMEM_DATA_OP_UDMA : 0)));
+    assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | qp_engine));
     if (init_status == 0) {
         initialized = 2;
     }
@@ -64,8 +66,10 @@ int aclshmemx_set_shared_jetty(data_op_engine_type_t engine, bool enabled)
 }
 int aclshmemx_set_qp_num(data_op_engine_type_t engine, uint32_t count)
 {
-    assert(engine == ACLSHMEM_DATA_OP_UDMA && count == 32 && initialized == 0);
+    assert(initialized == 0);
+    assert((engine == ACLSHMEM_DATA_OP_UDMA && count == 32) || (engine == ACLSHMEM_DATA_OP_ROCE && count == 2));
     qp_count = count;
+    qp_engine = engine;
     return 0;
 }
 int aclshmem_finalize()
@@ -83,8 +87,9 @@ void* aclshmem_malloc(size_t bytes)
     return allocation_failure ? nullptr : &storage;
 }
 // Match the aligned allocation API used by Session; reuse the existing fault-injection stub.
-void* aclshmem_align(size_t, size_t bytes)
+void* aclshmem_align(size_t alignment, size_t bytes)
 {
+    workspace_alignment = alignment;
     return aclshmem_malloc(bytes);
 }
 void aclshmem_free(void* value)
@@ -110,8 +115,8 @@ int main(int argc, char** argv)
         expected_bytes = logical_bytes + (2ULL << 20);
         // Exercise the highest rank, full guard allocation, original-pointer
         // ownership and logical capacity independently of the EP size.
-        deepep::Session session(expected_world - 1, expected_world, logical_bytes,
-                               "tcp://xxx.xxx.xxx.xxx:xxxxx", 30, true);
+        deepep::Session session(expected_world - 1, expected_world, logical_bytes, "tcp://xxx.xxx.xxx.xxx:xxxxx", 30,
+                                true);
         assert(session.capacity() == logical_bytes && session.workspace() == &storage && memsets == 1);
         assert(uint64_t(expected_world - 1) * 1024U < expected_bytes - logical_bytes);
         session.close();
@@ -127,6 +132,23 @@ int main(int argc, char** argv)
         assert(session.udma() && qp_count == 32);
         session.close();
         assert(!deepep::Session::busy());
+    } else if (mode == "megamoe-roce") {
+        fails(
+            []() { deepep::Session s(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, false, false, false, true); });
+        fails(
+            []() { deepep::Session s(0, 16, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true); });
+#ifdef DEEPEP_MEGAMOE_ROCE
+        expected_world = 32;
+        deepep::Session session(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true);
+        assert(qp_engine == ACLSHMEM_DATA_OP_ROCE && qp_count == 2 && !session.udma());
+        assert(workspace_alignment == 512);
+        session.close();
+        assert(!deepep::Session::busy() && frees == 1 && finalized == 1);
+#else
+        fails(
+            []() { deepep::Session s(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true); });
+        assert(!deepep::Session::busy() && allocations == 0);
+#endif
     } else if (mode == "megamoe") {
         fails([]() { deepep::Session s(0, 256, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true); });
         fails([]() { deepep::Session s(0, 2, 2ULL << 30, "tcp://127.0.0.1:19091", 30, false, true); });

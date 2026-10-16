@@ -117,6 +117,10 @@ bash experiments/megamoe/scripts/build.sh
 
 脚本准备依赖并构建、安装启用 MegaMoE 和 timer 的 wheel，日常重编复用已校验的 SHMEM。直接使用 `pip wheel` 时默认不构建 MegaMoE。多机配置和验证步骤见 [MegaMoE 使用说明](experiments/megamoe/README.md)；设备编译、精度与性能仍待验收。
 
+两机各16卡的 EP32 Decode 由 `ranks_per_node=16` 默认选择机内 MTE＋跨机 RoCE，当前范围为 W4A8、每卡 B=1～31。
+构建时按网卡传入 `--rdma-backend XSCALE` 或 `HNS_1825`；已有 SDK 切换后端需加 `--rebuild-shmem`。
+原有8卡分组与16卡单机保持 MTE；新路径的真实 NPU 精度与性能仍待验收，部署命令见上述说明。
+
 ## 接口与示例
 
 ---

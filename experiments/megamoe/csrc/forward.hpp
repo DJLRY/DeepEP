@@ -30,7 +30,7 @@ public:
         torch::Tensor weight1, torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
         c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> shared_weight1,
         c10::optional<torch::Tensor> shared_weight2, c10::optional<torch::Tensor> shared_weight_scales1,
-        c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<torch::Tensor> out);
+        c10::optional<torch::Tensor> shared_weight_scales2, uint64_t sequence, c10::optional<torch::Tensor> out);
 
     int64_t workspace_bytes() const
     {
@@ -45,6 +45,7 @@ private:
     uint64_t ffts_;
 };
 
-int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden);
+int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden,
+                    int64_t ranks_per_node = 0);
 
 }  // namespace deepep::megamoe

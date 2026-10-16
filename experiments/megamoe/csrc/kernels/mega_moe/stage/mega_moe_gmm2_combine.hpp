@@ -86,17 +86,40 @@ __aicore__ inline void CombineTokens(uint32_t nLoc, uint32_t n, LocalTensor<int3
 template <typename Element>
 __aicore__ inline void SendCombineTokenRow(uint32_t rowElements, uint64_t gmRemoteBaseOffset,
                                            LocalTensor<int32_t>& metaInfoTensor, LocalTensor<Element>& rowTensor,
-                                           const Params& params)
+                                           const Params& params, uint32_t rankId)
 {
     CombineTokenRoute route = LoadCombineTokenRoute(metaInfoTensor, 0U);
 
+    // Keep (source rank, token, top-k slot) unchanged in metadata. Remote experts
+    // write their BF16 row to the source's paired gateway on this host; only that
+    // gateway's communication owner submits the cross-host transfer.
+    const bool viaGateway =
+        UseHierarchicalRoce(params.tilingData) && HierarchicalHost(route.dstRankId) != HierarchicalHost(rankId);
+    const uint32_t destinationRank = viaGateway ? HierarchicalGateway(route.dstRankId) : route.dstRankId;
+    if (viaGateway) {
+        gmRemoteBaseOffset =
+            static_cast<uint64_t>(params.peermemInfo.gatewayCombinePtr - params.peermemInfo.rankSyncInWorldPtr);
+    }
+
     GlobalTensor<Element> gmRemoteD;
     gmRemoteD.SetGlobalBuffer(
-        reinterpret_cast<__gm__ Element*>(GetRankWinAddrWithOffset(route.dstRankId, gmRemoteBaseOffset)));
+        reinterpret_cast<__gm__ Element*>(GetRankWinAddrWithOffset(destinationRank, gmRemoteBaseOffset)));
     uint64_t gmDstRowOffset = GetCombineDstRowIndex(route, params) * rowElements;
 
     DataCopyExtParams ub2GmParams{1U, static_cast<uint32_t>(rowElements * sizeof(Element)), 0U, 0U, 0U};
     DataCopyPad(gmRemoteD[gmDstRowOffset], rowTensor, ub2GmParams);
+
+    if (viaGateway) {
+        // Publish only after the entire row is visible to the gateway. Each
+        // (token, top-k) slot has one producer and its own 512-byte flag line.
+        // MTE3_S is independent of the row ring's MTE3_MTE2 events.
+        SyncFuncStatic<HardEvent::MTE3_S, SYNC_EVENT_ID0>();
+        const uint64_t readyOffset =
+            static_cast<uint64_t>(params.peermemInfo.gatewayCombineReadyPtr - params.peermemInfo.rankSyncInWorldPtr) +
+            GetCombineDstRowIndex(route, params) * HIERARCHICAL_FLAG_BYTES;
+        auto* ready = reinterpret_cast<__gm__ int32_t*>(GetRankWinAddrWithOffset(destinationRank, readyOffset));
+        WriteGmByPassDCache(ready, static_cast<int32_t>(params.tilingData->hierarchicalSequence));
+    }
 }
 
 // 通过本地 MTE 路径或远端 URMA 路径发送一个 layered 模板 token。
@@ -414,7 +437,7 @@ __aicore__ inline void SendWaveCombineToken(const MoeStageCommonConfig& common,
         SetFlag<HardEvent::MTE2_MTE3>(eventId);
         WaitFlag<HardEvent::MTE2_MTE3>(eventId);
         CombineImpl::SendCombineTokenRow<bfloat16_t>(common.tokenHiddenDim, gmRemoteBaseOffset, tokenMetaInfo, rowUb,
-                                                     params);
+                                                     params, common.rankId);
     } else {
         LocalTensor<bfloat16_t> quantUb =
             scratch.rowBufferTensor[slotElementOffset + bufferConfig.rowStrideBytes / sizeof(bfloat16_t)];
@@ -426,7 +449,7 @@ __aicore__ inline void SendWaveCombineToken(const MoeStageCommonConfig& common,
         using Fp8Type = typename std::conditional<CombineMode == MXFP8_E4M3_COMM_QUANT, fp8_e4m3fn_t, fp8_e5m2_t>::type;
         LocalTensor<Fp8Type> quantSendUb = quantUb.template ReinterpretCast<Fp8Type>();
         CombineImpl::SendCombineTokenRow<Fp8Type>(bufferConfig.quantRowElements, gmRemoteBaseOffset, tokenMetaInfo,
-                                                  quantSendUb, params);
+                                                  quantSendUb, params, common.rankId);
     }
     SetFlag<HardEvent::MTE3_MTE2>(eventId);
 }

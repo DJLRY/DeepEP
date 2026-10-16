@@ -130,12 +130,12 @@ uint64_t HostFlagElements(const MegaMoeTilingData& t)
     const bool is_w4 = t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 ||
                        t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W4 ||
                        t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A4W4_NZ;
-    if (is_w4 || (t.topoType == MegaMoeImpl::TOPO_TYPE_MTE && t.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT)) {
+    if (is_w4 || (MegaMoeImpl::UsesMteLayout(t.topoType) && t.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT)) {
         // Pairwise GMM2/combine publishes one sequence per AIC.
         count += static_cast<uint64_t>(t.aicNum) * MegaMoeImpl::INT_CACHELINE;
     }
-    if (t.topoType == MegaMoeImpl::TOPO_TYPE_MTE && (t.combineQuantMode != MegaMoeImpl::COMBINE_NO_QUANT ||
-                                                     t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4)) {
+    if (MegaMoeImpl::UsesMteLayout(t.topoType) && (t.combineQuantMode != MegaMoeImpl::COMBINE_NO_QUANT ||
+                                                   t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4)) {
         // Match WorkspaceInfo: the atomic A8W4 path owns one counter per M-group,
         // while quantized Combine retains one ready slot per AIC.
         const uint64_t ready_slots_per_expert = t.combineQuantMode == MegaMoeImpl::COMBINE_NO_QUANT
@@ -145,7 +145,7 @@ uint64_t HostFlagElements(const MegaMoeTilingData& t)
     }
     if (t.sharedExpertNum > 0U) {
         count += CeilDiv<uint64_t>(t.bs, 256U) * t.sharedExpertNum * MegaMoeImpl::INT_CACHELINE;
-        if (t.topoType == MegaMoeImpl::TOPO_TYPE_MTE && t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4) {
+        if (MegaMoeImpl::UsesMteLayout(t.topoType) && t.groupedMatmulMode == MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4) {
             count += 4ULL * t.aicNum * MegaMoeImpl::INT_CACHELINE;
         }
     }
@@ -236,7 +236,7 @@ PlatformInfo GetPlatformInfo()
 
 MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t topk, int64_t local_experts,
                              int64_t world, int64_t max_tokens, int64_t max_recv, bool is_a8w4, int64_t shared_experts,
-                             const PlatformInfo& p)
+                             int64_t ranks_per_node, const PlatformInfo& p)
 {
     MegaMoeTilingData t{};
     t.moeExpertPerRank = static_cast<uint32_t>(local_experts);
@@ -254,7 +254,19 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     t.combineQuantMode = MegaMoeImpl::COMBINE_NO_QUANT;
     t.clampLimit = std::numeric_limits<float>::max();
     t.groupedMatmulMode = is_a8w4 ? MegaMoeImpl::GROUPED_MATMUL_MODE_A8W4 : MegaMoeImpl::GROUPED_MATMUL_MODE_GENERAL;
-    t.topoType = MegaMoeImpl::TOPO_TYPE_MTE;
+    t.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
+    const bool hierarchical = ranks_per_node == MegaMoeImpl::HIERARCHICAL_RANKS_PER_HOST && world > ranks_per_node;
+    t.topoType = hierarchical ? MegaMoeImpl::TOPO_TYPE_MTE_ROCE : MegaMoeImpl::TOPO_TYPE_MTE;
+    TORCH_CHECK(!hierarchical || (world == MegaMoeImpl::HIERARCHICAL_WORLD_SIZE && is_a8w4 &&
+                                  bs <= MegaMoeImpl::HIERARCHICAL_MAX_TOKENS),
+                "MTE+RoCE MegaMoE requires two 16-rank hosts, FP8xFP4 and BS in [1,31]");
+#ifndef DEEPEP_MEGAMOE_ROCE
+    TORCH_CHECK(!hierarchical, "Rebuild MegaMoE with a RoCE-enabled SHMEM SDK (XSCALE or HNS_1825)");
+#endif
+    TORCH_CHECK(!hierarchical || p.ub > MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES,
+                "Not enough UB for MegaMoE RoCE scratch");
+    const uint32_t stage_ub = hierarchical ? p.ub - MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES : p.ub;
+    t.roceScratchUbOffset = hierarchical ? stage_ub : 0U;
     t.sharedExpertNum = static_cast<uint32_t>(shared_experts);
     t.combineSyncSlotCountPerExpert = 0;
     t.topkWeightsPrefetch = 0;
@@ -277,9 +289,9 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
             CeilDiv<uint64_t>(static_cast<uint64_t>(p.aic) * 4U, gmm1_tiles), CeilDiv<uint64_t>(p.aic, gmm2_tiles)));
     }
     t.isPerExpertWeightTensor = false;
-    t.dispatchBufferConfig = DispatchConfig(t, p.ub);
-    SetSendMaskConfigs(t, p.ub);
-    SetUnpermuteConfigs(t, p.ub);
+    t.dispatchBufferConfig = DispatchConfig(t, stage_ub);
+    SetSendMaskConfigs(t, stage_ub);
+    SetUnpermuteConfigs(t, stage_ub);
     return t;
 }
 
@@ -306,14 +318,13 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
                 "Plan shared experts require W4A8, with count in [0,8]");
     TORCH_CHECK(ranks_per_node == 0 || (ranks_per_node > 0 && ranks_per_node <= world && world % ranks_per_node == 0),
                 "Plan ranks_per_node must divide EP");
-    const auto required = buffer_size(world, experts, max_tokens, topk, example.size(1));
+    const auto required = buffer_size(world, experts, max_tokens, topk, example.size(1), ranks_per_node);
     TORCH_CHECK(symmetric_address != 0 && symmetric_bytes >= required, "MegaMoE symmetric buffer needs ", required,
                 " bytes, got ", symmetric_bytes);
     platform_ = GetPlatformInfo();
     tiling_ = MakeTiling(example.size(0), example.size(1), intermediate * 2, topk, experts, world, max_tokens, 0,
-                         is_a8w4, shared_experts, platform_);
-    tiling_.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
-    static_assert(sizeof(MegaMoeTilingData) == 224, "MegaMoE tiling ABI changed");
+                         is_a8w4, shared_experts, ranks_per_node, platform_);
+    static_assert(sizeof(MegaMoeTilingData) == 232, "MegaMoE tiling ABI changed");
     const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling_);
     const int64_t bytes =
         info.workspaceSize + static_cast<int64_t>(platform_.system_workspace) + kReservedWorkspaceBytes;
@@ -329,6 +340,13 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     context.epRankId = static_cast<uint32_t>(rank);
     context.rankSizePerServer = static_cast<uint32_t>(world);
     for (int64_t peer = 0; peer < world; ++peer) {
+        if (MegaMoeImpl::UseHierarchicalRoce(&tiling_) &&
+            MegaMoeImpl::HierarchicalHost(static_cast<uint32_t>(peer)) !=
+                MegaMoeImpl::HierarchicalHost(static_cast<uint32_t>(rank))) {
+            // Cross-host operations use the local symmetric address plus PE, never
+            // an address from the MTE peer table. Keep these entries deliberately null.
+            continue;
+        }
         void* address = aclshmem_ptr(reinterpret_cast<void*>(symmetric_address), static_cast<int32_t>(peer));
         TORCH_CHECK(address != nullptr, "rank=", rank, " prepare: cannot resolve peer=", peer);
         context.epHcclBuffer_[peer] = reinterpret_cast<uint64_t>(address);
@@ -342,7 +360,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     torch::Tensor weight1, torch::Tensor weight2, torch::Tensor weight_scales1, torch::Tensor weight_scales2,
     c10::optional<torch::Tensor> timer, c10::optional<torch::Tensor> shared_weight1,
     c10::optional<torch::Tensor> shared_weight2, c10::optional<torch::Tensor> shared_weight_scales1,
-    c10::optional<torch::Tensor> shared_weight_scales2, c10::optional<torch::Tensor> out)
+    c10::optional<torch::Tensor> shared_weight_scales2, uint64_t sequence, c10::optional<torch::Tensor> out)
 {
     CheckTensor(x, 2, "x");
     CheckTensor(topk_ids, 2, "topk_ids");
@@ -448,6 +466,10 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     TORCH_CHECK(y.scalar_type() == torch::kBFloat16 && y.sizes() == x.sizes(), "out must be BF16 [BS, H]");
     torch::Tensor expert_tokens = torch::empty({experts}, x.options().dtype(torch::kInt32));
 
+    TORCH_CHECK(!MegaMoeImpl::UseHierarchicalRoce(&tiling_) ||
+                    (sequence > 0 && sequence <= std::numeric_limits<uint32_t>::max()),
+                "RoCE invocation sequence exhausted; recreate SymmBuffer collectively");
+    tiling_.hierarchicalSequence = static_cast<uint32_t>(sequence);
     const auto stream = c10_npu::getCurrentNPUStream();
     auto ptr = [](const torch::Tensor& tensor) { return static_cast<uint8_t*>(tensor.data_ptr()); };
     auto opt = [&](const c10::optional<torch::Tensor>& tensor) { return tensor ? ptr(*tensor) : nullptr; };
@@ -477,16 +499,27 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
     return {y, expert_tokens};
 }
 
-int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden)
+int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden,
+                    int64_t ranks_per_node)
 {
     TORCH_CHECK(world >= 2 && world <= 128 && experts >= 1 && experts <= 128 && tokens >= 1 && tokens <= 65536 &&
                     topk >= 1 && topk <= 32 && topk <= world * experts && hidden >= 1024 && hidden <= 8192 &&
                     hidden % 64 == 0,
                 "Invalid buffer shape");
+    TORCH_CHECK(ranks_per_node == 0 || (ranks_per_node > 0 && ranks_per_node <= world && world % ranks_per_node == 0),
+                "ranks_per_node must divide EP");
+    const bool hierarchical = ranks_per_node == MegaMoeImpl::HIERARCHICAL_RANKS_PER_HOST && world > ranks_per_node;
+    TORCH_CHECK(!hierarchical || world == MegaMoeImpl::HIERARCHICAL_WORLD_SIZE,
+                "MTE+RoCE MegaMoE currently requires EP32 on two 16-rank hosts");
     // The buffer outlives BS/weight-mode changes. Reserve the decode rail/count
     // layout as well; prefill continues to bind its original device offsets.
     const MegaMoeImpl::PeermemSizeParams params{
-        tokens, topk, hidden, experts, world, 2, 1, false, false, MegaMoeImpl::TOPO_TYPE_MTE, true};
+        tokens, topk,
+        hidden, experts,
+        world,  2,
+        1,      false,
+        false,  hierarchical ? MegaMoeImpl::TOPO_TYPE_MTE_ROCE : MegaMoeImpl::TOPO_TYPE_MTE,
+        true,   static_cast<uint32_t>(ranks_per_node)};
     return AlignUp<int64_t>(MegaMoeImpl::EXCEPTION_DUMP_REGION_SIZE + MegaMoeImpl::CalcPeermemLeastSize(params),
                             2LL << 20);
 }

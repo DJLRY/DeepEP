@@ -132,6 +132,7 @@ def validate_shmem_sdk(root, expected):
     sdk = json.loads(manifest.read_text(encoding="utf-8"))
     if sdk.get("revision") != expected["revision"]:
         raise RuntimeError("SHMEM SDK source revision differs from dependencies.lock.json")
+    shmem_rdma_backend(sdk)
     for relative, digest in expected["header_sha256_lf"].items():
         data = (manifest.parent / "include" / relative).read_bytes().replace(b"\r\n", b"\n")
         if hashlib.sha256(data).hexdigest() != digest:
@@ -145,6 +146,14 @@ def validate_shmem_sdk(root, expected):
     if "lib/libshmem.so" not in sdk["sha256"] or not any(key.startswith("include/") for key in sdk["sha256"]):
         raise RuntimeError("SHMEM SDK manifest must cover headers and libshmem.so")
     return sdk
+
+
+def shmem_rdma_backend(sdk):
+    """Use the SDK provider's build identity, never infer the NIC from card count."""
+    build = sdk.get("build", {})
+    if not isinstance(build, dict) or build.get("rdma_backend", "NONE") not in ("NONE", "XSCALE", "HNS_1825"):
+        raise RuntimeError("SHMEM SDK rdma_backend must be NONE, XSCALE or HNS_1825")
+    return build.get("rdma_backend", "NONE")
 
 
 def build_cache_key(configuration):
@@ -220,6 +229,7 @@ def build_configuration(environment=None):
         sdk = json.loads(manifest.read_text(encoding="utf-8"))
         if not isinstance(sdk, dict):
             raise ValueError("Invalid SHMEM SDK manifest")
+        shmem_rdma_backend(sdk)
         if sdk.get("revision") != lock["shmem"]["revision"]:
             raise RuntimeError("SHMEM SDK source revision differs from dependencies.lock.json")
         for relative, expected in lock["shmem"]["header_sha256_lf"].items():
@@ -251,6 +261,7 @@ def build_configuration(environment=None):
     # Record actual inputs so replacing an unpinned SDK invalidates the build cache.
     result["shmem"] = {
         "revision": sdk.get("revision", "unknown") if isinstance(sdk, dict) else "unknown",
+        "rdma_backend": shmem_rdma_backend(sdk) if isinstance(sdk, dict) else "NONE",
         "sha256": {
             path.relative_to(manifest.parent).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in files
@@ -394,6 +405,7 @@ class CMakeBuild(build_ext):
             f"-DCMAKE_CXX_COMPILER={configuration['compiler_path']}",
             f"-DASCEND_HOME_PATH={configuration['ASCEND_HOME_PATH']}",
             f"-DSHMEM_ROOT={configuration['SHMEM_ROOT']}",
+            f"-DDEEPEP_SHMEM_RDMA_BACKEND={configuration['shmem']['rdma_backend']}",
             f"-DDEEPEP_BUILD_MEGAMOE={'ON' if megamoe.get('enabled', False) else 'OFF'}",
             f"-DDEEPEP_MEGAMOE_TIMER={'ON' if megamoe.get('timer', False) else 'OFF'}",
             f"-DCATLASS_ROOT={configuration.get('CATLASS_ROOT', '')}",

@@ -31,7 +31,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 4:
+    if getattr(extension, "api_protocol", None) != 5:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -109,6 +109,9 @@ class SymmBuffer:
                 raise ValueError("Experts must divide EP, with at most 128 local experts")
             if ranks_per_node and size % ranks_per_node:
                 raise ValueError("ranks_per_node must divide EP (contiguous node-major ranks)")
+            if ranks_per_node == 16 and size > 16:
+                if size != 32 or mma_type != "fp8xfp4":
+                    raise ValueError("MTE+RoCE MegaMoE requires EP32 on two 16-rank hosts and FP8xFP4 weights")
         except (TypeError, ValueError) as failure:
             error = str(failure)
         # 在进入 SHMEM 之前共同校验布局，不能各 rank 各自选择通信偏移。
@@ -126,7 +129,9 @@ class SymmBuffer:
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
-        capacity = int(ext.buffer_size(size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden))
+        capacity = int(
+            ext.buffer_size(size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, ranks_per_node)
+        )
         self._lock = threading.Lock()
         self._device = torch.device(f"npu:{npu_api().current_device()}")
         self._plan = self._plan_bs = None
@@ -135,6 +140,8 @@ class SymmBuffer:
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
         self.ranks_per_node = ranks_per_node
+        self._hierarchical_roce = ranks_per_node == 16 and size > 16
+        self._sequence = 0
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
         try:
@@ -143,7 +150,7 @@ class SymmBuffer:
             error = str(failure)
         # 输入分配失败先通知所有 rank，再进入 SHMEM，避免其他 rank 已在建链等待。
         collective_check(group, "input allocation", error)
-        self._runtime = _MegaRuntime(group, capacity, timeout)
+        self._runtime = _MegaRuntime(group, capacity, timeout, ranks_per_node=ranks_per_node)
 
     def allocate_inputs(self):
         """Legacy idempotent helper. Inputs are already allocated by the constructor."""
@@ -167,6 +174,8 @@ class SymmBuffer:
 
     def _prepare(self, bs):
         integer("BS", bs, 1, self.num_max_tokens_per_rank)
+        if self._hierarchical_roce and bs >= 32:
+            raise ValueError("MTE+RoCE MegaMoE currently supports decode BS in [1,31]")
         if self._plan_bs == bs:
             return
         # 只保留当前 BS 的计划，不让不同 BS 的最坏容量 workspace 累积占满 HBM。
@@ -507,7 +516,15 @@ def _run(
         # 同一 owner 的调用串行进入专属流，禁止不同流覆盖仍在使用的对称空间。
         with npu_api().stream(runtime.stream):
             b._prepare(data.shape[0])
-            result = b._plan.forward(data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, out)
+            sequence = b._sequence + 1 if b._hierarchical_roce else 0
+            if sequence > 0xFFFFFFFF:
+                raise RuntimeError("RoCE invocation sequence exhausted; recreate SymmBuffer collectively")
+            result = b._plan.forward(
+                data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, sequence, out
+            )
+            # Keep the sequence in the buffer, not the BS-specific Plan. Failed
+            # pre-launch validation does not consume an invocation ID.
+            b._sequence = sequence
             if cumulative_stats is not None:
                 cumulative_stats.add_(result[1])
                 cumulative_stats.record_stream(runtime.stream)

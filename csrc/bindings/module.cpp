@@ -18,6 +18,7 @@ namespace py = pybind11;
 PYBIND11_MODULE(_C, module)
 {
     module.attr("runtime_protocol") = 1;
+    module.attr("shmem_rdma_backend") = DEEPEP_SHMEM_RDMA_BACKEND;
     module.def("shmem_library_path", []() {
         Dl_info info{};
         if (dladdr(reinterpret_cast<void*>(&aclshmemx_init_attr), &info) == 0 || info.dli_fname == nullptr) {
@@ -51,10 +52,12 @@ PYBIND11_MODULE(_C, module)
 #ifdef DEEPEP_BUILD_MEGAMOE
     module.def(
         "create_megamoe_runtime",
-        [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout) {
-            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, false, true);
+        [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool roce) {
+            return std::make_unique<deepep::Session>(rank, size, bytes, endpoint, timeout, false, true, false, false,
+                                                     roce);
         },
-        py::call_guard<py::gil_scoped_release>());
+        py::arg("rank"), py::arg("size"), py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"),
+        py::arg("roce") = false, py::call_guard<py::gil_scoped_release>());
     module.def("megamoe_workspace_address", &deepep::Session::workspace_address);
 #endif
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED

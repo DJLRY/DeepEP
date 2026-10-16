@@ -98,6 +98,11 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
         "compiler_path": "/tools/c++",
         "ASCEND_HOME_PATH": "/sdk/cann",
         "SHMEM_ROOT": "/sdk/shmem",
+        "shmem": {
+            "revision": "test-sdk",
+            "rdma_backend": "NONE",
+            "sha256": {"lib/libshmem.so": "0" * 64},
+        },
         "build_type": "RelWithDebInfo",
         "python_executable": "/private/python",
         "build_environment": {"CXXFLAGS": "-I/private/include"},
@@ -148,6 +153,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
     command.build_extension(ext)
     assert "-DCMAKE_BUILD_TYPE=RelWithDebInfo" in calls[0]
     assert f"-DDEEPEP_DEVICE_JOBS={expected_jobs}" in calls[0]
+    assert "-DDEEPEP_SHMEM_RDMA_BACKEND=NONE" in calls[0]
     assert f"-Dpybind11_DIR={pybind11_cmake_dir}" in calls[0]
     assert f"-DDEEPEP_BUILD_EP_GMM_FUSED={'ON' if ep_gmm_fused else 'OFF'}" in calls[0]
     assert calls[1][-2:] == ["--parallel", expected_jobs]

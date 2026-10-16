@@ -36,9 +36,17 @@ bool Session::busy()
 }
 
 Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
-                 bool megamoe, bool mpi, bool combine_only)
+                 bool megamoe, bool mpi, bool combine_only, bool roce)
 {
     if (combine_only && (!udma || megamoe)) throw std::invalid_argument("Combine-only requires UDMA");
+    if (roce && (!megamoe || udma || mpi || combine_only || size != 32)) {
+        throw std::invalid_argument("RoCE requires the two-host EP32 MegaMoE runtime");
+    }
+#ifndef DEEPEP_MEGAMOE_ROCE
+    if (roce) {
+        throw std::runtime_error("Rebuild MegaMoE with an XSCALE or HNS_1825 SHMEM SDK for RoCE");
+    }
+#endif
     const char* dense_env = std::getenv("DEEPEP_SHMEM_DENSE_QPS");
     const std::string dense = dense_env == nullptr ? "0" : dense_env;
     if (dense != "0" && dense != "1") throw std::invalid_argument("DEEPEP_SHMEM_DENSE_QPS must be 0 or 1");
@@ -72,8 +80,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     aclshmemx_uniqueid_t uid{};
     attr.my_pe = rank;
     attr.n_pes = size;
-    const uint64_t allocation_bytes = bytes +
-        ((bytes == (8ULL << 30)) ? (2ULL << 20) : 0ULL);
+    const uint64_t allocation_bytes = bytes + ((bytes == (8ULL << 30)) ? (2ULL << 20) : 0ULL);
     attr.local_mem_size = allocation_bytes;
     if (!mpi) {
         std::memcpy(attr.ip_port, endpoint.c_str(), endpoint.size() + 1);
@@ -81,8 +88,8 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     // A null communicator selects MPI_COMM_WORLD. The SHMEM MPI plugin owns
     // MPI_Init/Finalize when the application has not initialized MPI itself.
     attr.comm_args = mpi ? nullptr : &uid;
-    attr.option_attr.data_op_engine_type =
-        udma ? static_cast<data_op_engine_type_t>(ACLSHMEM_DATA_OP_MTE | ACLSHMEM_DATA_OP_UDMA) : ACLSHMEM_DATA_OP_MTE;
+    attr.option_attr.data_op_engine_type = static_cast<data_op_engine_type_t>(
+        ACLSHMEM_DATA_OP_MTE | (udma ? ACLSHMEM_DATA_OP_UDMA : 0) | (roce ? ACLSHMEM_DATA_OP_ROCE : 0));
     attr.option_attr.shm_init_timeout = timeout;
     attr.option_attr.shm_create_timeout = timeout;
     attr.option_attr.control_operation_timeout = timeout;
@@ -97,6 +104,10 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     // A failed initialization can leave SDK state behind. Keep the process
     // reserved until a new process is launched; do not finalize foreign state.
     occupied = true;
+    if (roce) {
+        // QP0 belongs to SDK operations; one sender owns application QP1 per peer.
+        check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, 2), "aclshmemx_set_qp_num (RoCE)");
+    }
     if (udma) {
         // Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.
         // Serialized operators reuse the bank, not concurrent SQ writers.
@@ -119,9 +130,9 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     check(aclshmemx_init_attr(mpi ? ACLSHMEMX_INIT_WITH_MPI : ACLSHMEMX_INIT_WITH_DEFAULT, &attr),
           "aclshmemx_init_attr");
     try {
-        // Peer-table aggregate packets require physical 512B boundaries, not
-        // merely 512B-relative offsets within a possibly 16B-aligned allocation.
-        workspace_ = udma ? aclshmem_align(512U, allocation_bytes) : aclshmem_malloc(allocation_bytes);
+        // Peer-table packets and MegaMoE RoCE flags require physical 512B
+        // boundaries, not merely aligned offsets within a 16B-aligned allocation.
+        workspace_ = (udma || roce) ? aclshmem_align(512U, allocation_bytes) : aclshmem_malloc(allocation_bytes);
         if (workspace_ == nullptr) {
             throw std::runtime_error("aclshmem_malloc failed");
         }

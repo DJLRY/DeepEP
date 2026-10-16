@@ -3,7 +3,7 @@ Copyright (c) 2026, Lu Lu
 Modified by Joyce_An 2026
 -->
 
-# MegaMoE Prefill Beta
+# MegaMoE Prefill / Decode Beta
 
 公开入口：`deep_ep_experimental.megamoe`。W4A8 共享专家按实际单卡 B 自动选择小 BS / Prefill 策略；路由专家保留 Prefill 调度。
 构建和多机测试入口位于本目录的 `scripts/`；机器地址及环境配置由使用者提供。
@@ -59,7 +59,7 @@ from deep_ep_experimental.megamoe import (
 )
 
 # torchrun 启动后先 torch.npu.set_device(local_rank)。
-group = StoreGroup.from_env()  # 主机协调用 TCPStore，算子通信用 SHMEM + MTE
+group = StoreGroup.from_env()  # 主机协调用 TCPStore，算子通信用 SHMEM
 buffer = SymmBuffer(
     group, num_experts=384, num_max_tokens_per_rank=4096, num_topk=6,
     hidden=7168, intermediate_hidden=3072,
@@ -74,6 +74,7 @@ buffer = SymmBuffer(
 
 约束：EP=2～128，E 可整除 EP 且每卡最多 128 个路由专家；S=0～8；B=1～65536；
 H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(32,E)。
+下面的 16 卡跨机路径另限 EP32、W4A8 和实际 B=1～31。
 各 rank 必须同序、同 B 调用；仅推理，不支持反向、空/不等长 B 或图捕获。
 `mma_type="fp8xfp8"` 是保留入口，不支持共享专家/timer；**下文 benchmark 固定测试 W4A8，不提供权重 dtype 开关**。
 
@@ -99,7 +100,7 @@ Token Combine 按实际单卡 B 选择：B≤256 使用六槽，B>256 使用两�
 输出握手再推进一次；大 BS 使用输入/输出跨卡握手。共享 GMM1 后无需全核屏障。
 共享 SwiGLU 在 AIV1 上优先于 Combine，共享 GMM2 按本核路由完成及共享激活就绪推进。
 S=0 的 W4A8 小 BS 也使用上述量化完成/count 就绪协议；W8A8 使用输入/输出跨卡握手。
-tiling ABI 为 224 字节。
+tiling ABI 为 232 字节。
 CATLASS GMM 的布局和同步机制见 [GMM 说明](csrc/kernels/mega_moe/catlass_gmm/README.md)。
 
 所有 rank 必须按相同顺序、相同 B 调用，切换 B 时在计时前集体调用 `prepare(B)`。
@@ -112,7 +113,8 @@ CATLASS GMM 的布局和同步机制见 [GMM 说明](csrc/kernels/mega_moe/catla
 ## 2. 编译安装
 
 W4A8 在 B≤256 时使用较小 wave、rail 路由中转和打包 count。
-rail 按每8个 rank 一组，EP≤8 或完整8卡分组启用，其余 EP 回退直发路由。
+原有路径的 rail 按每8个 rank 一组，EP≤8 或完整8卡分组启用，其余 EP 回退直发路由。
+显式指定 `ranks_per_node=16` 时 rail 使用16卡分组；跨机采用下文的 MTE＋RoCE 路径。
 B>256 保留 Prefill 输入协议，所有路径保留输出跨卡同步。
 
 要求 Linux、Python ≥3.11、Ascend950、CANN 9.2.0 及匹配的 Torch/torch_npu；框架环境由使用者准备。
@@ -134,10 +136,76 @@ python -m pip show ascend-deepep
 wheel 位于 `dist/build-*/`；运行前按构建输出设置 SHMEM 的 `LD_LIBRARY_PATH`。
 基础包的 `pip wheel` 默认关闭 MegaMoE，详见[构建文档](../../docs/build.md)。
 
+两机各16卡需要按实际网卡构建 RoCE SDK。XSCALE 与 HNS_1825 二选一，例如：
+
+```bash
+# 已有默认 SHMEM 构建时，先停止使用该 SDK 的作业，再显式重建。
+bash experiments/megamoe/scripts/build.sh --rdma-backend XSCALE --rebuild-shmem
+# 使用 HNS 1825 网卡时，将 XSCALE 换成 HNS_1825。
+```
+
+首次构建可省略 `--rebuild-shmem`。后续复用仓内 SDK 时继续传入相同的 `--rdma-backend`。
+默认值 `NONE` 保留不启用 RoCE 的 SDK 构建；16卡单机及原有8卡分组路径不要求 RoCE。
+后端写入 `deepep-sdk.json` 并参与构建缓存和复用检查，MegaMoE 的 Host/Device 编译自动采用匹配配置。
+外部 SDK 需由提供方登记真实后端，见[SDK 登记说明](../../docs/build.md#分步骤构建外部-sdk打包或-ci)。
+所有运行节点安装相同 wheel、使用与 wheel 匹配的 SHMEM 库，并按部署环境配置 NPU—NIC 绑定与 RoCE 网络。
+`DEEPEP_SHMEM_ENDPOINT` 是进程会合地址，不替代网卡 IP/GID 配置。
+
 ## 3. 多机测试
 
-### 配置与启动
+### 两机各16卡：MTE＋RoCE Decode
 
+通信模式由已有的 `ranks_per_node` 决定，没有新增公开 `transport` 参数：
+
+| 配置 | 通信路径 |
+| --- | --- |
+| `ranks_per_node=8` | 保留原有 MTE 路径 |
+| `ranks_per_node=16`、EP16、同一主机 | MTE |
+| `ranks_per_node=16`、EP32、两台主机 | 机内 MTE，跨机 RoCE |
+
+`ranks_per_node=0` 保留原有默认行为，不自动检测16卡平台。两机路径要求一台机器对应 rank 0～15、
+另一台对应 rank 16～31，gateway 配对为 `0↔16`、`1↔17`、…、`15↔31`。
+初始化会集体验证 Linux 主机身份、设备唯一性、rank 分组、SDK 后端及库身份；不匹配即报错。
+两机路径当前只接受 `mma_type="fp8xfp4"`（W4A8）、实际每卡 B=1～31；
+FP8 和内部量化的 BF16 输入均沿用原接口，容量可大于实际 B。B≥32、W8A8 及更多16卡主机暂不支持。
+
+在两台已分配设备的机器上分别执行下列命令，只将 `NODE_RANK` 改为0或1。
+地址和端口是占位示例，需替换为实际配置；两台机器各启动16个进程：
+
+```bash
+export MASTER_ADDR=192.0.2.1
+export MASTER_PORT=29654
+export DEEPEP_SHMEM_ENDPOINT=tcp://192.0.2.1:26733
+export NODE_RANK=0  # 另一台机器使用1。
+torchrun --nnodes=2 --nproc-per-node=16 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" --max-restarts=0 \
+  --module deep_ep_experimental.megamoe.example --input bf16
+```
+
+示例使用 B=17，并从 `LOCAL_WORLD_SIZE` 传入 `ranks_per_node=16`。它检查输出有限性，
+完整精度比较仍需 benchmark 的 CPU Golden。共享存储上先生成所需 case 的 Golden，再在两台机器启动：
+
+```bash
+# 仅生成一次；参数须与后续 benchmark 完全一致。
+python -m deep_ep_experimental.megamoe.golden --config deepseek_v4_pro \
+  --bs-values 1,17,31 --ep-size 32 --ranks 0-31 --input bf16 --routing balanced \
+  --golden-dir /path/to/shared/golden
+
+# 每台机器分别运行，沿用上面的 MASTER_*、NODE_RANK 和 SHMEM 环境。
+torchrun --nnodes=2 --nproc-per-node=16 --node-rank="$NODE_RANK" \
+  --master-addr="$MASTER_ADDR" --master-port="$MASTER_PORT" --max-restarts=0 \
+  --module deep_ep_experimental.megamoe.benchmark --config deepseek_v4_pro \
+  --bs-values 1,17,31 --mode accuracy --input bf16 --routing balanced \
+  --golden-dir /path/to/shared/golden --output-dir /path/to/new/accuracy-run
+```
+
+性能测试将 `--mode accuracy` 改为 `--mode perf`，并选择新的输出目录；计时范围仍遵循下文说明。
+还应覆盖 FP8 输入、random/skewed 路由、S=0/1、重复调用及 B 切换。
+本分支的真实 CANN 编译、两机 NPU 精度、RDMA 到达可见性和性能验收仍待完成；CPU 测试不代表设备通过。
+
+### 原有每机8卡：配置与启动
+
+下面的 `batch_launch.py` 仍按每机8个进程组织作业；两机16卡使用上面的 `torchrun` 命令。
 所有节点需要相同绝对路径的共享 checkout、匹配的 Conda/CANN 环境、SSH 访问和每机8张空闲 NPU。
 在仓库外创建机器配置，通过 `--hosts-file` 显式传入。以下地址仅用于文档示例，需替换为已分配的节点：
 

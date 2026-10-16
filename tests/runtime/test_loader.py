@@ -37,10 +37,12 @@ def test_native_loader_identity(monkeypatch, tmp_path, fault):
         if fault == "checksum":
             with pytest.warns(RuntimeWarning, match="Loaded SHMEM library differs"):
                 assert _native._load_native() is module
+                assert module.shmem_sdk_matches is False
         elif fault:
             with pytest.raises(ImportError):
                 _native._load_native()
         else:
             assert _native._load_native() is module
+            assert module.shmem_sdk_matches is True
     finally:
         _native._load_native.cache_clear()

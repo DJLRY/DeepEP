@@ -138,8 +138,9 @@ def backend(monkeypatch):
     monkeypatch.setattr(api, "require_native", lambda _: SimpleNamespace(megamoe_workspace_address=lambda _: 4096))
 
     class Runtime:
-        def __init__(self, group, capacity, timeout):
+        def __init__(self, group, capacity, timeout, *, ranks_per_node=0):
             self.device, self.stream, self.native = 0, stream, SimpleNamespace(capacity=capacity)
+            self.ranks_per_node = ranks_per_node
             self.closed = False
 
         def ensure_alive(self):
@@ -443,3 +444,76 @@ def test_plan_allocation_failure_is_collective_and_retryable(backend):
     backend.ext.Plan = plan_type
     backend.buffer.prepare(17)
     assert backend.buffer._plan_bs == 17
+
+
+def hierarchical_buffer(backend, *, size=32, mma_type="fp8xfp4"):
+    from deep_ep._store import StoreGroup
+
+    group = StoreGroup(None, 0, size, prefix="hierarchical-api-test")
+    group.all_gather = lambda value, stage: [value] * size
+    buffer = api.SymmBuffer(group, size * 2, 32, 2, 1024, 256, ranks_per_node=16, mma_type=mma_type)
+    buffer.topk_idx.data[:] = [0, size]
+    buffer.topk_weights.data[:] = [0.4, 0.6]
+    return buffer
+
+
+def test_hierarchical_sequence_survives_plan_recreation_and_old_epoch_wrap(backend):
+    b = hierarchical_buffer(backend)
+    assert b._runtime.ranks_per_node == 16 and b._hierarchical_roce
+    pairs = weights()
+    try:
+        for sequence in range(1, 260):
+            bs = (1, 7, 31)[sequence % 3]
+            api.fp8_fp4_mega_moe(Tensor(np.zeros((bs, 1024)), "bfloat16"), *pairs, b)
+            launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
+            assert launch[-2] == sequence and b._sequence == sequence
+            assert b._plan_bs == bs
+        with pytest.raises(ValueError, match=r"BS in \[1,31\]"):
+            b.prepare(32)
+        assert b._sequence == 259
+    finally:
+        b.destroy()
+
+
+def test_hierarchical_launch_failure_and_sequence_exhaustion(backend, monkeypatch):
+    b = hierarchical_buffer(backend)
+    try:
+        b.prepare(1)
+        plan = b._plan
+        launch = plan.forward
+
+        def fail(*args):
+            raise RuntimeError("launch rejected")
+
+        monkeypatch.setattr(plan, "forward", fail)
+        with pytest.raises(RuntimeError, match="launch rejected"):
+            api.fp8_fp4_mega_moe(Tensor(np.zeros((1, 1024)), "bfloat16"), *weights(), b)
+        assert b._sequence == 0
+        monkeypatch.setattr(plan, "forward", launch)
+        b._sequence = 0xFFFFFFFE
+        api.fp8_fp4_mega_moe(Tensor(np.zeros((1, 1024)), "bfloat16"), *weights(), b)
+        assert b._sequence == 0xFFFFFFFF
+        count = len(backend.events)
+        with pytest.raises(RuntimeError, match="sequence exhausted"):
+            api.fp8_fp4_mega_moe(Tensor(np.zeros((1, 1024)), "bfloat16"), *weights(), b)
+        assert not any(isinstance(e, tuple) and e[0] == "launch" for e in backend.events[count:])
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("size,mma_type", [(64, "fp8xfp4"), (32, "fp8xfp8")])
+def test_hierarchical_unsupported_configuration_fails_collectively(backend, size, mma_type):
+    with pytest.raises(ValueError, match="MTE\\+RoCE MegaMoE requires EP32"):
+        hierarchical_buffer(backend, size=size, mma_type=mma_type)
+
+
+def test_sixteen_rank_single_host_keeps_mte(backend):
+    b = hierarchical_buffer(backend, size=16)
+    try:
+        assert not b._hierarchical_roce
+        b.prepare(32)
+        api.fp8_fp4_mega_moe(Tensor(np.zeros((32, 1024)), "bfloat16"), *weights(), b)
+        launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
+        assert launch[-2] == 0 and b._sequence == 0
+    finally:
+        b.destroy()

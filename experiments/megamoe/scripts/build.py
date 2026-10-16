@@ -19,7 +19,7 @@ sys.path.insert(0, str(ROOT / "scripts"))
 from build_shmem import cann_version, prepare  # noqa: E402
 
 
-def build(root=ROOT, *, rebuild_shmem=False):
+def build(root=ROOT, *, rebuild_shmem=False, rdma_backend=None):
     root = Path(root).resolve()
     if platform.system() != "Linux" or sys.version_info < (3, 11):
         raise RuntimeError("Build requires Linux and Python >= 3.11")
@@ -44,6 +44,8 @@ def build(root=ROOT, *, rebuild_shmem=False):
             env[name] = str(Path(env[name]).resolve())
     if rebuild_shmem and "SHMEM_ROOT" in env:
         raise ValueError("--rebuild-shmem only rebuilds the bundled SDK; unset SHMEM_ROOT first")
+    if rdma_backend not in {None, "NONE", "XSCALE", "HNS_1825"}:
+        raise ValueError("rdma_backend must be NONE, XSCALE or HNS_1825")
 
     # Git 的 HTTPS helper 使用系统库，避免加载 Python/CANN 环境中的 OpenSSL 等动态库。
     git_env = dict(env)
@@ -76,7 +78,7 @@ def build(root=ROOT, *, rebuild_shmem=False):
         submodule("catlass", lock["megamoe"]["catlass_revision"])
     run([sys.executable, "-m", "pip", "install", "-r", str(root / "requirements-build.txt")])
     if "SHMEM_ROOT" not in env:
-        prepare(root, rebuild=rebuild_shmem, if_needed=True)
+        prepare(root, rebuild=rebuild_shmem, if_needed=True, rdma_backend=rdma_backend or "NONE")
         env["SHMEM_ROOT"] = str(root / "third-party/shmem/install/shmem")
     env.setdefault("CATLASS_ROOT", str(root / "third-party/catlass"))
     env["LD_LIBRARY_PATH"] = str(Path(env["SHMEM_ROOT"]) / "lib") + ":" + env.get("LD_LIBRARY_PATH", "")
@@ -84,7 +86,9 @@ def build(root=ROOT, *, rebuild_shmem=False):
     sys.path.insert(0, str(ROOT))
     from build_support import build_configuration
 
-    build_configuration(env)
+    configuration = build_configuration(env)
+    if rdma_backend is not None and configuration["shmem"]["rdma_backend"] != rdma_backend:
+        raise RuntimeError("Selected --rdma-backend does not match the installed SHMEM SDK identity")
     (root / "dist").mkdir(exist_ok=True)
     wheel_dir = Path(tempfile.mkdtemp(prefix="build-", dir=root / "dist"))
     run([sys.executable, "-m", "pip", "wheel", ".", "--no-build-isolation", "--no-deps", "-w", str(wheel_dir)])
@@ -106,9 +110,14 @@ def build(root=ROOT, *, rebuild_shmem=False):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
+        "--rdma-backend",
+        choices=("NONE", "XSCALE", "HNS_1825"),
+        help="RoCE NIC backend for the bundled SDK, or expected backend for SHMEM_ROOT",
+    )
+    parser.add_argument(
         "--rebuild-shmem",
         action="store_true",
         help="Regenerate bundled SHMEM build/install; stop all users of that SDK first",
     )
     args = parser.parse_args()
-    build(rebuild_shmem=args.rebuild_shmem)
+    build(rebuild_shmem=args.rebuild_shmem, rdma_backend=args.rdma_backend)

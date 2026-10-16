@@ -28,12 +28,16 @@ target_compile_options(_C PRIVATE "$<$<NOT:$<CONFIG:Debug>>:-O2>" -Wall -Wextra 
 target_compile_options(_C PRIVATE "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
     "-ffile-prefix-map=${SHMEM_ROOT}=SHMEM_SDK" "-ffile-prefix-map=${ASCEND_HOME_PATH}=CANN_SDK")
 target_compile_definitions(_C PRIVATE "$<$<NOT:$<CONFIG:Debug>>:_FORTIFY_SOURCE=2>")
+target_compile_definitions(_C PRIVATE DEEPEP_SHMEM_RDMA_BACKEND="${DEEPEP_SHMEM_RDMA_BACKEND}")
 target_link_options(_C PRIVATE -Wl,-z,relro,-z,now,-z,noexecstack)
 # SDKs are external dependencies. Never embed checkout/toolkit absolute RPATHs.
 set_target_properties(_C PROPERTIES INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
 install(TARGETS _C LIBRARY DESTINATION .)
 if(DEEPEP_BUILD_MEGAMOE)
     target_compile_definitions(_C PRIVATE DEEPEP_BUILD_MEGAMOE=1)
+    if(NOT DEEPEP_SHMEM_RDMA_BACKEND STREQUAL "NONE")
+        target_compile_definitions(_C PRIVATE DEEPEP_MEGAMOE_ROCE=1)
+    endif()
     add_subdirectory(experiments/megamoe)
 elseif(DEEPEP_MEGAMOE_TIMER)
     message(FATAL_ERROR "DEEPEP_MEGAMOE_TIMER requires DEEPEP_BUILD_MEGAMOE")

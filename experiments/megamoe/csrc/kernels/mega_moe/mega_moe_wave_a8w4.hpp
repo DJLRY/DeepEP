@@ -349,6 +349,10 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         }
         if (hasCombine && TryRunReadyCombine(combine)) {
             hasCombine = NextAivSlice(combine, false);
+            this->TryProgressRemoteCombine();
+            continue;
+        }
+        if (this->TryProgressRemoteCombine()) {
             continue;
         }
         // 没有可执行任务才退避；不能进入 Combine 的阻塞等待，否则可能挡住 GMM2 所需的 SwiGLU。
@@ -389,6 +393,7 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::RunGmm2
             this->template RunGmm2CombineForExpert<FuseGateUp>(
                 gmm2State, gmm2AddrInfo, startBlockIdx, sliceTokenStartIndexInExpert, sliceTokenCount,
                 combineBufferConfig, combineRowSequence, gmm1TileReadySequence, isFinalCombine, true);
+            this->TryProgressRemoteCombine();
         }
     }
     if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {

@@ -50,7 +50,7 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
         elif case == "device":
             peer[6] = 0
         elif case == "engine":
-            peer[7] = 1
+            peer[-1] = 1
         return [local, peer]
 
     if backend == "store":
@@ -85,5 +85,79 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
         try:
             assert len(created) == 1
             assert created[0][:3] == (0, 2, 2 << 20)
+        finally:
+            runtime.close()
+
+
+@pytest.mark.parametrize(
+    "world,ranks_per_node,case,error",
+    [
+        (32, 16, "normal", None),
+        (16, 16, "no-rdma", None),
+        (32, 8, "no-rdma", None),
+        (32, 16, "no-rdma", "requires an XSCALE or HNS_1825"),
+        (32, 16, "sdk-mismatch", "requires an XSCALE or HNS_1825"),
+        (32, 16, "peer-no-rdma", "requires an XSCALE or HNS_1825"),
+        (32, 16, "backend-mismatch", "disagree on SHMEM RDMA backend"),
+        (32, 16, "interleaved", "contiguous groups of 16"),
+        (32, 16, "one-host", "contiguous groups of 16"),
+        (32, 16, "config-mismatch", "disagree on ranks_per_node"),
+        (64, 16, "normal", "supports EP16 or two-host EP32"),
+    ],
+)
+def test_megamoe_roce_collective_bootstrap(monkeypatch, world, ranks_per_node, case, error):
+    monkeypatch.setattr(_runtime, "endpoint", lambda: "tcp://127.0.0.1:19091")
+    monkeypatch.setattr(_runtime, "_OWNER", None)
+    monkeypatch.setattr(_runtime, "_host_boot_id", lambda: "test-host")
+    created = []
+    native = SimpleNamespace(
+        Runtime=lambda *args: pytest.fail("Unexpected core runtime"),
+        runtime_busy=lambda: False,
+        create_megamoe_runtime=lambda *args: created.append(args) or SimpleNamespace(close=lambda: None),
+        shmem_rdma_backend="NONE" if case == "no-rdma" else "XSCALE",
+        shmem_sdk_matches=case != "sdk-mismatch",
+    )
+    monkeypatch.setattr(_runtime, "require_native", lambda operation: native)
+    monkeypatch.setattr(
+        _runtime,
+        "npu_api",
+        lambda: SimpleNamespace(
+            current_device=lambda: 0, Stream=lambda **kwargs: SimpleNamespace(synchronize=lambda: None)
+        ),
+    )
+
+    def exchange(local, stage):
+        peers = []
+        for rank in range(world):
+            peer = list(local)
+            peer[4] += rank // ranks_per_node
+            peer[6] = rank % ranks_per_node
+            if case == "interleaved":
+                peer[4], peer[6] = local[4] + rank % 2, rank // 2
+            elif case == "one-host":
+                peer[4], peer[6] = local[4], rank
+            if rank == world - 1:
+                if case == "peer-no-rdma":
+                    peer[8] = 0
+                elif case == "backend-mismatch":
+                    peer[8] = 2
+                elif case == "config-mismatch":
+                    peer[7] = 8
+            peers.append(peer)
+        return peers
+
+    group = StoreGroup(None, 0, world, prefix="test-roce")
+    monkeypatch.setattr(group, "all_gather", exchange)
+    if error is not None:
+        with pytest.raises((ValueError, RuntimeError), match=error):
+            _MegaRuntime(group, 2 << 20, ranks_per_node=ranks_per_node)
+        assert not created
+        assert _runtime._OWNER is None
+    else:
+        runtime = _MegaRuntime(group, 2 << 20, ranks_per_node=ranks_per_node)
+        try:
+            assert runtime.use_roce == (ranks_per_node == 16 and world > 16)
+            assert len(created) == 1
+            assert created[0][5:] == ((True,) if runtime.use_roce else ())
         finally:
             runtime.close()

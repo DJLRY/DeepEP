@@ -18,6 +18,7 @@ struct SendMaskConfig {
     uint64_t railTopkIdsWinOffset;
     uint64_t railTopkIdsSlotBytes;
     uint32_t serverNum;
+    uint32_t ranksPerServer;
     MegaMoeSendMaskBufferConfig bufferConfig;
 };
 
@@ -39,7 +40,9 @@ __aicore__ inline SendMaskConfig CreateSendMaskConfig(const Params& params, uint
                                         : static_cast<uint64_t>(params.peermemInfo.railTopkIdsRecvPtr -
                                                                 params.peermemInfo.rankSyncInWorldPtr),
             .railTopkIdsSlotBytes = static_cast<uint64_t>(CalcRailTopkIdsSlotBytes(params.tilingData)),
-            .serverNum = static_cast<uint32_t>(CalcServerNum(params.tilingData->epWorldSize)),
+            .serverNum =
+                static_cast<uint32_t>(CalcServerNum(params.tilingData->epWorldSize, RailServerSize(params.tilingData))),
+            .ranksPerServer = static_cast<uint32_t>(RailServerSize(params.tilingData)),
             .bufferConfig = bufferConfig};
 }
 
@@ -290,9 +293,8 @@ __aicore__ inline void SendTopkIdsToRailServer(const MoeStageCommonConfig& commo
                                                SendMaskScratch& scratch, uint32_t targetServerIdx)
 {
     const int32_t itemsPerBatch = RailItemsPerBatch(config.bufferConfig);
-    const uint32_t railRank = targetServerIdx * static_cast<uint32_t>(MEGA_MOE_SERVER_SIZE) +
-                              common.rankId % static_cast<uint32_t>(MEGA_MOE_SERVER_SIZE);
-    const uint32_t srcServerIdx = common.rankId / static_cast<uint32_t>(MEGA_MOE_SERVER_SIZE);
+    const uint32_t railRank = targetServerIdx * config.ranksPerServer + common.rankId % config.ranksPerServer;
+    const uint32_t srcServerIdx = common.rankId / config.ranksPerServer;
     const uint64_t slotOffset =
         config.railTopkIdsWinOffset + static_cast<uint64_t>(srcServerIdx) * config.railTopkIdsSlotBytes;
     const int32_t totalItems = static_cast<int32_t>(static_cast<uint64_t>(common.tokenNum) * common.topK);
@@ -616,8 +618,8 @@ __aicore__ inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig& com
     int32_t expectEpoch = ((ReadGmByPassDCache(launchCountSlot) + 1) & 0x7F) | 0x80;
     const int32_t realSendTotalNum = WaitRailPacketArrival(railSlotBase, expectEpoch);
     const int32_t srcTokenNum = realSendTotalNum / static_cast<int32_t>(common.topK);
-    const int32_t sourceRank = static_cast<int32_t>(relayIdx * static_cast<uint32_t>(MEGA_MOE_SERVER_SIZE) +
-                                                    common.rankId % static_cast<uint32_t>(MEGA_MOE_SERVER_SIZE));
+    const int32_t sourceRank =
+        static_cast<int32_t>(relayIdx * config.ranksPerServer + common.rankId % config.ranksPerServer);
 
     GlobalTensor<int32_t> topkIdsGm;
     topkIdsGm.SetGlobalBuffer(railSlotBase);
@@ -669,7 +671,7 @@ __aicore__ inline void GatherAndSendExpertCompactRoutesRail(const AivJobContext&
     }
 
     const uint32_t serverNum = config.serverNum;
-    const uint32_t myServer = common.rankId / static_cast<uint32_t>(MEGA_MOE_SERVER_SIZE);
+    const uint32_t myServer = common.rankId / config.ranksPerServer;
     const uint32_t jobIdx = job.jobIndex;
 
     if (jobIdx < serverNum) {
@@ -681,11 +683,9 @@ __aicore__ inline void GatherAndSendExpertCompactRoutesRail(const AivJobContext&
     }
     const uint32_t relayCoreIdx = jobIdx - serverNum;
     const uint32_t relayCoreCount = job.totalJobs - serverNum;
-    const uint32_t serverRankBegin = myServer * static_cast<uint32_t>(MEGA_MOE_SERVER_SIZE);
+    const uint32_t serverRankBegin = myServer * config.ranksPerServer;
     const uint32_t remainingRanks = common.worldSize - serverRankBegin;
-    const uint32_t serverCardCount = remainingRanks < static_cast<uint32_t>(MEGA_MOE_SERVER_SIZE)
-                                         ? remainingRanks
-                                         : static_cast<uint32_t>(MEGA_MOE_SERVER_SIZE);
+    const uint32_t serverCardCount = remainingRanks < config.ranksPerServer ? remainingRanks : config.ranksPerServer;
     const uint32_t serverExpertBegin = serverRankBegin * common.moeExpertPerRank;
     const uint32_t serverExpertNum = serverCardCount * common.moeExpertPerRank;
     for (uint32_t relayIdx = relayCoreIdx % serverNum; relayIdx < serverNum; relayIdx += relayCoreCount) {

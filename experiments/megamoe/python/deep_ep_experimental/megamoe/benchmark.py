@@ -210,7 +210,9 @@ def run(args, config, group):
         local_rank=int(os.environ["LOCAL_RANK"]),
         timer_ranks=timer_ranks,
         host_coordination="tcpstore",
-        device_communication="shmem_mte",
+        device_communication=(
+            "shmem_mte_roce" if int(os.environ["LOCAL_WORLD_SIZE"]) == 16 and world > 16 else "shmem_mte"
+        ),
         api="fp8_fp4_mega_moe",
         numerical_contract="ascend_post_gmm2_route_weight_v1",
         created_utc=datetime.now(timezone.utc).isoformat(),
