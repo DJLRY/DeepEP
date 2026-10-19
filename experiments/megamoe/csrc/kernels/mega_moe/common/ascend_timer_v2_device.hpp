@@ -13,6 +13,7 @@ public:
 #ifdef DEEPEP_MEGAMOE_TIMER
         timerAddr_ = timerAddr;
 #else
+        (void)timerAddr;
         timerAddr_ = nullptr;
         coreId_ = -1;
         return;
@@ -200,6 +201,36 @@ public:
         }
     }
 
+    // RDMA may progress inside a compute tile/span. Keep its handle independent
+    // of activeType_/waitType_ and never drain a pipeline just for timestamps.
+    __aicore__ inline int BeginRdma(AscendTimer::DynamicTimingType type, AscendTimer::RdmaPhase phase, uint32_t peer,
+                                    uint32_t bytes, bool isCommit)
+    {
+        if (!Enabled()) {
+            return -1;
+        }
+        int typeId = static_cast<int>(type);
+        int index = dynamicCounts_[typeId]++;
+        if (index >= AscendTimer::MAX_DYNAMIC_ITER) {
+            return -1;
+        }
+        int offset = AscendTimer::TASK_METADATA_OFFSET +
+                     ((coreId_ * AscendTimer::DYNAMIC_TYPE_COUNT + typeId) * AscendTimer::MAX_DYNAMIC_ITER + index) * 2;
+        WriteValue(offset,
+                   static_cast<int64_t>((static_cast<uint64_t>(peer + 1) << 32) | (static_cast<uint32_t>(phase) + 1)));
+        WriteValue(offset + 1, static_cast<int64_t>((static_cast<uint64_t>(isCommit) << 32) | bytes));
+        WriteWave(DynamicTimingIndex(typeId, index), AscendTimer::NO_WAVE);
+        WriteStart(DynamicTimingIndex(typeId, index), AscendC::GetSystemCycle());
+        return index;
+    }
+
+    __aicore__ inline void EndRdma(AscendTimer::DynamicTimingType type, int index)
+    {
+        if (Enabled() && index >= 0) {
+            EndRaw(static_cast<int>(type), index, AscendC::GetSystemCycle());
+        }
+    }
+
     __aicore__ inline void FlushDynamicCounts()
     {
         if (!Enabled()) {
@@ -296,6 +327,26 @@ private:
             WriteValue(index + 1, cycle);
         }
     }
+};
+
+class AscendTimerRdmaScope {
+public:
+    __aicore__ inline AscendTimerRdmaScope(AscendTimerDevice* timer, AscendTimer::DynamicTimingType type,
+                                           AscendTimer::RdmaPhase phase, uint32_t peer, uint32_t bytes, bool isCommit)
+        : timer_(timer), type_(type), index_(timer ? timer->BeginRdma(type, phase, peer, bytes, isCommit) : -1)
+    {
+    }
+    __aicore__ inline ~AscendTimerRdmaScope()
+    {
+        if (timer_ != nullptr) {
+            timer_->EndRdma(type_, index_);
+        }
+    }
+
+private:
+    AscendTimerDevice* timer_;
+    AscendTimer::DynamicTimingType type_;
+    int index_;
 };
 
 class AscendTimerTileScope {

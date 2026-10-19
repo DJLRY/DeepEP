@@ -323,7 +323,7 @@ def test_performance_workflow_reuses_settings_and_skips_golden(saved, monkeypatc
         else:
             assert "deep_ep_experimental.megamoe.timer" in command
             assert command[command.index("--ranks") + 1] == str(node * 16)
-            assert "--include-wait" in command and "--merge" in command
+            assert "--include-wait" not in command and "--merge" in command
 
     monkeypatch.setattr(launcher, "execute", execute)
     for _ in range(2):
@@ -336,6 +336,22 @@ def test_performance_workflow_reuses_settings_and_skips_golden(saved, monkeypatc
     assert "not a cross-device timestamp span" in summary
     assert path.read_bytes() == before
     assert launcher.CASE["warmup"] == 0 and launcher.CASE["iters"] == 1
+
+
+@pytest.mark.parametrize("flag,include", [(None, False), ("--hide-wait", False), ("--include-wait", True)])
+def test_trace_wait_option_reaches_parser_and_run_manifest(saved, monkeypatch, flag, include):
+    path, config = saved
+    monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(launcher, "environment", lambda _: {})
+    monkeypatch.setattr(launcher, "preflight", lambda *args: None)
+    monkeypatch.setattr(launcher, "performance_summary", lambda *args: None)
+    calls = []
+    monkeypatch.setattr(launcher, "execute", lambda command, *args, **kwargs: calls.append(command))
+    launcher.main(["trace", "--config", str(path), *([flag] if flag else [])])
+    assert len(calls) == 2
+    assert ("--include-wait" in calls[1]) is include
+    run_dir = Path(calls[0][calls[0].index("--output-dir") + 1])
+    assert json.loads((run_dir / "run.json").read_text())["include_wait"] is include
 
 
 def test_timer_build_is_explicit_and_does_not_launch_workers(saved, monkeypatch):
@@ -401,6 +417,9 @@ def test_failed_trace_does_not_print_done_or_summary(saved, monkeypatch, capsys,
     "arguments",
     [
         ["perf", "--timer"],
+        ["perf", "--include-wait"],
+        ["build", "--hide-wait"],
+        ["trace", "--include-wait", "--hide-wait"],
         ["perf", "--timer-ranks", "0"],
         ["run", "--warmup", "20"],
         ["build", "--iters", "100"],

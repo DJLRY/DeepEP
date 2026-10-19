@@ -78,7 +78,7 @@ __aicore__ inline bool IsHierarchicalCombineRowReady(const MoeStageCommonConfig&
 // scratch and QP are the same resources used by the completed Dispatch stage.
 __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig& common, const Params& params,
                                                       HierarchicalCombineProgress& progress,
-                                                      __ubuf__ uint8_t* roceScratch)
+                                                      __ubuf__ uint8_t* roceScratch, AscendTimerDevice* timer = nullptr)
 {
     if constexpr (g_coreType == AIC) {
         return false;
@@ -102,7 +102,7 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
         }
         const uint64_t byteOffset = static_cast<uint64_t>(runStart) * rowBytes;
         RocePutBytes(params.peermemInfo.combineSendPtr + byteOffset, params.peermemInfo.gatewayCombinePtr + byteOffset,
-                     (row - runStart) * rowBytes, destination, roceScratch);
+                     (row - runStart) * rowBytes, destination, roceScratch, timer, AscendTimer::RdmaPhase::Combine);
         for (uint32_t sent = runStart; sent < row; ++sent) {
             progress.pendingTopkMasks[sent / common.topK] &= ~(uint32_t(1) << (sent % common.topK));
         }
@@ -123,7 +123,8 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
 // a cycle. The commit is required even when expectedRows is zero and also closes
 // this invocation's lifetime before the next one can reuse Dispatch buffers.
 __aicore__ inline void DrainHierarchicalCombine(const MoeStageCommonConfig& common, const Params& params,
-                                                HierarchicalCombineProgress& progress, __ubuf__ uint8_t* roceScratch)
+                                                HierarchicalCombineProgress& progress, __ubuf__ uint8_t* roceScratch,
+                                                AscendTimerDevice* timer = nullptr)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -133,7 +134,7 @@ __aicore__ inline void DrainHierarchicalCombine(const MoeStageCommonConfig& comm
     }
     InitializeHierarchicalCombineProgress(common, params, progress);
     while (progress.sentRows < progress.expectedRows) {
-        if (!TryProgressHierarchicalCombine(common, params, progress, roceScratch)) {
+        if (!TryProgressHierarchicalCombine(common, params, progress, roceScratch, timer)) {
             const int64_t waitStart = GetSystemCycle();
             while (GetSystemCycle() - waitStart < GM_FLAG_POLL_BACKOFF_CYCLES) {
             }

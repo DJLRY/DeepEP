@@ -94,3 +94,64 @@ def test_truncated_and_overflow_rejected(raw_file):
 def test_sync_alignment_is_explicit_and_requires_anchor():
     with pytest.raises(ValueError, match="missing"):
         synchronized_rank_bases({0: [{"name": "AIC_GMM1", "start_cycle": 100, "end_cycle": 200}]})
+
+
+def test_rdma_binary_metadata_and_wait_visibility(raw_file):
+    core = 1
+    with raw_file.open("r+b") as stream:
+
+        def put(index, *values):
+            stream.seek(index * 8)
+            stream.write(struct.pack("<" + "q" * len(values), *values))
+
+        for phase in range(3):
+            for name, commit, size in (
+                ("AIV_RDMA_POST", 0, 3584),
+                ("AIV_RDMA_QUIET_WAIT", 0, 0),
+                ("AIV_RDMA_RECV_WAIT", 1, 4),
+            ):
+                family = p.DYNAMIC_NAMES.index(name)
+                slot = family * p.MAX_DYNAMIC_ITER + phase
+                logical = len(p.FIXED_NAMES) + slot
+                put(core * p.COUNTERS_PER_CORE + logical * 2, 101000 + phase * 1000, 101500 + phase * 1000)
+                put(p.N_TIMING_COUNTER + core * p.DYNAMIC_ITER_PER_CORE + family, 3)
+                put(
+                    p.TASK_METADATA_OFFSET + (core * len(p.DYNAMIC_NAMES) * p.MAX_DYNAMIC_ITER + slot) * 2,
+                    (17 << 32) | (phase + 1),
+                    (commit << 32) | size,
+                )
+                put(p.WAVE_ID_OFFSET + core * p.WAVE_ID_PER_CORE + logical, p.NO_WAVE)
+    parsed = raw_file.with_suffix(".parsed.csv")
+    decode(raw_file, parsed)
+    raw = raw_events_for_rank(parsed, 0)
+    base = first_start_cycle(raw)
+    hidden = trace_events(raw, "keep", base)
+    shown = trace_events(raw, "keep", base, include_wait=True)
+    assert len(hidden) == 6 and len(shown) == 13
+    rdma = [e for e in shown if e["args"].get("granularity") == "rdma"]
+    assert len(rdma) == 9
+    assert {e["args"]["phase"] for e in rdma} == set(p.RDMA_PHASES)
+    for event in rdma:
+        args = event["args"]
+        assert event["tid"] == "group_0_AIV_0/RDMA"
+        assert args["peer_rank"] == 16 and args["wave_id"] is None
+        assert "expert_id" not in args and "n_tile" not in args
+        if args["event_family"] == "AIV_RDMA_POST":
+            assert args["kind"] == "data" and args["bytes"] == 3584
+            assert event["cat"] == "rdma_post"
+        else:
+            assert event["cat"] == "rdma_wait"
+    for event in hidden:
+        counterpart = next(e for e in shown if e["name"] == event["name"] and e["tid"] == event["tid"])
+        assert (event["ts"], event["dur"]) == (counterpart["ts"], counterpart["dur"])
+
+
+@pytest.mark.parametrize("first,second", [(0, 0), (33 << 32 | 1, 4), (1 << 32 | 4, 4), (1 << 32 | 1, 2 << 32)])
+def test_rdma_invalid_metadata_rejected(first, second):
+    class Metadata:
+        def __getitem__(self, key):
+            return first, second
+
+    logical = len(p.FIXED_NAMES) + p.DYNAMIC_NAMES.index("AIV_RDMA_POST") * p.MAX_DYNAMIC_ITER
+    with pytest.raises(ValueError, match="invalid RDMA metadata"):
+        p.task_metadata(Metadata(), 1, logical)

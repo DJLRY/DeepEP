@@ -30,7 +30,8 @@ __aicore__ inline void WaitHierarchicalLocalSignal(const Params& params, Hierarc
 // copy, never the packer's reusable UB. Each selected token keeps its original
 // row index at the gateway; holes require neither packing nor a remapping table.
 __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& common, const Params& params,
-                                                const SendMaskConfig& config, SendMaskScratch& scratch)
+                                                const SendMaskConfig& config, SendMaskScratch& scratch,
+                                                AscendTimerDevice* timer = nullptr)
 {
     const uint32_t myHost = HierarchicalHost(common.rankId);
     const uint32_t gateway = HierarchicalGateway(common.rankId);
@@ -39,13 +40,13 @@ __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& comm
 
     GM_ADDR packedRail = params.peermemInfo.railTopkIdsRecvPtr + myHost * config.railTopkIdsSlotBytes;
     const uint32_t railBytes = static_cast<uint32_t>(CalcRailTopkIdsSlotDataBytes(common.tokenNum, common.topK));
-    RocePutBytes(packedRail, packedRail, railBytes, gateway, roceScratch);
+    RocePutBytes(packedRail, packedRail, railBytes, gateway, roceScratch, timer, AscendTimer::RdmaPhase::DispatchMeta);
     // Finish metadata before posting payload, so the independent receive leader
     // can release route/count work while the payload is still in flight.
     RocePublishCommit(
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetMetaCommit)),
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence)), gateway,
-        roceScratch);
+        roceScratch, timer, AscendTimer::RdmaPhase::DispatchMeta);
 
     GlobalTensor<int32_t> rail;
     rail.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(packedRail));
@@ -80,7 +81,7 @@ __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& comm
         }
         const uint64_t offset = static_cast<uint64_t>(first) * rowBytes;
         RocePutBytes(params.peermemInfo.relayPayloadPtr + offset, params.peermemInfo.quantTokenScalePtr + offset,
-                     (token - first) * rowBytes, gateway, roceScratch);
+                     (token - first) * rowBytes, gateway, roceScratch, timer, AscendTimer::RdmaPhase::DispatchPayload);
     }
     // Completion is deliberately deferred until after this owner's reset/shared
     // input work. Even a zero-payload batch sends the later completion epoch.
@@ -88,7 +89,8 @@ __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& comm
 
 __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& job, const MoeStageCommonConfig& common,
                                                          const Params& params, GM_ADDR* winRankAddr,
-                                                         const SendMaskConfig& config, SendMaskScratch& scratch)
+                                                         const SendMaskConfig& config, SendMaskScratch& scratch,
+                                                         AscendTimerDevice* timer = nullptr)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -102,7 +104,7 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
         return;
     }
     if (job.jobIndex == otherHost) {
-        PostHierarchicalDispatch(common, params, config, scratch);
+        PostHierarchicalDispatch(common, params, config, scratch, timer);
         return;
     }
     if (job.jobIndex >= job.totalJobs || job.totalJobs <= 2U) {
@@ -113,7 +115,8 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
     // sender's CQ. Its progress cannot depend on the sender reaching payload quiet.
     if (job.jobIndex == 2U + otherHost) {
         RoceWaitCommit(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetMetaCommit),
-                       params.tilingData->hierarchicalSequence);
+                       params.tilingData->hierarchicalSequence, timer, AscendTimer::RdmaPhase::DispatchMeta,
+                       HierarchicalGateway(common.rankId));
         PublishHierarchicalLocalSignal(params, HierarchicalSignal::MetaReady);
     }
     const uint32_t relayCore = job.jobIndex - 2U;
@@ -134,7 +137,7 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
 }
 
 __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, const MoeStageCommonConfig& common,
-                                                  const Params& params)
+                                                  const Params& params, AscendTimerDevice* timer = nullptr)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -146,12 +149,12 @@ __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, cons
     RocePublishCommit(
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit)),
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence)), gateway,
-        HierarchicalRoceScratch(params));
+        HierarchicalRoceScratch(params), timer, AscendTimer::RdmaPhase::DispatchPayload);
     PublishHierarchicalLocalSignal(params, HierarchicalSignal::TxDone);
     // Both sides finish their own outbound notification before waiting for the
     // opposite direction. No software ACK is required for source completion.
     RoceWaitCommit(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit),
-                   params.tilingData->hierarchicalSequence);
+                   params.tilingData->hierarchicalSequence, timer, AscendTimer::RdmaPhase::DispatchPayload, gateway);
     PublishHierarchicalLocalSignal(params, HierarchicalSignal::RelayPayloadReady);
 }
 

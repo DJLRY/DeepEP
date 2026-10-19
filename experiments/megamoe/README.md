@@ -242,7 +242,31 @@ bash experiments/megamoe/scripts/run_bs32.sh trace --timer-ranks 0-31 --warmup 2
 
 `trace` 先执行 timer 关闭的 profiler 采样，再单独运行一批调用，仅在最后一轮、选中的 rank 上设备打点。
 它不会自动构建；未安装支持 timer 的 wheel 时会在启动 worker 前提示执行 `build --timer`。
-32个 rank 始终全部参加运行；采集后各节点只自动解析自己拥有的选中 rank，保留 WAIT 事件。
+32个 rank 始终全部参加运行；采集后各节点只自动解析自己拥有的选中 rank，默认隐藏 WAIT 事件。
+`trace --include-wait` 显示全部 WAIT，`trace --hide-wait` 显式隐藏。该开关只影响流水 JSON 和事件汇总，
+原始 BIN/解析 CSV 仍保留 WAIT，其他事件的时间戳不变，不压缩等待时间。
+
+A8W4 的跨机 RDMA 在所属 AIV 的 `/RDMA` 子轨道记录，带有阶段（`dispatch_meta`、
+`dispatch_payload`、`combine`）、对端全局 rank、数据/commit 类型及字节数：
+
+| 事件 | 含义 |
+| --- | --- |
+| `AIV_RDMA_POST` | 非阻塞 put 调用的提交时间；不代表数据在网络上的完整传输时间 |
+| `AIV_RDMA_QUIET_WAIT` | 已有 QP quiet 调用的剩余完成等待；data 的 bytes=0 表示批量字节数未统计，commit 为4字节 |
+| `AIV_RDMA_RECV_WAIT` | 已有 commit 等待及后续加载排序；包含等待对端生产、传输和发布 commit 的时间 |
+
+默认只显示 POST；诊断通信等待时使用 `--include-wait`。设备打点不新增通信同步，仍有采样开销，
+性能基线继续使用独立的 timer 关闭采样。新打点改变了原始 buffer 布局，两节点都需重新 `build --timer`，
+并用同一版本解析器解析新采样；旧 BIN 请用采集时版本解析器。
+已有的 `*_parsed.csv` 可直接重新出图（无需重跑设备，也可用于旧布局的已解析 CSV）：
+
+```bash
+python -I -m deep_ep_experimental.megamoe.timer.trace_parser \
+  --timer-dir /实际结果目录/bs_32/timer --output-dir /实际结果目录/timer_hidden \
+  --rank-start 0 --rank-end 0 --time-origin rank
+```
+
+上述命令默认隐藏 WAIT；加 `--include-wait` 可恢复显示。节点1的单卡采样对应 rank16，需同时修改两个 rank 参数。
 结果位于 `<case_dir>/trace_node_<rank>_<随机字符>/`，除上述性能文件外，还包含：
 
 | 文件 | 内容 |

@@ -98,7 +98,8 @@ protected:
         if constexpr (g_coreType == AIV) {
             if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob(rankId_)) {
                 return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_,
-                                                      HierarchicalRoceScratch(params_));
+                                                      HierarchicalRoceScratch(params_),
+                                                      timer_.Enabled() ? &timer_ : nullptr);
             }
         }
         return false;
@@ -892,7 +893,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
         }
         if (UseHierarchicalRoce(params_.tilingData)) {
             GatherAndPostHierarchicalDispatch(aivJob_, commonConfig_, params_, g_winRankAddr_, sendMaskConfig_,
-                                              sendMaskScratch_);
+                                              sendMaskScratch_, timer_.Enabled() ? &timer_ : nullptr);
         } else {
             GatherAndSendExpertCompactRoutes(aivJob_, commonConfig_, params_, g_winRankAddr_, sendMaskConfig_,
                                              sendMaskScratch_);
@@ -913,7 +914,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
             aivJob_, commonConfig_, params_, quantProcessConfig_, sharedExpertPrepareScratch_);
     }
     if (UseHierarchicalRoce(params_.tilingData)) {
-        FinishHierarchicalDispatch(aivJob_, commonConfig_, params_);
+        FinishHierarchicalDispatch(aivJob_, commonConfig_, params_, timer_.Enabled() ? &timer_ : nullptr);
     }
     if (decodeInputReady_) {
         // Route published old+1. The public barrier below makes slot 0's
@@ -1018,14 +1019,16 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
             CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
             if (aivJob_.jobIndex == HierarchicalSendJob(rankId_)) {
                 auto* scratch = HierarchicalRoceScratch(params_);
-                DrainHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch);
+                auto* rdmaTimer = timer_.Enabled() ? &timer_ : nullptr;
+                DrainHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch, rdmaTimer);
                 RocePublishCommit(reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(
                                       params_.peermemInfo, HierarchicalSignal::CombineCommit)),
                                   reinterpret_cast<GM_ADDR>(
                                       HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::Sequence)),
-                                  HierarchicalGateway(rankId_), scratch);
+                                  HierarchicalGateway(rankId_), scratch, rdmaTimer, AscendTimer::RdmaPhase::Combine);
                 RoceWaitCommit(HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::CombineCommit),
-                               params_.tilingData->hierarchicalSequence);
+                               params_.tilingData->hierarchicalSequence, rdmaTimer, AscendTimer::RdmaPhase::Combine,
+                               HierarchicalGateway(rankId_));
             }
             PipeBarrier<PIPE_ALL>();
             SyncAll<true>();

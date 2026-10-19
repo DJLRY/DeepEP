@@ -39,8 +39,13 @@ enum DynamicTimingType {
     AIC_SHARED_GMM2,
     AIV_SHARED_GMM2_PROLOGUE,
     AIV_SHARED_SWIGLU,
+    AIV_RDMA_POST,
+    AIV_RDMA_QUIET_WAIT,
+    AIV_RDMA_RECV_WAIT,
     DYNAMIC_TYPE_COUNT_ENUM
 };
+
+enum class RdmaPhase : uint32_t { DispatchMeta = 0, DispatchPayload = 1, Combine = 2 };
 
 // W4 tile 事件按真实任务编号；WAIT 复用对应计算任务的编号。
 // 为大 BS 的 tile 依赖等待预留空间，超限由主机校验明确报错。
@@ -56,6 +61,8 @@ static constexpr int DYNAMIC_ITER_TOTAL_SIZE = DYNAMIC_ITER_PER_CORE_ALIGN * N_C
 static constexpr int TASK_METADATA_OFFSET = N_TIMING_COUNTER + DYNAMIC_ITER_TOTAL_SIZE;
 // 每个动态槽追加两个 int64：(expert+1,row_start)、(n_tile+1,row_count)，各占 32 bit。
 // 全零表示旧路径无任务坐标；n_tile+1 为零表示 slice 级记录。
+// RDMA slots instead store (peer+1,phase+1), (is_commit,bytes), each field 32 bits.
+// Data Quiet covers preceding QP operations; its byte count is unknown (zero).
 static constexpr int TASK_METADATA_SIZE = N_CORE_COUNT * DYNAMIC_TYPE_COUNT * MAX_DYNAMIC_ITER * 2;
 // 保留任务坐标，在尾部追加真实 Wave ID；-1 表示全局或未标记的路径。
 static constexpr int NO_WAVE = -1;

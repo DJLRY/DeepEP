@@ -10,6 +10,8 @@
 #define __gm__
 #define __ubuf__
 #define GM_ADDR uint8_t*
+#define ASCEND_IS_AIV (true)
+constexpr int PIPE_ALL = 0;
 
 inline void trap()
 {
@@ -21,9 +23,48 @@ inline bool signalObserved = false;
 inline bool scalarEventSet = false;
 inline bool mteCanRead = false;
 inline std::vector<int> operations;
+inline int pipelineBarriers = 0;
+inline int64_t cycle = 100;
 }  // namespace RoceTest
 
 namespace AscendC {
+inline int GetBlockIdx()
+{
+    return 0;
+}
+inline int GetTaskRation()
+{
+    return 2;
+}
+inline int GetSubBlockIdx()
+{
+    return 0;
+}
+inline int64_t GetSystemCycle()
+{
+    return ++RoceTest::cycle;
+}
+template <int Pipe>
+void PipeBarrier()
+{
+    ++RoceTest::pipelineBarriers;
+}
+template <typename T>
+class GlobalTensor {
+public:
+    void SetGlobalBuffer(T* data)
+    {
+        data_ = data;
+    }
+    T& operator()(int index)
+    {
+        return data_[index];
+    }
+
+private:
+    T* data_ = nullptr;
+};
+
 using TEventID = uint32_t;
 enum class HardEvent { S_MTE2 };
 

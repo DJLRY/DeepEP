@@ -363,7 +363,16 @@ def performance_summary(config, run_dir, action, local_timer_ranks):
 
 
 def dispatch(
-    action, config, *, rebuild_shmem=False, errors_only=False, timer=False, warmup=None, iters=None, timer_ranks=None
+    action,
+    config,
+    *,
+    rebuild_shmem=False,
+    errors_only=False,
+    timer=False,
+    warmup=None,
+    iters=None,
+    timer_ranks=None,
+    include_wait=False,
 ):
     if platform.system() != "Linux":
         raise RuntimeError("Build/run require Linux; configure/show-config can run without devices")
@@ -400,7 +409,16 @@ def dispatch(
     (run_dir / "case.json").write_text(json.dumps(case, indent=2) + "\n", encoding="utf-8")
     (run_dir / "launch.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
     (run_dir / "run.json").write_text(
-        json.dumps(dict(action=action, timer_ranks=selected, warmup=case["warmup"], iters=case["iters"]), indent=2)
+        json.dumps(
+            dict(
+                action=action,
+                timer_ranks=selected,
+                warmup=case["warmup"],
+                iters=case["iters"],
+                include_wait=include_wait,
+            ),
+            indent=2,
+        )
         + "\n",
         encoding="utf-8",
     )
@@ -421,7 +439,7 @@ def dispatch(
                 str(run_dir / "bs_32" / "timer"),
                 "--ranks",
                 ",".join(map(str, local_ranks)),
-                "--include-wait",
+                *(["--include-wait"] if include_wait else []),
                 "--merge",
             ],
             env,
@@ -450,6 +468,20 @@ def main(argv=None):
         help="build only: show errors with nearby context; retain all output in build.log",
     )
     parser.add_argument("--timer", action="store_true", help="build only: enable device timer support for trace")
+    waits = parser.add_mutually_exclusive_group()
+    waits.add_argument(
+        "--include-wait",
+        dest="include_wait",
+        action="store_true",
+        default=None,
+        help="trace only: show WAIT events, including RDMA completion/receive waits (default: hidden)",
+    )
+    waits.add_argument(
+        "--hide-wait",
+        dest="include_wait",
+        action="store_false",
+        help="trace only: hide WAIT events without changing timestamps or raw samples",
+    )
     parser.add_argument("--warmup", type=int, help="perf/trace only: warmup calls (default: 20)")
     parser.add_argument("--iters", type=int, help="perf/trace only: collected calls (default: 100; report last half)")
     parser.add_argument(
@@ -472,6 +504,8 @@ def main(argv=None):
         parser.error("--timer requires build; use the trace action for collection")
     if args.timer_ranks is not None and args.action != "trace":
         parser.error("--timer-ranks requires trace")
+    if args.include_wait is not None and args.action != "trace":
+        parser.error("--include-wait/--hide-wait require trace")
     if args.warmup is not None or args.iters is not None:
         if args.action not in ("perf", "trace"):
             parser.error("--warmup/--iters require perf or trace")
@@ -496,6 +530,8 @@ def main(argv=None):
         options["timer"] = True
     if args.action in ("perf", "trace"):
         options.update(warmup=args.warmup, iters=args.iters, timer_ranks=args.timer_ranks)
+    if args.action == "trace":
+        options["include_wait"] = bool(args.include_wait)
     dispatch(args.action, config, **options)
 
 

@@ -33,7 +33,12 @@ DYNAMIC_NAMES = [
     "AIC_SHARED_GMM2",
     "AIV_SHARED_GMM2_PROLOGUE",
     "AIV_SHARED_SWIGLU",
+    "AIV_RDMA_POST",
+    "AIV_RDMA_QUIET_WAIT",
+    "AIV_RDMA_RECV_WAIT",
 ]
+
+RDMA_PHASES = ("dispatch_meta", "dispatch_payload", "combine")
 
 # W4 动态槽保存 tile/slice；其他路径保持原有区间协议。
 MAX_DYNAMIC_ITER = 4096
@@ -58,9 +63,23 @@ def task_metadata(raw, core_id, logical_index):
         return {}
     offset = TASK_METADATA_OFFSET + (core_id * len(DYNAMIC_NAMES) * MAX_DYNAMIC_ITER + dynamic_index) * 2
     first, second = raw[offset : offset + 2]
+    family = DYNAMIC_NAMES[dynamic_index // MAX_DYNAMIC_ITER]
+    mask = (1 << 32) - 1
+    if family.startswith("AIV_RDMA_"):
+        peer = ((first >> 32) & mask) - 1
+        phase = (first & mask) - 1
+        kind = (second >> 32) & mask
+        if not (0 <= peer < 32 and 0 <= phase < len(RDMA_PHASES) and kind in (0, 1)):
+            raise ValueError(f"invalid RDMA metadata: core={core_id}, slot={dynamic_index}")
+        return dict(
+            granularity="rdma",
+            peer_rank=peer,
+            phase=RDMA_PHASES[phase],
+            kind="commit" if kind else "data",
+            bytes=second & mask,
+        )
     if first == second == 0:
         return {}
-    mask = (1 << 32) - 1
     expert = ((first >> 32) & mask) - 1
     row_start = first & mask
     n_tile = ((second >> 32) & mask) - 1
@@ -74,7 +93,6 @@ def task_metadata(raw, core_id, logical_index):
         m_tile=row_start // 256,
         granularity="tile" if n_tile >= 0 else "slice",
     )
-    family = DYNAMIC_NAMES[dynamic_index // MAX_DYNAMIC_ITER]
     if "_SHARED_" in family:
         result["expert_kind"] = "shared"
     if n_tile >= 0:

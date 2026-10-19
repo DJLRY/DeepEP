@@ -174,6 +174,10 @@ def trace_events(
         task = event.get("task", {})
         granularity = task.get("granularity")
         display_name = event["name"]
+        lane = f"group_{event['group_id']}_{event['core_type']}_{event['sub_id']}"
+        category = (
+            "dependency_wait" if "WAIT" in event["name"] else ("aic_op" if event["core_type"] == "AIC" else "aiv_op")
+        )
         wave_metadata = {}
         if "wave_id" in event:
             wave_id = event["wave_id"]
@@ -188,14 +192,20 @@ def trace_events(
                 "raw_event_name": event["name"],
                 "display_index_semantics": "per_core_per_family_per_wave_task_or_interval",
             }
+        if granularity == "rdma":
+            family = event_family(event["name"])
+            display_name = f"{family}_{task['phase']}_{task['kind']}_peer{task['peer_rank']}_{task['bytes']}B"
+            # Progress can run inside a compute tile. Use its own lane to avoid
+            # overlapping X events on the compute track; clocks stay unchanged.
+            lane += "/RDMA"
+            category = "rdma_wait" if "WAIT" in family else "rdma_post"
+            wave_metadata["display_index_semantics"] = "per_core_rdma_operation"
         result.append(
             {
                 "ph": "X",
-                "cat": "dependency_wait"
-                if "WAIT" in event["name"]
-                else ("aic_op" if event["core_type"] == "AIC" else "aiv_op"),
+                "cat": category,
                 "pid": f"rank{event['rank']}",
-                "tid": (f"group_{event['group_id']}_{event['core_type']}_{event['sub_id']}"),
+                "tid": lane,
                 "name": display_name,
                 "ts": round((event["start_cycle"] - base_cycle) / CYCLE_TO_US, 6),
                 "dur": round(
