@@ -219,6 +219,13 @@ bash experiments/megamoe/scripts/run_bs32.sh configure --python /path/to/env/bin
 FP8 和内部量化的 BF16 输入均沿用原接口，容量可大于实际 B。B>32 及更多16卡主机暂不支持。
 A8W8 当前只运行路由专家，`num_shared_experts` 必须为0，不能传入 timer。
 
+两机 RoCE runtime 的 `barrier()` 和 `destroy()` 先同步本卡全部 stream，再通过现有
+StoreGroup（TCPStore）或 ProcessGroup 交换完成状态；全部 rank 成功后才允许清理 SHMEM。
+当前 kernel 在返回前已等待应用 QP1 完成，这一顺序确保释放前没有未完成的通信。
+这里不调用直接读取对端 GM 的通用 `aclshmem_barrier_all()`，也不要求机内各 rank 建立 RoCE QP。
+所有 rank 必须按相同顺序调用，调用期间不得并发提交新的算子；任一 rank 同步失败则保留资源并要求重启作业。
+该修复涉及 Python 和原生扩展，两台机器都需重新构建/安装匹配的 wheel；已有 SHMEM SDK 无需为此修改。
+
 在两台已分配设备的机器上分别执行下列命令，只将 `NODE_RANK` 改为0或1。
 地址和端口是占位示例，需替换为实际配置；两台机器各启动16个进程：
 

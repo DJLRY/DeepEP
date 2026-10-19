@@ -132,7 +132,7 @@ int main(int argc, char** argv)
         assert(session.udma() && qp_count == 32);
         session.close();
         assert(!deepep::Session::busy());
-    } else if (mode == "megamoe-roce") {
+    } else if (mode == "megamoe-roce" || mode == "megamoe-roce-close-fault") {
         fails(
             []() { deepep::Session s(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, false, false, false, true); });
         fails(
@@ -142,7 +142,22 @@ int main(int argc, char** argv)
         deepep::Session session(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true);
         assert(qp_engine == ACLSHMEM_DATA_OP_ROCE && qp_count == 2 && !session.udma());
         assert(workspace_alignment == 512);
+        fails([&]() { session.barrier(); });
+        fails([&]() { session.close(); });
+        assert(barriers == 0 && frees == 0 && finalized == 0 && !session.closed());
+        session.barrier(true);
+        if (mode == "megamoe-roce-close-fault") {
+            finalize_status = -1;
+            fails([&]() { session.close(true); });
+            assert(!session.closed() && deepep::Session::busy() && frees == 1 && finalized == 1);
+            fails([&]() { session.close(true); });
+            fails([&]() { session.barrier(true); });
+            assert(barriers == 0 && frees == 1 && finalized == 1);
+            return 0;
+        }
+        session.close(true);
         session.close();
+        assert(barriers == 0);
         assert(!deepep::Session::busy() && frees == 1 && finalized == 1);
 #else
         fails(
@@ -201,8 +216,10 @@ int main(int argc, char** argv)
             return 0;
         }
         session.barrier();
+        assert(barriers == 1);
         session.close();
         session.close();
+        assert(barriers == 2);
         assert(session.closed() && !deepep::Session::busy() && frees == 1);
         fails([&]() { session.barrier(); });
         auto next = create();

@@ -56,6 +56,7 @@ def lifecycle_binary(tmp_path_factory, request):
         "udma",
         "megamoe",
         "megamoe-roce",
+        "megamoe-roce-close-fault",
         "low-latency",
         "ll-rank-bias-16",
         "ll-rank-bias-32",

@@ -113,7 +113,7 @@ def test_megamoe_roce_collective_bootstrap(monkeypatch, world, ranks_per_node, c
     native = SimpleNamespace(
         Runtime=lambda *args: pytest.fail("Unexpected core runtime"),
         runtime_busy=lambda: False,
-        create_megamoe_runtime=lambda *args: created.append(args) or SimpleNamespace(close=lambda: None),
+        create_megamoe_runtime=lambda *args: created.append(args) or SimpleNamespace(close=lambda **kwargs: None),
         shmem_rdma_backend="NONE" if case == "no-rdma" else "XSCALE",
         shmem_sdk_matches=case != "sdk-mismatch",
     )
@@ -122,11 +122,15 @@ def test_megamoe_roce_collective_bootstrap(monkeypatch, world, ranks_per_node, c
         _runtime,
         "npu_api",
         lambda: SimpleNamespace(
-            current_device=lambda: 0, Stream=lambda **kwargs: SimpleNamespace(synchronize=lambda: None)
+            current_device=lambda: 0,
+            synchronize=lambda device: None,
+            Stream=lambda **kwargs: SimpleNamespace(synchronize=lambda: None),
         ),
     )
 
     def exchange(local, stage):
+        if stage == "RoCE runtime close":
+            return [local] * world
         peers = []
         for rank in range(world):
             peer = list(local)

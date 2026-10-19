@@ -248,23 +248,65 @@ class Runtime:
     def ensure_alive(self):
         if self.closed:
             raise RuntimeError("Buffer runtime has been destroyed")
+        if getattr(self, "roce_failed", False):
+            raise RuntimeError("RoCE runtime synchronization or cleanup failed; restart the distributed job")
         if npu_api().current_device() != self.device:
             raise RuntimeError("Use Buffer on its creating NPU device")
+
+    def _roce_collective(self, operation):
+        # MegaMoE senders quiet QP1 before returning. Complete all compute and
+        # communication streams before any rank can release symmetric memory.
+        # The generic SHMEM WORLD barrier directly reads remote GM and cannot
+        # synchronize peers reachable only over RoCE.
+        stage = f"RoCE runtime {operation}"
+        try:
+            error = None
+            try:
+                self.ensure_alive()
+                npu_api().synchronize(self.device)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            packet = [stage, error]
+            if isinstance(self.group, StoreGroup):
+                peers = self.group.all_gather(packet, stage)
+            else:
+                import torch.distributed as dist
+
+                peers = [None] * self.world_size
+                dist.all_gather_object(peers, packet, group=self.group)
+            if any(peer[0] != stage for peer in peers):
+                raise RuntimeError(f"RoCE runtime collective order mismatch: {peers}")
+            errors = [(rank, peer[1]) for rank, peer in enumerate(peers) if peer[1] is not None]
+            if errors:
+                raise RuntimeError(f"{stage}: device synchronization failed on ranks {errors}")
+            getattr(self.native, operation)(host_coordinated=True)
+        except Exception as exc:
+            self.roce_failed = True
+            if isinstance(self.group, StoreGroup):
+                self.group.abort(exc)
+            raise
 
     def close(self):
         global _OWNER
         with getattr(self, "notify_lock", nullcontext()), _LOCK:
             if self.closed:
                 return
-            self.ensure_alive()
-            self.stream.synchronize()
-            self.native.close()
+            if getattr(self, "use_roce", False):
+                self._roce_collective("close")
+            else:
+                self.ensure_alive()
+                self.stream.synchronize()
+                self.native.close()
             self.notify_inflight = None
             self.low_latency_comm_args = None
             self.closed = True
             _OWNER = None
 
     def barrier(self):
+        if self.use_roce:
+            with self.notify_lock:
+                self._roce_collective("barrier")
+            return
         self.ensure_alive()
         npu_api().current_stream(self.device).synchronize()
         self.stream.synchronize()

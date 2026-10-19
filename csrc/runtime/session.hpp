@@ -23,8 +23,10 @@ public:
     Session(const Session&) = delete;
     Session& operator=(const Session&) = delete;
     ~Session() = default;  // Never start collectives from Python GC/interpreter exit.
-    void barrier();
-    void close();
+    // RoCE callers must complete device work and coordinate all ranks on the
+    // host first. This internal flag never bypasses the non-RoCE barrier.
+    void barrier(bool host_coordinated = false);
+    void close(bool host_coordinated = false);
     bool closed() const
     {
         return closed_;
@@ -107,6 +109,7 @@ private:
     int rank_ = 0;
     int world_ = 0;
     bool udma_ = false;
+    bool roce_ = false;
     bool combine_only_ = false;
     bool sparse_qp_enabled_ = false;
     bool peer_table_ = false;

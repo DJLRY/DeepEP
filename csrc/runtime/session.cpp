@@ -141,6 +141,7 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
         rank_ = rank;
         world_ = size;
         udma_ = udma;
+        roce_ = roce;
         closed_ = false;
     } catch (...) {
         if (workspace_ != nullptr) {
@@ -271,21 +272,27 @@ uintptr_t Session::workspace_address() const
     return reinterpret_cast<uintptr_t>(workspace_);
 }
 
-void Session::barrier()
+void Session::barrier(bool host_coordinated)
 {
     std::lock_guard<std::mutex> guard(runtime_mutex);
     check_context();
-    aclshmem_barrier_all();
+    if (roce_ && !host_coordinated) {
+        throw std::runtime_error("RoCE barrier requires host-coordinated device completion on all ranks");
+    }
+    if (!roce_) aclshmem_barrier_all();
 }
 
-void Session::close()
+void Session::close(bool host_coordinated)
 {
     std::lock_guard<std::mutex> guard(runtime_mutex);
     if (closed_) {
         return;
     }
     check_context();
-    aclshmem_barrier_all();
+    if (roce_ && !host_coordinated) {
+        throw std::runtime_error("RoCE close requires host-coordinated device completion on all ranks");
+    }
+    if (!roce_) aclshmem_barrier_all();
     if (workspace_ != nullptr) {
         aclshmem_free(workspace_);
         workspace_ = nullptr;

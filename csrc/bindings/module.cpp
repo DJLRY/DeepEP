@@ -43,8 +43,10 @@ PYBIND11_MODULE(_C, module)
         .def(py::init<int, int, uint64_t, const std::string&, unsigned, bool>(), py::arg("rank"), py::arg("size"),
              py::arg("bytes"), py::arg("endpoint"), py::arg("timeout"), py::arg("udma") = false,
              py::call_guard<py::gil_scoped_release>())
-        .def("barrier", &deepep::Session::barrier, py::call_guard<py::gil_scoped_release>())
-        .def("close", &deepep::Session::close, py::call_guard<py::gil_scoped_release>())
+        .def("barrier", &deepep::Session::barrier, py::arg("host_coordinated") = false,
+             py::call_guard<py::gil_scoped_release>())
+        .def("close", &deepep::Session::close, py::arg("host_coordinated") = false,
+             py::call_guard<py::gil_scoped_release>())
         .def_property_readonly("closed", &deepep::Session::closed)
         .def_property_readonly("capacity", &deepep::Session::capacity)
         .def_property_readonly("sparse_qp_enabled", &deepep::Session::sparse_qp_enabled)
