@@ -154,6 +154,48 @@ bash experiments/megamoe/scripts/build.sh --rdma-backend XSCALE --rebuild-shmem
 
 ## 3. 多机测试
 
+### BS32：保存配置，分别编译和运行
+
+两台机器各16卡的 BS32 精度用例使用 `scripts/run_bs32.sh`，在**已有的同一个 checkout** 中执行。
+此入口不重新克隆、不自动拉取代码，也不在运行时编译或安装；依赖留在当前仓库的 `third-party/`。
+模型固定为 H=3584、I=1280、E=384、K=8、S=0、EP32，使用 FP8 输入和 FP4 权重、balanced 路由及全部 token 精度检查。
+
+先激活匹配的 Torch/torch_npu Python 环境，在两台机器各配置一次：
+
+```bash
+bash experiments/megamoe/scripts/run_bs32.sh configure
+# 依次输入本机编号（0/1）、节点0的IP、CANN set_env.sh、XSCALE/HNS_1825。
+# 默认保存当前 Python、端口29654/26733、Golden workers=4。
+
+# 两台分别编译安装；只在首次安装或需要更新构建时执行。
+bash experiments/megamoe/scripts/run_bs32.sh build
+
+# 两台分别执行，只运行测试。以后重复这条命令即可，不再询问配置。
+bash experiments/megamoe/scripts/run_bs32.sh run
+```
+
+配置默认保存到 `.megamoe-bs32/<hostname>.json`，已加入 Git 忽略规则；共享 checkout 的两台主机也各用自己的文件。
+Python 使用保存的绝对路径，后续自动加载保存的 CANN 环境；迁移或删除 Python 环境后需显式更新配置。
+可以用 `--config /absolute/path/node.json` 指定其他配置文件，之后各阶段都须传同一路径。
+配置文件是 JSON 数据，不作为 shell 脚本执行；环境变量不会覆盖已保存的节点/IP设置。
+
+```bash
+bash experiments/megamoe/scripts/run_bs32.sh show-config
+# 显式修改指定字段，其他设置保留；改节点0的IP时，两台都要修改。
+bash experiments/megamoe/scripts/run_bs32.sh configure --master-addr 192.0.2.10
+# 输出放到数据盘，避免每次在 /root 新建整个仓库。
+bash experiments/megamoe/scripts/run_bs32.sh configure --case-dir /data/megamoe-bs32
+# Python 环境变更时：
+bash experiments/megamoe/scripts/run_bs32.sh configure --python /path/to/env/bin/python
+```
+
+也可直接编辑已保存的 JSON（路径使用绝对路径）。更改 CANN、Python 或 RoCE 后端后应重新执行 `build`；
+更换仓内 SHMEM 后端时须停止使用该 SDK 的作业，再执行 `build --rebuild-shmem`。
+`run` 自动生成本机16个 rank 的 CPU Golden，后续校验并复用缓存；可提前执行 `golden` 单独准备。
+默认 Golden 位于 `benchmark-runs/bs32/golden/`，每次运行的配置快照和日志位于该目录上级的 `node_<rank>_<随机字符>/`。
+配置与结果均保留在原目录，`git pull` 不会清除它们。此入口使用仓内 SHMEM/CATLASS，不接受外部 SDK 环境覆盖。
+若之前使用的是复制到服务器的旧 `run_bs32.sh`，请改用上述仓库内路径，旧脚本不会随 `git pull` 更新。
+
 ### 两机各16卡：MTE＋RoCE Decode
 
 通信模式由已有的 `ranks_per_node` 决定，没有新增公开 `transport` 参数：
