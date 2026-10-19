@@ -129,6 +129,7 @@ python -m pip show ascend-deepep
 
 在匹配的 Torch/torch_npu 环境中执行。实验构建入口默认开启 MegaMoE 和 timer，
 自动初始化固定版本 SHMEM/CATLASS 子模块、校验或构建 SHMEM，再构建安装 wheel。
+CATLASS 只拉取本仓使用的 C++ 头文件所在仓库，不递归下载 DSL 的 LLVM/Triton 或测试依赖。
 `PYTHON=/path/to/python` 可指定解释器；`DEEPEP_MEGAMOE_TIMER=OFF` 关闭设备打点。
 已激活 Conda 时，入口会在 Python 启动前优先使用该环境的运行库。
 已有 SDK 可用 `SHMEM_ROOT`、`CATLASS_ROOT` 指定；已有子模块须保持干净且版本与[依赖锁文件](../../dependencies.lock.json)一致。

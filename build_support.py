@@ -287,7 +287,7 @@ def build_configuration(environment=None):
         catlass = Path(env.get("CATLASS_ROOT", str(ROOT / "third-party/catlass")))
         if not (catlass / "include/catlass/gemm/tile/copy_l1_to_l0a.hpp").is_file():
             raise RuntimeError(
-                "MegaMoE requires CATLASS: run git submodule update --init --recursive, "
+                "MegaMoE requires CATLASS: run git submodule update --init -- third-party/catlass, "
                 "or set CATLASS_ROOT; see experiments/megamoe/README.md"
             )
         revision = subprocess.check_output(["git", "-C", str(catlass), "rev-parse", "HEAD"], text=True).strip()

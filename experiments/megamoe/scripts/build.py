@@ -60,22 +60,39 @@ def build(root=ROOT, *, rebuild_shmem=False, rdma_backend=None):
     if beta == "ON":
         run([sys.executable, "-c", "import torch, torch_npu; print(torch.__version__, torch_npu.__version__)"])
 
-    def submodule(name, revision):
+    def submodule(name, revision, *, recursive=True):
         source = root / "third-party" / name
         if not (source / ".git").exists():
-            run(["git", "submodule", "update", "--init", "--recursive", "--", f"third-party/{name}"])
+            run(
+                [
+                    "git",
+                    "submodule",
+                    "update",
+                    "--init",
+                    *(["--recursive"] if recursive else []),
+                    "--",
+                    f"third-party/{name}",
+                ]
+            )
 
         # 不对已初始化子模块自动 checkout，避免覆盖用户修改或隐藏版本漂移。
         def git(*args):
             return subprocess.check_output(["git", "-C", str(source), *args], env=git_env, text=True).strip()
 
-        if git("rev-parse", "HEAD") != revision or git("status", "--porcelain", "--untracked-files=normal"):
+        # CATLASS's unused nested projects may be only partly cloned after an
+        # interrupted recursive update. Still check all files in its own tree.
+        status_options = [] if recursive else ["--ignore-submodules=all"]
+        if git("rev-parse", "HEAD") != revision or git(
+            "status", "--porcelain", "--untracked-files=normal", *status_options
+        ):
             raise RuntimeError(f"{source} must be clean and pinned to {revision}; review it before updating")
 
     if "SHMEM_ROOT" not in env:
         submodule("shmem", lock["shmem"]["revision"])
     if beta == "ON" and "CATLASS_ROOT" not in env:
-        submodule("catlass", lock["megamoe"]["catlass_revision"])
+        # Only include/ and examples/common are consumed by our CMake target.
+        # The nested DSL/compiler/test projects pull LLVM, Triton and googletest.
+        submodule("catlass", lock["megamoe"]["catlass_revision"], recursive=False)
     run([sys.executable, "-m", "pip", "install", "-r", str(root / "requirements-build.txt")])
     if "SHMEM_ROOT" not in env:
         prepare(root, rebuild=rebuild_shmem, if_needed=True, rdma_backend=rdma_backend or "NONE")

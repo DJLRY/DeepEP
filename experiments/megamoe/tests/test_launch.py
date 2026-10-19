@@ -80,12 +80,17 @@ def test_relocated_entrypoints_work_in_isolated_python(entry):
     assert "usage:" in result.stdout
 
 
-def test_build_isolates_git_libraries_and_preserves_framework_environment(tmp_path, monkeypatch):
+@pytest.mark.parametrize("catlass_initialized", [False, True])
+def test_build_isolates_git_libraries_and_preserves_framework_environment(tmp_path, monkeypatch, catlass_initialized):
     spec = importlib.util.spec_from_file_location("megamoe_build", SCRIPTS / "build.py")
     builder = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(builder)
     lock = json.loads((ROOT / "dependencies.lock.json").read_text())
     (tmp_path / "dependencies.lock.json").write_text(json.dumps(lock))
+    if catlass_initialized:
+        catlass = tmp_path / "third-party/catlass"
+        catlass.mkdir(parents=True)
+        (catlass / ".git").touch()
     for name in ("SHMEM_ROOT", "CATLASS_ROOT"):
         monkeypatch.delenv(name, raising=False)
     for name, value in {
@@ -119,7 +124,8 @@ def test_build_isolates_git_libraries_and_preserves_framework_environment(tmp_pa
         check_environment(command, env)
         assert check
         if command[0] == "git":
-            assert command[1:6] == ["submodule", "update", "--init", "--recursive", "--"]
+            recursive = ["--recursive"] if command[-1] == "third-party/shmem" else []
+            assert command[1:-1] == ["submodule", "update", "--init", *recursive, "--"]
             clones.append(command[-1])
         elif command[1:4] == ["-m", "pip", "install"]:
             # Stop before package installation or compilation; only dependency preparation is exercised.
@@ -136,14 +142,15 @@ def test_build_isolates_git_libraries_and_preserves_framework_environment(tmp_pa
             return (
                 lock["shmem"]["revision"] if Path(command[2]).name == "shmem" else lock["megamoe"]["catlass_revision"]
             )
-        assert command[3:] == ["status", "--porcelain", "--untracked-files=normal"]
+        ignore_nested = ["--ignore-submodules=all"] if Path(command[2]).name == "catlass" else []
+        assert command[3:] == ["status", "--porcelain", "--untracked-files=normal", *ignore_nested]
         return ""
 
     monkeypatch.setattr(builder.subprocess, "run", run)
     monkeypatch.setattr(builder.subprocess, "check_output", check_output)
     with pytest.raises(DependenciesPrepared):
         builder.build(tmp_path)
-    assert clones == ["third-party/shmem", "third-party/catlass"]
+    assert clones == ["third-party/shmem", *([] if catlass_initialized else ["third-party/catlass"])]
     assert len(queries) == 4
     assert len(framework_checks) == 1
     assert dict(os.environ) == original_environment
