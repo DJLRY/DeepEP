@@ -713,7 +713,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::SendHie
         static_cast<int32_t>(GetTokenCombineProducerCount(commonConfig_, waveCombineJob_, rowCount)));
     SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
     const auto buffers = InitWaveCombineBuffers<COMBINE_NO_QUANT>(commonConfig_, waveCombineScratch_);
-    const GM_ADDR output =
+    // GM_ADDR is a pointer macro: qualify the pointer, not the pointed-to data.
+    GM_ADDR const output =
         params_.workspaceInfo.gmm2MmadResPtr + globalRowStart * commonConfig_.tokenHiddenDim * sizeof(bfloat16_t);
     uint32_t rowSequence = 0U;
     for (uint32_t done = 0U; done < owned.count;) {
