@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+from types import ModuleType, SimpleNamespace
 
 import pytest
 
@@ -111,6 +112,8 @@ def test_isolated_cli_help():
     result = subprocess.run([sys.executable, "-I", launcher.__file__, "--help"], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert "configure,show-config,build,golden,run" in result.stdout
+    assert "perf,trace" in result.stdout
+    assert "--timer-ranks" in result.stdout
 
 
 @pytest.mark.parametrize(
@@ -280,3 +283,183 @@ def test_errors_only_success_and_unknown_failure_keep_full_logs(saved, tmp_path,
         launcher.dispatch("build", config, errors_only=True)
     assert error.value.returncode == 7
     assert "full log:" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("node,action", [(0, "perf"), (1, "perf"), (0, "trace"), (1, "trace")])
+def test_performance_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, node, action):
+    path, config = saved
+    config["node_rank"] = node
+    launcher.save_config(path, config)
+    before = path.read_bytes()
+    monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(launcher, "environment", lambda _: {})
+    monkeypatch.setattr(launcher, "preflight", lambda *args: None)
+    calls = []
+    outputs = []
+
+    def execute(command, env, log, **kwargs):
+        calls.append(command)
+        assert command[0] == config["python"]
+        assert env["DEEPEP_MEGAMOE_TIMER"] == ("ON" if action == "trace" else "OFF")
+        if "torch.distributed.run" in command:
+            assert command[command.index("--node-rank") + 1] == str(node)
+            assert command[command.index("--mode") + 1] == "perf"
+            assert command[command.index("--input") + 1] == "fp8"
+            assert command[command.index("--routing") + 1] == "balanced"
+            assert command[command.index("--nproc-per-node") + 1] == "16"
+            case = json.loads(Path(command[command.index("--config") + 1]).read_text())
+            assert case == dict(launcher.CASE, warmup=20, iters=100)
+            output = Path(command[command.index("--output-dir") + 1])
+            outputs.append(output)
+            report_dir = output / f"rank_{node * 16}" / "bs_32"
+            report_dir.mkdir(parents=True)
+            (report_dir / "profiling.json").write_text(
+                json.dumps(dict(rounds=50, recorded_rounds=100, mean_us=12.5, rank_max_mean_us=25.0))
+            )
+            if action == "trace":
+                assert command[command.index("--timer-ranks") + 1] == "0,16"
+            else:
+                assert "--timer" not in command
+        else:
+            assert "deep_ep_experimental.megamoe.timer" in command
+            assert command[command.index("--ranks") + 1] == str(node * 16)
+            assert "--include-wait" in command and "--merge" in command
+
+    monkeypatch.setattr(launcher, "execute", execute)
+    for _ in range(2):
+        launcher.main([action, "--config", str(path)])
+    assert len(calls) == (4 if action == "trace" else 2)
+    assert outputs[0] != outputs[1]
+    summary = (outputs[-1] / "summary.txt").read_text()
+    assert "minimum rank: 12.500 us" in summary and "maximum rank: 25.000 us" in summary
+    assert "50/100 rounds" in summary
+    assert "not a cross-device timestamp span" in summary
+    assert path.read_bytes() == before
+    assert launcher.CASE["warmup"] == 0 and launcher.CASE["iters"] == 1
+
+
+def test_timer_build_is_explicit_and_does_not_launch_workers(saved, monkeypatch):
+    path, _ = saved
+    monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(launcher, "environment", lambda _: {})
+    calls = []
+    monkeypatch.setattr(launcher, "execute", lambda *args, **kwargs: calls.append((args, kwargs)))
+    launcher.main(["build", "--timer", "--errors-only", "--config", str(path)])
+    assert len(calls) == 1
+    args, kwargs = calls[0]
+    assert args[0][0] == "bash" and args[1]["DEEPEP_MEGAMOE_TIMER"] == "ON"
+    assert kwargs["errors_only"]
+    launcher.main(["build", "--config", str(path)])
+    assert calls[-1][0][1]["DEEPEP_MEGAMOE_TIMER"] == "OFF"
+
+
+def test_trace_round_overrides_and_host_without_selected_ranks(saved, monkeypatch):
+    path, _ = saved
+    monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(launcher, "environment", lambda _: {})
+    monkeypatch.setattr(launcher, "preflight", lambda *args: None)
+    calls = []
+    monkeypatch.setattr(launcher, "execute", lambda *args, **kwargs: calls.append(args))
+    summaries = []
+    monkeypatch.setattr(launcher, "performance_summary", lambda *args: summaries.append(args))
+    launcher.main(["trace", "--config", str(path), "--warmup", "0", "--iters", "5", "--timer-ranks", "16-18,31"])
+    assert len(calls) == 1  # node0 still joins the benchmark; no local timer files to parse.
+    command = calls[0][0]
+    case = json.loads(Path(command[command.index("--config") + 1]).read_text())
+    assert (case["warmup"], case["iters"]) == (0, 5)
+    assert command[command.index("--timer-ranks") + 1] == "16,17,18,31"
+    assert summaries[0][-1] == []
+
+
+@pytest.mark.parametrize("failure", ["preflight", "benchmark", "parse"])
+def test_failed_trace_does_not_print_done_or_summary(saved, monkeypatch, capsys, failure):
+    _, config = saved
+    monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(launcher, "environment", lambda _: {})
+
+    def preflight(*args):
+        if failure == "preflight":
+            raise RuntimeError("build --timer first")
+
+    calls = []
+
+    def execute(command, *args, **kwargs):
+        calls.append(command)
+        if failure == "benchmark" or "deep_ep_experimental.megamoe.timer" in command:
+            raise subprocess.CalledProcessError(7, command)
+
+    monkeypatch.setattr(launcher, "preflight", preflight)
+    monkeypatch.setattr(launcher, "execute", execute)
+    monkeypatch.setattr(launcher, "performance_summary", lambda *args: pytest.fail("summary after failed trace"))
+    with pytest.raises((RuntimeError, subprocess.CalledProcessError)):
+        launcher.dispatch("trace", config)
+    assert len(calls) == {"preflight": 0, "benchmark": 1, "parse": 2}[failure]
+    assert "[DONE]" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "arguments",
+    [
+        ["perf", "--timer"],
+        ["perf", "--timer-ranks", "0"],
+        ["run", "--warmup", "20"],
+        ["build", "--iters", "100"],
+        ["trace", "--warmup", "-1"],
+        ["perf", "--iters", "0"],
+        ["trace", "--timer-ranks", "32"],
+        ["trace", "--timer-ranks", "1-0"],
+        ["trace", "--timer-ranks", "0,0"],
+        ["trace", "--timer-ranks", "0-999999999"],
+    ],
+)
+def test_invalid_performance_options_fail_before_launch(saved, monkeypatch, arguments):
+    path, _ = saved
+    monkeypatch.setattr(launcher, "dispatch", lambda *args, **kwargs: pytest.fail("invalid arguments launched"))
+    with pytest.raises(SystemExit):
+        launcher.main([*arguments, "--config", str(path)])
+
+
+@pytest.mark.parametrize("requested,compiled", [(False, False), (False, True), (True, False), (True, True)])
+def test_preflight_checks_installed_timer_support(saved, tmp_path, monkeypatch, requested, compiled):
+    _, config = saved
+    checkout = tmp_path / "checkout"
+    library = checkout / "third-party/shmem/install/shmem/lib/libshmem.so"
+    library.parent.mkdir(parents=True)
+    library.touch()
+    installed = tmp_path / "installed"
+    installed.mkdir()
+    (installed / "_build_info.json").write_text(
+        json.dumps(dict(megamoe=dict(enabled=True), shmem=dict(rdma_backend=config["rdma_backend"])))
+    )
+    monkeypatch.setattr(launcher, "ROOT", checkout)
+    monkeypatch.setattr("importlib.resources.files", lambda package: installed)
+    modules = {}
+    for name in (
+        "torch",
+        "torch_npu",
+        "deep_ep",
+        "deep_ep._native",
+        "deep_ep_experimental",
+        "deep_ep_experimental.megamoe",
+        "deep_ep_experimental.megamoe._C",
+    ):
+        module = ModuleType(name)
+        module.__path__ = []
+        modules[name] = module
+        monkeypatch.setitem(sys.modules, name, module)
+    modules["torch"].npu = SimpleNamespace(device_count=lambda: 16)
+    modules["deep_ep"].__file__ = str(installed / "__init__.py")
+    modules["deep_ep._native"].require_native = lambda operation: None
+    modules["deep_ep_experimental.megamoe._C"].timer_enabled = compiled
+
+    def execute(command, env):
+        monkeypatch.setattr(sys, "argv", ["-c", *command[4:]])
+        exec(command[3], {})
+
+    monkeypatch.setattr(launcher, "execute", execute)
+    env = dict(DEEPEP_MEGAMOE_TIMER="ON" if requested else "OFF")
+    if requested and not compiled:
+        with pytest.raises(RuntimeError, match="build --timer"):
+            launcher.preflight(config, env)
+    else:
+        launcher.preflight(config, env)

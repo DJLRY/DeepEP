@@ -1,6 +1,6 @@
 # Copyright (c) 2026, Lu Lu
 
-"""Persist per-host settings, build separately, and run the two-host EP32 BS32 accuracy case."""
+"""Persist per-host settings and build, check, profile or trace the two-host EP32 BS32 case."""
 
 import argparse
 from collections import deque
@@ -239,21 +239,23 @@ from pathlib import Path
 from importlib.resources import files
 import torch, torch_npu, deep_ep
 from deep_ep._native import require_native
-import deep_ep_experimental.megamoe._C
+import deep_ep_experimental.megamoe._C as megamoe
 require_native('BS32 preflight')
 info = json.loads(files('deep_ep').joinpath('_build_info.json').read_text())
 if Path(deep_ep.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()):
     raise RuntimeError('deep_ep resolves to source; run build first')
 if not info['megamoe']['enabled'] or info['shmem']['rdma_backend'] != sys.argv[2]:
     raise RuntimeError('Installed wheel does not match MegaMoE/RoCE configuration; run build first')
+if sys.argv[3] == 'ON' and not megamoe.timer_enabled:
+    raise RuntimeError('Trace requires a timer-enabled wheel; run run_bs32.sh build --timer on both hosts first')
 if torch.npu.device_count() != 16:
     raise RuntimeError('BS32 requires sixteen visible NPUs on each host')
 print('[CHECK] Python:', sys.executable, 'deep_ep:', deep_ep.__file__, flush=True)
 """
-    execute([config["python"], "-I", "-c", code, str(ROOT), config["rdma_backend"]], env)
+    execute([config["python"], "-I", "-c", code, str(ROOT), config["rdma_backend"], env["DEEPEP_MEGAMOE_TIMER"]], env)
 
 
-def test_commands(config, run_dir):
+def test_commands(config, run_dir, *, mode="accuracy", timer_ranks=None):
     python = [config["python"], "-I", "-m"]
     golden_dir = str(Path(config["case_dir"]) / "golden")
     common = [
@@ -301,17 +303,72 @@ def test_commands(config, run_dir):
         "deep_ep_experimental.megamoe.benchmark",
         *common,
         "--mode",
-        "accuracy",
+        mode,
         "--output-dir",
         str(run_dir),
     ]
+    if timer_ranks is not None:
+        benchmark.extend(["--timer", "--timer-ranks", ",".join(map(str, timer_ranks))])
     return golden, benchmark
 
 
-def dispatch(action, config, *, rebuild_shmem=False, errors_only=False):
+def parse_timer_ranks(value):
+    ranks = []
+    try:
+        for part in value.split(","):
+            bounds = part.split("-")
+            if len(bounds) == 1:
+                ranks.append(int(part))
+            elif len(bounds) == 2:
+                first, last = map(int, bounds)
+                if not 0 <= first <= last < 32:
+                    raise ValueError
+                ranks.extend(range(first, last + 1))
+            else:
+                raise ValueError
+        if not ranks or min(ranks) < 0 or max(ranks) >= 32 or len(set(ranks)) != len(ranks):
+            raise ValueError
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Use distinct EP32 ranks, e.g. 0,16 or 0-31") from error
+    return sorted(ranks)
+
+
+def performance_summary(config, run_dir, action, local_timer_ranks):
+    # Every rank's profiling.json contains the same all-EP statistics. Read a
+    # local rank so separate node output disks work without copying reports.
+    rank = config["node_rank"] * 16
+    path = run_dir / f"rank_{rank}" / "bs_32" / "profiling.json"
+    report = json.loads(path.read_text(encoding="utf-8"))
+    lines = [
+        "[PERF SUMMARY] EP32 BS32; FP8 input / FP4 weights; balanced routing",
+        f"All-rank kernel Duration; {report['rounds']}/{report['recorded_rounds']} rounds (tail half)",
+        f"Mean of per-round minimum rank: {report['mean_us']:.3f} us",
+        f"Mean of per-round maximum rank: {report['rank_max_mean_us']:.3f} us",
+        "These are rank-local kernel durations, not a cross-device timestamp span or Python wall time.",
+        f"All-rank statistics: {path}",
+        f"Local raw samples/profiler: {run_dir}/rank_<rank>/bs_32/",
+    ]
+    if action == "trace":
+        lines.extend(
+            [
+                "Timer data comes from a separate instrumented pass; do not use it as the performance baseline.",
+                f"Local traced ranks: {local_timer_ranks}",
+                f"Local timer files: {run_dir / 'bs_32' / 'timer'}",
+                "Trace time is relative to each rank; merged ranks are not globally clock-aligned.",
+            ]
+        )
+    summary = "\n".join(lines) + "\n"
+    (run_dir / "summary.txt").write_text(summary, encoding="utf-8")
+    print(summary, end="", flush=True)
+
+
+def dispatch(
+    action, config, *, rebuild_shmem=False, errors_only=False, timer=False, warmup=None, iters=None, timer_ranks=None
+):
     if platform.system() != "Linux":
         raise RuntimeError("Build/run require Linux; configure/show-config can run without devices")
     env = environment(config)
+    env["DEEPEP_MEGAMOE_TIMER"] = "ON" if timer or action == "trace" else "OFF"
     if action == "build":
         command = ["bash", str(ROOT / "experiments/megamoe/scripts/build.sh"), "--rdma-backend", config["rdma_backend"]]
         if rebuild_shmem:
@@ -333,21 +390,55 @@ def dispatch(action, config, *, rebuild_shmem=False, errors_only=False):
     preflight(config, env)
     directory = Path(config["case_dir"])
     directory.mkdir(parents=True, exist_ok=True)
-    run_dir = Path(tempfile.mkdtemp(prefix=f"node_{config['node_rank']}_", dir=directory))
-    (run_dir / "case.json").write_text(json.dumps(CASE, indent=2) + "\n", encoding="utf-8")
+    performance = action in ("perf", "trace")
+    prefix = f"{action}_node_" if performance else "node_"
+    run_dir = Path(tempfile.mkdtemp(prefix=f"{prefix}{config['node_rank']}_", dir=directory))
+    case = dict(CASE)
+    if performance:
+        case.update(warmup=20 if warmup is None else warmup, iters=100 if iters is None else iters)
+    selected = ([0, 16] if timer_ranks is None else timer_ranks) if action == "trace" else None
+    (run_dir / "case.json").write_text(json.dumps(case, indent=2) + "\n", encoding="utf-8")
     (run_dir / "launch.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+    (run_dir / "run.json").write_text(
+        json.dumps(dict(action=action, timer_ranks=selected, warmup=case["warmup"], iters=case["iters"]), indent=2)
+        + "\n",
+        encoding="utf-8",
+    )
     print(f"[RUN] node={config['node_rank']} master={config['master_addr']} output={run_dir}", flush=True)
-    golden, benchmark = test_commands(config, run_dir)
-    execute(golden, env, run_dir / "golden.log")
-    if action == "run":
+    golden, benchmark = test_commands(config, run_dir, mode="perf" if performance else "accuracy", timer_ranks=selected)
+    if not performance:
+        execute(golden, env, run_dir / "golden.log")
+    if action != "golden":
         execute(benchmark, env, run_dir / "console.log")
+    local_ranks = [rank for rank in selected or [] if rank // 16 == config["node_rank"]]
+    if local_ranks:
+        execute(
+            [
+                config["python"],
+                "-I",
+                "-m",
+                "deep_ep_experimental.megamoe.timer",
+                str(run_dir / "bs_32" / "timer"),
+                "--ranks",
+                ",".join(map(str, local_ranks)),
+                "--include-wait",
+                "--merge",
+            ],
+            env,
+            run_dir / "parse_timer.log",
+        )
+    if performance:
+        performance_summary(config, run_dir, action, local_ranks)
     print(f"[DONE] {action}: {run_dir}", flush=True)
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
-        "action", nargs="?", default="run", choices=("configure", "show-config", "build", "golden", "run")
+        "action",
+        nargs="?",
+        default="run",
+        choices=("configure", "show-config", "build", "golden", "run", "perf", "trace"),
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG, help="Machine-local JSON settings file")
     parser.add_argument(
@@ -357,6 +448,12 @@ def main(argv=None):
         "--errors-only",
         action="store_true",
         help="build only: show errors with nearby context; retain all output in build.log",
+    )
+    parser.add_argument("--timer", action="store_true", help="build only: enable device timer support for trace")
+    parser.add_argument("--warmup", type=int, help="perf/trace only: warmup calls (default: 20)")
+    parser.add_argument("--iters", type=int, help="perf/trace only: collected calls (default: 100; report last half)")
+    parser.add_argument(
+        "--timer-ranks", type=parse_timer_ranks, help="trace only: selected global ranks (default: 0,16; all: 0-31)"
     )
     for name in FIELDS:
         parser.add_argument(
@@ -371,6 +468,15 @@ def main(argv=None):
         parser.error("--rebuild-shmem requires build")
     if args.errors_only and args.action != "build":
         parser.error("--errors-only requires build")
+    if args.timer and args.action != "build":
+        parser.error("--timer requires build; use the trace action for collection")
+    if args.timer_ranks is not None and args.action != "trace":
+        parser.error("--timer-ranks requires trace")
+    if args.warmup is not None or args.iters is not None:
+        if args.action not in ("perf", "trace"):
+            parser.error("--warmup/--iters require perf or trace")
+        if (args.warmup is not None and args.warmup < 0) or (args.iters is not None and args.iters < 1):
+            parser.error("--warmup must be >= 0 and --iters must be >= 1")
     path = args.config.expanduser().absolute()
     if args.action == "configure":
         configure(path, args)
@@ -385,7 +491,12 @@ def main(argv=None):
     if args.action == "show-config":
         print(json.dumps(config, indent=2, ensure_ascii=False))
         return
-    dispatch(args.action, config, rebuild_shmem=args.rebuild_shmem, errors_only=args.errors_only)
+    options = dict(rebuild_shmem=args.rebuild_shmem, errors_only=args.errors_only)
+    if args.timer:
+        options["timer"] = True
+    if args.action in ("perf", "trace"):
+        options.update(warmup=args.warmup, iters=args.iters, timer_ranks=args.timer_ranks)
+    dispatch(args.action, config, **options)
 
 
 if __name__ == "__main__":

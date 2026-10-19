@@ -156,7 +156,7 @@ bash experiments/megamoe/scripts/build.sh --rdma-backend XSCALE --rebuild-shmem
 
 ### BS32：保存配置，分别编译和运行
 
-两台机器各16卡的 BS32 精度用例使用 `scripts/run_bs32.sh`，在**已有的同一个 checkout** 中执行。
+两台机器各16卡的 BS32 精度、性能及流水测试使用 `scripts/run_bs32.sh`，在**已有的同一个 checkout** 中执行。
 此入口不重新克隆、不自动拉取代码，也不在运行时编译或安装；依赖留在当前仓库的 `third-party/`。
 模型固定为 H=3584、I=1280、E=384、K=8、S=0、EP32，使用 FP8 输入和 FP4 权重、balanced 路由及全部 token 精度检查。
 
@@ -201,6 +201,62 @@ bash experiments/megamoe/scripts/run_bs32.sh configure --python /path/to/env/bin
 默认 Golden 位于 `benchmark-runs/bs32/golden/`，每次运行的配置快照和日志位于该目录上级的 `node_<rank>_<随机字符>/`。
 配置与结果均保留在原目录，`git pull` 不会清除它们。此入口使用仓内 SHMEM/CATLASS，不接受外部 SDK 环境覆盖。
 若之前使用的是复制到服务器的旧 `run_bs32.sh`，请改用上述仓库内路径，旧脚本不会随 `git pull` 更新。
+
+精度通过后，直接复用上述机器配置测性能；两台机器都执行同一个命令：
+
+```bash
+bash experiments/megamoe/scripts/run_bs32.sh perf
+# 可选：两台使用相同的预热、采样次数。
+bash experiments/megamoe/scripts/run_bs32.sh perf --warmup 20 --iters 100
+```
+
+`perf` 不生成或读取 Golden，不重新编译。默认预热20轮、采集100轮，并统计后50轮；
+模型、BS32、FP8输入、FP4权重、balanced路由均与精度用例一致。
+沿用 benchmark 的前置对齐计算，临时占用约12 GB显存/卡；对齐计算不计入 MegaMoE kernel Duration。
+结果保存到 `<case_dir>/perf_node_<rank>_<随机字符>/`，终端会打印完整路径和汇总：
+
+| 文件 | 内容 |
+| --- | --- |
+| `summary.txt` | 全EP每轮最短/最长 rank 的平均 kernel Duration，单位微秒 |
+| `case.json`、`launch.json`、`run.json` | 模型与轮次、机器配置、运行模式与选中的 timer ranks |
+| `console.log` | torchrun 与 benchmark 完整输出 |
+| `rank_<全局rank>/bs_32/profiling.json` | 全32 rank 的汇总及逐轮耗时 |
+| `rank_<全局rank>/bs_32/kernel_samples.json`、`profiler/` | 本 rank 的全部原始样本及 profiler 数据 |
+
+现有 benchmark 日志的 `E2E` / `mean_us` 是每轮**最短** rank 的平均值；
+`rank-max-mean` / `rank_max_mean_us` 是每轮**最长** rank 的平均值，建议同时记录并查看 rank 分布。
+它们是融合 kernel 的设备执行时长（含内部通信和等待），不含 Python 调用、权重准备或退出清理，
+也不代表经过跨设备时钟校准的全局起止跨度。`perf` 不传入设备 timer；安装了支持 timer 的 wheel 也不会打点，
+wheel 的编译配置可在每个 rank 的 `manifest.json` 中核对。需要恢复不支持 timer 的构建时执行普通 `build`。
+
+采集内部流水时，先在两台机器分别构建安装支持 timer 的 wheel，再在两台机器启动 `trace`：
+
+```bash
+# 两台均安装完成后再开始 trace；无需重新构建 SHMEM。
+bash experiments/megamoe/scripts/run_bs32.sh build --timer --errors-only
+bash experiments/megamoe/scripts/run_bs32.sh trace
+
+# 默认采集跨机配对 rank0、rank16；也可扩大覆盖范围，两台参数必须相同。
+bash experiments/megamoe/scripts/run_bs32.sh trace --timer-ranks 0-31 --warmup 20 --iters 100
+```
+
+`trace` 先执行 timer 关闭的 profiler 采样，再单独运行一批调用，仅在最后一轮、选中的 rank 上设备打点。
+它不会自动构建；未安装支持 timer 的 wheel 时会在启动 worker 前提示执行 `build --timer`。
+32个 rank 始终全部参加运行；采集后各节点只自动解析自己拥有的选中 rank，保留 WAIT 事件。
+结果位于 `<case_dir>/trace_node_<rank>_<随机字符>/`，除上述性能文件外，还包含：
+
+| 文件 | 内容 |
+| --- | --- |
+| `parse_timer.log` | 本机流水解析日志 |
+| `bs_32/timer/rank_<r>_npu_time.bin` | 原始设备打点，可重复离线解析 |
+| `bs_32/timer/rank_<r>_npu_time.json` | 单 rank 的 AIC/AIV 流水，支持 Chrome JSON trace 查看器 |
+| `bs_32/timer/all_rank_trace.json` | 本机选中 ranks 的合并流水，不包含另一台机器的原始数据 |
+| `bs_32/timer/timer_breakdown.txt/json` | 阶段耗时拆分；本机自动解析后对应本机选中 ranks |
+
+流水按每个 rank 自己的起点归零，不能用不同 rank 的坐标相减计算跨机延迟。
+设备打点反映代码阶段及等待，不是逐 WQE 的网卡执行轨迹；正式性能基线使用 `perf` 的结果。
+`trace` 默认只采两张卡，以控制原始 timer 文件及解析开销；分析慢 rank 时可通过 `--timer-ranks` 定点采集。
+运行、导出或自动解析失败均返回非零退出码，不打印成功的 `[DONE] trace`。
 
 ### 两机各16卡：MTE＋RoCE Decode
 
