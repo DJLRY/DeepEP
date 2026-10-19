@@ -415,12 +415,14 @@ template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessMoeExpertStages(
     int32_t& gmm1TileReadySequence)
 {
+    AscendTimerStartupScope startup(timer_.Enabled() ? &timer_ : nullptr);
     // GMM1/GMM2 交错流水只记录一次阶段入口，各 Wave 完成轮次由独立计数记录。
     exceptionDump_.UpdateStage(MegaMoeImpl::Stage::MOE_GMM1_ACTIVATION);
     uint64_t gmm1Count = 0U;
     uint64_t gmm2Count = 0U;
     DispatchBuffInit();
-    PrepareMoeExpertTokenCountTable<true>(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
+    PrepareMoeExpertTokenCountTable<true>(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_,
+                                          timer_.Enabled() ? &timer_ : nullptr);
     if constexpr (g_coreType == AIV && CombineQuantMode == COMBINE_NO_QUANT) {
         if (GetSubBlockIdx() == 1U) {
             ProcessAiv1PriorityStages(gmm1TileReadySequence);

@@ -4,6 +4,7 @@
 from pathlib import Path
 import re
 import struct
+import csv
 
 import pytest
 
@@ -14,6 +15,7 @@ from deep_ep_experimental.megamoe.timer.trace_parser import (
     raw_events_for_rank,
     synchronized_rank_bases,
     trace_events,
+    write_startup_breakdown,
 )
 
 ROOT = Path(__file__).resolve().parents[3]
@@ -155,3 +157,75 @@ def test_rdma_invalid_metadata_rejected(first, second):
     logical = len(p.FIXED_NAMES) + p.DYNAMIC_NAMES.index("AIV_RDMA_POST") * p.MAX_DYNAMIC_ITER
     with pytest.raises(ValueError, match="invalid RDMA metadata"):
         p.task_metadata(Metadata(), 1, logical)
+
+
+def test_startup_roundtrip_keeps_waits_in_diagnostic_csv(raw_file):
+    phases = [
+        (3, "AIC_MOE_STARTUP", 100000, 110000),
+        (3, "AIC_COUNT_READY_WAIT", 101000, 109000),
+        (5, "AIV_MOE_STARTUP", 100000, 110000),
+        (5, "AIV_COUNT_TABLE_PREPARE", 100500, 109500),
+        (5, "AIV_COUNT_METADATA_WAIT", 101000, 104000),
+        (5, "AIV_GATEWAY_PAYLOAD_CHECK", 104000, 107000),
+        (5, "AIV_COUNT_PREFIX_BUILD", 107000, 108000),
+        (5, "AIV_COUNT_TABLE_PUBLISH", 108000, 109000),
+    ]
+    with raw_file.open("r+b") as stream:
+
+        def put(index, *values):
+            stream.seek(index * 8)
+            stream.write(struct.pack("<" + "q" * len(values), *values))
+
+        for core, name, start, end in phases:
+            slot = p.FIXED_NAMES.index(name)
+            put(core * p.COUNTERS_PER_CORE + slot * 2, start, end)
+            put(p.WAVE_ID_OFFSET + core * p.WAVE_ID_PER_CORE + slot, p.NO_WAVE)
+        core = 5
+        family = p.DYNAMIC_NAMES.index("AIV_GATEWAY_PAYLOAD_WAIT")
+        slot = len(p.FIXED_NAMES) + family * p.MAX_DYNAMIC_ITER
+        put(core * p.COUNTERS_PER_CORE + slot * 2, 104500, 106500)
+        put(p.WAVE_ID_OFFSET + core * p.WAVE_ID_PER_CORE + slot, p.NO_WAVE)
+        put(p.N_TIMING_COUNTER + core * p.DYNAMIC_ITER_PER_CORE + family, 1)
+        put(
+            p.TASK_METADATA_OFFSET + (core * len(p.DYNAMIC_NAMES) + family) * p.MAX_DYNAMIC_ITER * 2,
+            (18 << 32) | 2,
+            130,
+        )
+    parsed = raw_file.with_suffix(".parsed.csv")
+    decode(raw_file, parsed)
+    raw = raw_events_for_rank(parsed, 0)
+    base = first_start_cycle(raw)
+    shown = trace_events(raw, "keep", base, include_wait=True)
+    startup = [e for e in shown if e["tid"].endswith("/STARTUP")]
+    assert len(startup) == 9
+    gateway = next(e for e in startup if e["args"].get("granularity") == "startup_dependency")
+    assert gateway["name"] == "AIV_GATEWAY_PAYLOAD_WAIT_source17_gateway1_seq130"
+    assert gateway["args"]["source_rank"] == 17 and gateway["args"]["gateway_rank"] == 1
+    assert gateway["args"]["wave_id"] is None and "expert_id" not in gateway["args"]
+    assert gateway["ts"] == 4.5 and gateway["dur"] == 2
+    hidden = trace_events(raw, "keep", base)
+    assert not any("WAIT" in e["name"] for e in hidden)
+    for event in hidden:
+        counterpart = next(e for e in shown if e["name"] == event["name"] and e["tid"] == event["tid"])
+        assert (event["ts"], event["dur"]) == (counterpart["ts"], counterpart["dur"])
+    report = raw_file.with_name("startup_breakdown.csv")
+    write_startup_breakdown({0: raw}, report)
+    with report.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 9
+    assert sum("WAIT" in row["event_family"] for row in rows) == 3
+    assert sum(row["scope"] == "envelope" for row in rows) == 4
+    dependency = next(row for row in rows if row["event_family"] == "AIV_GATEWAY_PAYLOAD_WAIT")
+    assert (dependency["source_rank"], dependency["gateway_rank"], dependency["sequence"]) == ("17", "1", "130")
+    assert float(dependency["duration_us"]) == 2
+
+
+@pytest.mark.parametrize("first,second", [(0, 0), (18 << 32 | 3, 130), (18 << 32 | 2, 0), (18 << 32 | 2, 1 << 32)])
+def test_gateway_invalid_metadata_rejected(first, second):
+    class Metadata:
+        def __getitem__(self, key):
+            return first, second
+
+    logical = len(p.FIXED_NAMES) + p.DYNAMIC_NAMES.index("AIV_GATEWAY_PAYLOAD_WAIT") * p.MAX_DYNAMIC_ITER
+    with pytest.raises(ValueError, match="invalid gateway wait metadata"):
+        p.task_metadata(Metadata(), 2, logical)

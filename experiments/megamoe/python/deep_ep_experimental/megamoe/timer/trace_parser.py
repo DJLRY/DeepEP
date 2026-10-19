@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from statistics import median
 
-from .protocol import CYCLE_TO_US
+from .protocol import CYCLE_TO_US, STARTUP_FIXED_NAMES
 
 SYNC_ANCHOR_EVENT = "AIV_INPUT_CROSS_RANK_SYNC"
 
@@ -173,6 +173,7 @@ def trace_events(
     for event in selected:
         task = event.get("task", {})
         granularity = task.get("granularity")
+        family = event_family(event["name"])
         display_name = event["name"]
         lane = f"group_{event['group_id']}_{event['core_type']}_{event['sub_id']}"
         category = (
@@ -200,6 +201,13 @@ def trace_events(
             lane += "/RDMA"
             category = "rdma_wait" if "WAIT" in family else "rdma_post"
             wave_metadata["display_index_semantics"] = "per_core_rdma_operation"
+        if family in STARTUP_FIXED_NAMES or granularity == "startup_dependency":
+            lane += "/STARTUP"
+            category = "startup_wait" if "WAIT" in family else "startup"
+            display_name = family
+            if granularity == "startup_dependency":
+                display_name += f"_source{task['source_rank']}_gateway{task['gateway_rank']}_seq{task['sequence']}"
+            wave_metadata["display_index_semantics"] = "per_core_startup_phase_or_dependency"
         result.append(
             {
                 "ph": "X",
@@ -234,6 +242,50 @@ def trace_events(
 def event_family(name: str) -> str:
     name = re.sub(r"^wave_(?:\d+|global)_", "", name)
     return re.sub(r"_\d+$", "", name)
+
+
+def write_startup_breakdown(raw_by_rank, path: Path):
+    """Retain WAIT and parent envelopes; overlapping rows must not be summed."""
+    fields = [
+        "rank",
+        "group_id",
+        "core_type",
+        "sub_id",
+        "event_family",
+        "scope",
+        "start_us",
+        "duration_us",
+        "source_rank",
+        "gateway_rank",
+        "sequence",
+    ]
+    parents = {"AIC_MOE_STARTUP", "AIV_MOE_STARTUP", "AIV_COUNT_TABLE_PREPARE", "AIV_GATEWAY_PAYLOAD_CHECK"}
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for rank, events in sorted(raw_by_rank.items()):
+            base = first_start_cycle(events)
+            for event in sorted(events, key=lambda e: (e["group_id"], e["core_type"], e["sub_id"], e["start_cycle"])):
+                family = event_family(event["name"])
+                if family not in STARTUP_FIXED_NAMES and family not in (
+                    "AIC_WAIT_INPUT_PREP",
+                    "AIV_GATEWAY_PAYLOAD_WAIT",
+                ):
+                    continue
+                task = event.get("task", {})
+                writer.writerow(
+                    dict(
+                        rank=rank,
+                        group_id=event["group_id"],
+                        core_type=event["core_type"],
+                        sub_id=event["sub_id"],
+                        event_family=family,
+                        scope="envelope" if family in parents else "phase",
+                        start_us=f"{(event['start_cycle'] - base) / CYCLE_TO_US:.6f}",
+                        duration_us=f"{(event['end_cycle'] - event['start_cycle']) / CYCLE_TO_US:.6f}",
+                        **{key: task.get(key, "") for key in ("source_rank", "gateway_rank", "sequence")},
+                    )
+                )
 
 
 def write_summary(events, path: Path) -> None:
@@ -352,6 +404,7 @@ def main():
     )
     summary_output = args.output_dir / "timer_summary.csv"
     write_summary(merged_raw, summary_output)
+    write_startup_breakdown(raw_by_rank, args.output_dir / "startup_breakdown.csv")
     print(f"[TIMER] merged {len(merged_trace)} events -> {merged_output}")
     print(f"[TIMER] summary -> {summary_output}")
 

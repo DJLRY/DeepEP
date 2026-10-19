@@ -19,6 +19,18 @@ enum FixedTiming {
     AIV_FINAL_CROSS_RANK_WAIT,
     AIV_UNPERMUTE,
     AIC_WAIT_INPUT_PREP,
+    AIC_MOE_STARTUP,
+    AIV_MOE_STARTUP,
+    AIC_DISPATCH_BUFFER_INIT,
+    AIV_DISPATCH_BUFFER_INIT,
+    AIV_INPUT_PREP_BARRIER_WAIT,
+    AIV_COUNT_TABLE_PREPARE,
+    AIV_COUNT_METADATA_WAIT,
+    AIV_GATEWAY_PAYLOAD_CHECK,
+    AIV_COUNT_PREFIX_BUILD,
+    AIV_COUNT_TABLE_PUBLISH,
+    AIC_COUNT_READY_WAIT,
+    AIV_COUNT_READY_WAIT,
     FIXED_TIMING_COUNT
 };
 
@@ -42,6 +54,7 @@ enum DynamicTimingType {
     AIV_RDMA_POST,
     AIV_RDMA_QUIET_WAIT,
     AIV_RDMA_RECV_WAIT,
+    AIV_GATEWAY_PAYLOAD_WAIT,
     DYNAMIC_TYPE_COUNT_ENUM
 };
 
@@ -63,6 +76,7 @@ static constexpr int TASK_METADATA_OFFSET = N_TIMING_COUNTER + DYNAMIC_ITER_TOTA
 // 全零表示旧路径无任务坐标；n_tile+1 为零表示 slice 级记录。
 // RDMA slots instead store (peer+1,phase+1), (is_commit,bytes), each field 32 bits.
 // Data Quiet covers preceding QP operations; its byte count is unknown (zero).
+// GATEWAY_PAYLOAD_WAIT stores (source+1,gateway+1), then the invocation sequence.
 static constexpr int TASK_METADATA_SIZE = N_CORE_COUNT * DYNAMIC_TYPE_COUNT * MAX_DYNAMIC_ITER * 2;
 // 保留任务坐标，在尾部追加真实 Wave ID；-1 表示全局或未标记的路径。
 static constexpr int NO_WAVE = -1;

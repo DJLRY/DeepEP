@@ -1,7 +1,22 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by SimpleBright_Man 2026
 
-"""Host mirror of kernels/mega_moe/common/ascend_timer_v2.h."""
+"""Host mirror of kernels/mega_moe/common/ascend_timer_v2.hpp."""
+
+STARTUP_FIXED_NAMES = [
+    "AIC_MOE_STARTUP",
+    "AIV_MOE_STARTUP",
+    "AIC_DISPATCH_BUFFER_INIT",
+    "AIV_DISPATCH_BUFFER_INIT",
+    "AIV_INPUT_PREP_BARRIER_WAIT",
+    "AIV_COUNT_TABLE_PREPARE",
+    "AIV_COUNT_METADATA_WAIT",
+    "AIV_GATEWAY_PAYLOAD_CHECK",
+    "AIV_COUNT_PREFIX_BUILD",
+    "AIV_COUNT_TABLE_PUBLISH",
+    "AIC_COUNT_READY_WAIT",
+    "AIV_COUNT_READY_WAIT",
+]
 
 FIXED_NAMES = [
     "KERNEL_TIMING",
@@ -14,6 +29,7 @@ FIXED_NAMES = [
     "AIV_FINAL_CROSS_RANK_WAIT",
     "AIV_UNPERMUTE",
     "AIC_WAIT_INPUT_PREP",
+    *STARTUP_FIXED_NAMES,
 ]
 
 DYNAMIC_NAMES = [
@@ -36,6 +52,7 @@ DYNAMIC_NAMES = [
     "AIV_RDMA_POST",
     "AIV_RDMA_QUIET_WAIT",
     "AIV_RDMA_RECV_WAIT",
+    "AIV_GATEWAY_PAYLOAD_WAIT",
 ]
 
 RDMA_PHASES = ("dispatch_meta", "dispatch_payload", "combine")
@@ -65,6 +82,12 @@ def task_metadata(raw, core_id, logical_index):
     first, second = raw[offset : offset + 2]
     family = DYNAMIC_NAMES[dynamic_index // MAX_DYNAMIC_ITER]
     mask = (1 << 32) - 1
+    if family == "AIV_GATEWAY_PAYLOAD_WAIT":
+        source = ((first >> 32) & mask) - 1
+        gateway = (first & mask) - 1
+        if not (0 <= source < 32 and gateway == (source + 16) % 32 and 0 < second <= mask):
+            raise ValueError(f"invalid gateway wait metadata: core={core_id}, slot={dynamic_index}")
+        return dict(granularity="startup_dependency", source_rank=source, gateway_rank=gateway, sequence=second)
     if family.startswith("AIV_RDMA_"):
         peer = ((first >> 32) & mask) - 1
         phase = (first & mask) - 1

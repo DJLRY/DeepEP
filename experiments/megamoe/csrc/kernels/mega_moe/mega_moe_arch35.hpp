@@ -325,6 +325,9 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Init(
 template <TemplateMegaMoeTypeClass>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::DispatchBuffInit()
 {
+    AscendTimerFixedScope timing(timer_.Enabled() ? &timer_ : nullptr, g_coreType == AIC
+                                                                           ? AscendTimer::AIC_DISPATCH_BUFFER_INIT
+                                                                           : AscendTimer::AIV_DISPATCH_BUFFER_INIT);
     const TokenDispatchConfig& context = tokenDispatchConfig_;
     TokenDispatchScratch<ActivationType>& scratch = tokenDispatchScratch_;
     scratch.expertRevNumsGlobalTensor.SetGlobalBuffer(
@@ -854,6 +857,9 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::PrepareGmmExpertState(E
 {
     if constexpr (WaitForTokenCountReady) {
         if (GetSubBlockIdx() == 0U && !state.expertCountTableReady) {
+            AscendTimerFixedScope timing(timer_.Enabled() ? &timer_ : nullptr, g_coreType == AIC
+                                                                                   ? AscendTimer::AIC_COUNT_READY_WAIT
+                                                                                   : AscendTimer::AIV_COUNT_READY_WAIT);
             WaitForMoeExpertTokenCountReady(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr, countWorkspace_, 0U);
             state.expertCountTableReady = true;
         }
@@ -939,6 +945,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
     exceptionDump_.UpdateStage(MegaMoeImpl::Stage::INPUT_PREPARE);
     ProcessInputPreparationStage();
     if constexpr (g_coreType == AIV) {
+        timer_.StartUnfenced(AscendTimer::AIV_INPUT_PREP_BARRIER_WAIT);
         PipeBarrier<PIPE_ALL>();
     } else {
         timer_.Start(AscendTimer::AIC_WAIT_INPUT_PREP);
@@ -946,6 +953,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
     SyncAll<false>();  // AIC 等待 AIV 完成输入准备后再进入 GMM。
     if constexpr (g_coreType == AIC) {
         timer_.End(AscendTimer::AIC_WAIT_INPUT_PREP);
+    } else {
+        timer_.EndUnfenced(AscendTimer::AIV_INPUT_PREP_BARRIER_WAIT);
     }
 
     int32_t gmm1TileReadySequence = 0;

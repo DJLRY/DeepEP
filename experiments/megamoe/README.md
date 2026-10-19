@@ -267,6 +267,32 @@ python -I -m deep_ep_experimental.megamoe.timer.trace_parser \
 ```
 
 上述命令默认隐藏 WAIT；加 `--include-wait` 可恢复显示。节点1的单卡采样对应 rank16，需同时修改两个 rank 参数。
+
+排查 `AIC_WAIT_INPUT_PREP` 结束到首次 GMM 之间的空白时，两节点更新并重新 `build --timer`，
+然后运行 `trace --include-wait`。新增的启动阶段位于各核 `/STARTUP` 轨道：
+
+| 事件 | 测量范围 |
+| --- | --- |
+| `AIC/AIV_MOE_STARTUP` | 路由专家阶段入口到本核首次 Dispatch、GMM1 prologue 或 GMM1 tile 入口；无任务的核在阶段退出时结束 |
+| `AIC/AIV_DISPATCH_BUFFER_INIT` | Dispatch 缓冲区视图和 scratch 地址初始化 |
+| `AIV_INPUT_PREP_BARRIER_WAIT` | 输入准备后的既有 PIPE_ALL 排空和 AIC/AIV 屏障；AIC 对应原有 `AIC_WAIT_INPUT_PREP` |
+| `AIV_COUNT_TABLE_PREPARE` | AIV1 准备 count/prefix 表的完整父区间 |
+| `AIV_COUNT_METADATA_WAIT` | 获取所有来源的有效 count：包含 DMA、epoch 校验、转置、重试与退避，并非纯网络延迟 |
+| `AIV_GATEWAY_PAYLOAD_CHECK` | 扫描本 rank 实际需要的远端来源并检查网关就绪的父区间 |
+| `AIV_GATEWAY_PAYLOAD_WAIT` | 每个所需来源的网关 `RelayPayloadReady` 等待；显示 source rank、gateway rank 和 sequence |
+| `AIV_COUNT_PREFIX_BUILD` | 计算专家 token 总数和 prefix 表，包含既有向量完成同步 |
+| `AIV_COUNT_TABLE_PUBLISH` | count/prefix 写回、既有 MTE3 完成同步和 count-ready 发布 |
+| `AIC/AIV_COUNT_READY_WAIT` | AIC/AIV0 等待对应 block 的 AIV1 发布 count-ready |
+
+这些观测不新增 PIPE_ALL、跨核屏障或通信。`AIC/AIV_MOE_STARTUP` 是启动总区间，
+不能与其子事件相加；首个 GMM tile 内部的输入等待仍由原 `AIC_GMM1_WAIT` 记录。
+网关逐个检查，单条 WAIT 是轮到该来源时的剩余等待，不能当作该来源的完整传输耗时。
+如果总启动区间长而以上子阶段都短，剩余部分包含专家扫描、调度及 GMM 调用内部首次 tile 前的准备。
+
+解析同时输出 `startup_breakdown.csv`，按 rank/group/core 列出阶段起点、耗时及网关身份，
+始终保留启动 WAIT，不受 JSON 的 `--include-wait` 开关影响。时间基准为每个 rank 的原始首事件；
+`scope=envelope` 是父区间，各核和父子区间不可累计当作端到端耗时。
+新启动打点再次扩展了 buffer 布局，旧 BIN 需使用采集时的解析器；旧采样无法补出此前未记录的阶段。
 结果位于 `<case_dir>/trace_node_<rank>_<随机字符>/`，除上述性能文件外，还包含：
 
 | 文件 | 内容 |

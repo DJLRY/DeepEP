@@ -26,6 +26,7 @@ public:
         activeType_ = activeIndex_ = waitType_ = waitIndex_ = -1;
         expert_ = -1;
         tileActive_ = false;
+        startupActive_ = false;
         int blockId = AscendC::GetBlockIdx();
         int taskRatio = AscendC::GetTaskRation();
         if (taskRatio <= 0) {
@@ -88,6 +89,9 @@ public:
         if (!Enabled() || expert_ < 0) {
             return false;
         }
+        if (type == AscendTimer::AIC_GMM1) {
+            EndStartup();
+        }
         tileActive_ = true;
         rowStart_ = sliceRow_ + m;
         rows_ = rows;
@@ -134,6 +138,39 @@ public:
         WriteEnd(timingId, AscendC::GetSystemCycle());
     }
 
+    // Observe existing synchronization without adding a pipeline drain. Fixed
+    // slots are used only once per invocation and do not touch tile/span state.
+    __aicore__ inline void StartUnfenced(AscendTimer::FixedTiming type)
+    {
+        if (Enabled()) {
+            WriteWave(static_cast<int>(type), AscendTimer::NO_WAVE);
+            WriteStart(static_cast<int>(type), AscendC::GetSystemCycle());
+        }
+    }
+
+    __aicore__ inline void EndUnfenced(AscendTimer::FixedTiming type)
+    {
+        if (Enabled()) {
+            WriteEnd(static_cast<int>(type), AscendC::GetSystemCycle());
+        }
+    }
+
+    __aicore__ inline void BeginStartup()
+    {
+        if (Enabled()) {
+            startupActive_ = true;
+            StartUnfenced(coreId_ % 3 == 0 ? AscendTimer::AIC_MOE_STARTUP : AscendTimer::AIV_MOE_STARTUP);
+        }
+    }
+
+    __aicore__ inline void EndStartup()
+    {
+        if (Enabled() && startupActive_) {
+            EndUnfenced(coreId_ % 3 == 0 ? AscendTimer::AIC_MOE_STARTUP : AscendTimer::AIV_MOE_STARTUP);
+            startupActive_ = false;
+        }
+    }
+
     // 每次 slice 独立记录；依赖等待会把当前执行段拆成真实的前后两段。
     __aicore__ inline void StartSpan(AscendTimer::DynamicTimingType type)
     {
@@ -141,6 +178,9 @@ public:
             return;
         }
         AscendC::PipeBarrier<PIPE_ALL>();
+        if (type == AscendTimer::AIV_DISPATCH || type == AscendTimer::AIV_GMM1_PROLOGUE) {
+            EndStartup();
+        }
         activeType_ = static_cast<int>(type);
         activeWaveId_ = waveId_;
         activeIndex_ = BeginRaw(activeType_, AscendC::GetSystemCycle());
@@ -206,28 +246,27 @@ public:
     __aicore__ inline int BeginRdma(AscendTimer::DynamicTimingType type, AscendTimer::RdmaPhase phase, uint32_t peer,
                                     uint32_t bytes, bool isCommit)
     {
-        if (!Enabled()) {
-            return -1;
-        }
-        int typeId = static_cast<int>(type);
-        int index = dynamicCounts_[typeId]++;
-        if (index >= AscendTimer::MAX_DYNAMIC_ITER) {
-            return -1;
-        }
-        int offset = AscendTimer::TASK_METADATA_OFFSET +
-                     ((coreId_ * AscendTimer::DYNAMIC_TYPE_COUNT + typeId) * AscendTimer::MAX_DYNAMIC_ITER + index) * 2;
-        WriteValue(offset,
-                   static_cast<int64_t>((static_cast<uint64_t>(peer + 1) << 32) | (static_cast<uint32_t>(phase) + 1)));
-        WriteValue(offset + 1, static_cast<int64_t>((static_cast<uint64_t>(isCommit) << 32) | bytes));
-        WriteWave(DynamicTimingIndex(typeId, index), AscendTimer::NO_WAVE);
-        WriteStart(DynamicTimingIndex(typeId, index), AscendC::GetSystemCycle());
-        return index;
+        return BeginIndependent(type, (static_cast<uint64_t>(peer + 1) << 32) | (static_cast<uint32_t>(phase) + 1),
+                                (static_cast<uint64_t>(isCommit) << 32) | bytes);
     }
 
     __aicore__ inline void EndRdma(AscendTimer::DynamicTimingType type, int index)
     {
         if (Enabled() && index >= 0) {
             EndRaw(static_cast<int>(type), index, AscendC::GetSystemCycle());
+        }
+    }
+
+    __aicore__ inline int BeginGatewayWait(uint32_t source, uint32_t gateway, uint32_t sequence)
+    {
+        return BeginIndependent(AscendTimer::AIV_GATEWAY_PAYLOAD_WAIT,
+                                (static_cast<uint64_t>(source + 1) << 32) | (gateway + 1), sequence);
+    }
+
+    __aicore__ inline void EndGatewayWait(int index)
+    {
+        if (Enabled() && index >= 0) {
+            EndRaw(AscendTimer::AIV_GATEWAY_PAYLOAD_WAIT, index, AscendC::GetSystemCycle());
         }
     }
 
@@ -253,11 +292,31 @@ private:
     int waitType_ = -1;
     int waitIndex_ = -1;
     bool tileActive_ = false;
+    bool startupActive_ = false;
     int expert_ = -1;
     int nTile_ = -1;
     uint32_t sliceRow_ = 0;
     uint32_t rowStart_ = 0;
     uint32_t rows_ = 0;
+
+    __aicore__ inline int BeginIndependent(AscendTimer::DynamicTimingType type, uint64_t first, uint64_t second)
+    {
+        if (!Enabled()) {
+            return -1;
+        }
+        int typeId = static_cast<int>(type);
+        int index = dynamicCounts_[typeId]++;
+        if (index >= AscendTimer::MAX_DYNAMIC_ITER) {
+            return -1;
+        }
+        int offset = AscendTimer::TASK_METADATA_OFFSET +
+                     ((coreId_ * AscendTimer::DYNAMIC_TYPE_COUNT + typeId) * AscendTimer::MAX_DYNAMIC_ITER + index) * 2;
+        WriteValue(offset, static_cast<int64_t>(first));
+        WriteValue(offset + 1, static_cast<int64_t>(second));
+        WriteWave(DynamicTimingIndex(typeId, index), AscendTimer::NO_WAVE);
+        WriteStart(DynamicTimingIndex(typeId, index), AscendC::GetSystemCycle());
+        return index;
+    }
 
     __aicore__ inline void WriteMetadata(int typeId, int index)
     {
@@ -327,6 +386,67 @@ private:
             WriteValue(index + 1, cycle);
         }
     }
+};
+
+class AscendTimerFixedScope {
+public:
+    __aicore__ inline AscendTimerFixedScope(AscendTimerDevice* timer, AscendTimer::FixedTiming type)
+        : timer_(timer), type_(type)
+    {
+        if (timer_ != nullptr) {
+            timer_->StartUnfenced(type_);
+        }
+    }
+    __aicore__ inline ~AscendTimerFixedScope()
+    {
+        if (timer_ != nullptr) {
+            timer_->EndUnfenced(type_);
+        }
+    }
+
+private:
+    AscendTimerDevice* timer_;
+    AscendTimer::FixedTiming type_;
+};
+
+// The first routed Dispatch/prologue/tile closes this envelope. Empty-work
+// cores close it at stage exit, so they retain a visible startup interval too.
+class AscendTimerStartupScope {
+public:
+    __aicore__ inline explicit AscendTimerStartupScope(AscendTimerDevice* timer) : timer_(timer)
+    {
+        if (timer_ != nullptr) {
+            timer_->BeginStartup();
+        }
+    }
+    __aicore__ inline ~AscendTimerStartupScope()
+    {
+        if (timer_ != nullptr) {
+            timer_->EndStartup();
+        }
+    }
+
+private:
+    AscendTimerDevice* timer_;
+};
+
+class AscendTimerGatewayWaitScope {
+public:
+    __aicore__ inline AscendTimerGatewayWaitScope(AscendTimerDevice* timer, uint32_t source, uint32_t gateway,
+                                                  uint32_t sequence)
+        : timer_(timer), index_(timer ? timer->BeginGatewayWait(source, gateway, sequence) : -1)
+    {
+    }
+    __aicore__ inline ~AscendTimerGatewayWaitScope()
+    {
+        if (timer_ != nullptr) {
+            timer_->EndGatewayWait(index_);
+        }
+    }
+
+private:
+    AscendTimerDevice* timer_;
+    int index_;
 };
 
 class AscendTimerRdmaScope {

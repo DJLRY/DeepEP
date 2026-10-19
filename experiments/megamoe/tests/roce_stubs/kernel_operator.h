@@ -10,7 +10,7 @@
 #define __gm__
 #define __ubuf__
 #define GM_ADDR uint8_t*
-#define ASCEND_IS_AIV (true)
+#define ASCEND_IS_AIV (RoceTest::isAiv)
 constexpr int PIPE_ALL = 0;
 
 inline void trap()
@@ -19,6 +19,10 @@ inline void trap()
 }
 
 namespace RoceTest {
+inline bool isAiv = true;
+inline int blockIndex = 0;
+inline int taskRatio = 2;
+inline int subBlockIndex = 0;
 inline bool signalObserved = false;
 inline bool scalarEventSet = false;
 inline bool mteCanRead = false;
@@ -30,15 +34,15 @@ inline int64_t cycle = 100;
 namespace AscendC {
 inline int GetBlockIdx()
 {
-    return 0;
+    return RoceTest::blockIndex;
 }
 inline int GetTaskRation()
 {
-    return 2;
+    return RoceTest::taskRatio;
 }
 inline int GetSubBlockIdx()
 {
-    return 0;
+    return RoceTest::subBlockIndex;
 }
 inline int64_t GetSystemCycle()
 {

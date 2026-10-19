@@ -20,6 +20,7 @@
 
 #include "../common/mega_moe_utils.hpp"
 #include "../common/mega_moe_peer_rows.hpp"
+#include "../common/ascend_timer_v2_device.hpp"
 #include "mega_moe_token_quant.hpp"
 #include "mega_moe_count_arrival.hpp"
 
@@ -622,7 +623,8 @@ template <bool NeedCumsumReload = false, typename ActivationType>
 __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfig& common,
                                                        const BlockWorkspaceContext& countWorkspace,
                                                        const Params& params,
-                                                       TokenDispatchScratch<ActivationType>& scratch)
+                                                       TokenDispatchScratch<ActivationType>& scratch,
+                                                       AscendTimerDevice* timer = nullptr)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -631,6 +633,7 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
         return;
     }
 
+    AscendTimerFixedScope preparation(timer, AscendTimer::AIV_COUNT_TABLE_PREPARE);
     uint32_t rawCountElementCount = common.worldSize * common.moeExpertPerRank;
     // 每次重新准备输入路由都失效缓存。不能仅靠 expertId，否则重复 launch 可能复用旧计数。
     scratch.peerRowLimitsCache = {};
@@ -638,8 +641,14 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
         reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.rankSyncInWorldPtr + RANK_SYNC_COUNTER_OFFSET_BYTES);
     int32_t expectEpoch = (ReadGmByPassDCache(launchCountSlot0) & 0x7F) | 0x80;
     if (UseDecodeRailRouting(params.tilingData)) {
-        LoadMteExpertCounts(common, params, scratch, static_cast<uint32_t>(expectEpoch));
+        {
+            // Includes DMA snapshots, epoch validation and any poll/backoff;
+            // it is readiness acquisition time, not pure network latency.
+            AscendTimerFixedScope counts(timer, AscendTimer::AIV_COUNT_METADATA_WAIT);
+            LoadMteExpertCounts(common, params, scratch, static_cast<uint32_t>(expectEpoch));
+        }
         if (UseHierarchicalRoce(params.tilingData)) {
+            AscendTimerFixedScope payload(timer, AscendTimer::AIV_GATEWAY_PAYLOAD_CHECK);
             // Counts may arrive before the paired payload. Only wait for gateways
             // that actually supply this rank; route metadata retains original S.
             const uint64_t readyOffset = params.peermemInfo.hierarchicalControlPtr -
@@ -654,14 +663,16 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
                     needed |= scratch.cumsumInfoTensor.GetValue(expert * common.worldSize + source) != 0;
                 }
                 if (needed) {
-                    auto* ready =
-                        reinterpret_cast<__gm__ int32_t*>(g_winRankAddr_[HierarchicalGateway(source)] + readyOffset);
+                    const uint32_t gateway = HierarchicalGateway(source);
+                    AscendTimerGatewayWaitScope wait(timer, source, gateway, params.tilingData->hierarchicalSequence);
+                    auto* ready = reinterpret_cast<__gm__ int32_t*>(g_winRankAddr_[gateway] + readyOffset);
                     WaitUntilGmFlagEquals(ready, static_cast<int32_t>(params.tilingData->hierarchicalSequence));
                 }
             }
             SyncFuncStatic<HardEvent::S_MTE2, 7U>();
         }
     } else {
+        AscendTimerFixedScope counts(timer, AscendTimer::AIV_COUNT_METADATA_WAIT);
         GlobalTensor<int32_t> expertCountGlobal;
         expertCountGlobal.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.expertCountRecvPtr));
         DataCopyPad(scratch.cumsumInfoTensor, expertCountGlobal,
@@ -695,11 +706,14 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
             }
         }
     }
-    SyncFuncStatic<AscendC::HardEvent::S_V, SYNC_EVENT_ID2>();
-
-    ComputeExpertCountTables(scratch.cumsumInfoTensor, scratch.expertTokenNumsOutTensor, common.moeExpertPerRank,
-                             common.worldSize, params.tilingData->maxOutputSize);
-    SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
+    {
+        AscendTimerFixedScope prefix(timer, AscendTimer::AIV_COUNT_PREFIX_BUILD);
+        SyncFuncStatic<AscendC::HardEvent::S_V, SYNC_EVENT_ID2>();
+        ComputeExpertCountTables(scratch.cumsumInfoTensor, scratch.expertTokenNumsOutTensor, common.moeExpertPerRank,
+                                 common.worldSize, params.tilingData->maxOutputSize);
+        SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
+    }
+    AscendTimerFixedScope publish(timer, AscendTimer::AIV_COUNT_TABLE_PUBLISH);
     uint64_t countOffset = GetExpertCountWorkspaceOffset(countWorkspace, common.moeExpertPerRank, 0U, true);
     SyncFuncStatic<AscendC::HardEvent::V_MTE3, SYNC_EVENT_ID2>();
     DataCopyPad(scratch.expertRevNumsGlobalTensor[countOffset], scratch.expertTokenNumsOutTensor,

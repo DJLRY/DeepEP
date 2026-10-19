@@ -23,6 +23,11 @@ def test_rdma_timer_preserves_compute_and_transport(tmp_path, backend, timer):
     compile_and_run(tmp_path, backend, "rdma_timer_test.cpp", timer)
 
 
+@pytest.mark.parametrize("timer", [False, True], ids=["timer-off", "timer-on"])
+def test_startup_timer_closes_at_first_work_without_extra_barriers(tmp_path, timer):
+    compile_and_run(tmp_path, None, "startup_timer_test.cpp", timer)
+
+
 def compile_and_run(tmp_path, backend, source_name, timer=False):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
