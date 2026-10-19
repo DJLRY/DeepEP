@@ -400,6 +400,7 @@ class CMakeBuild(build_ext):
             directory,
             f"-DCMAKE_BUILD_TYPE={configuration['build_type']}",
             f"-DDEEPEP_DEVICE_JOBS={jobs}",
+            f"-DDEEPEP_HOST_PROCESSOR={configuration['machine']}",
             f"-DPython_EXECUTABLE={sys.executable}",
             f"-Dpybind11_DIR={pybind11.get_cmake_dir()}",
             f"-DCMAKE_CXX_COMPILER={configuration['compiler_path']}",

@@ -9,7 +9,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 include("${CMAKE_CURRENT_LIST_DIR}/../Dependencies.cmake")
 set(_sdk_include "${ASCEND_HOME_PATH}/include")
-set(_arch_include "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/include")
+set(_arch_include "${ASCEND_HOME_PATH}/${DEEPEP_HOST_PROCESSOR}-linux/include")
 set(_tikcpp "${ASCEND_HOME_PATH}/compiler/tikcpp")
 # Some toolkit layouts expose a legacy rt.h compatibility header separately.
 # Do not require that header to configure the CANN 9.2 -xasc target: the
@@ -22,8 +22,8 @@ find_path(DEVICE_RT_INCLUDE rt.h HINTS
     "${_arch_include}/runtime" "${_arch_include}/experiment/runtime"
     "${_arch_include}/acl/runtime" "${_arch_include}"
     "${ASCEND_HOME_PATH}/pkg_inc/runtime"
-    "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc/runtime"
-    "${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/runtime/include"
+    "${ASCEND_HOME_PATH}/${DEEPEP_HOST_PROCESSOR}-linux/pkg_inc/runtime"
+    "${ASCEND_HOME_PATH}/${DEEPEP_HOST_PROCESSOR}-linux/runtime/include"
     NO_DEFAULT_PATH)
 add_library(deepep_kernels SHARED "${DEEPEP_SOURCE_DIR}/csrc/kernels/notify/notify.cpp"
     "${DEEPEP_SOURCE_DIR}/csrc/kernels/dispatch/dispatch.cpp"

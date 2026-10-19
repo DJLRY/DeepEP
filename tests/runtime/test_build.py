@@ -324,6 +324,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
         "source_sha256": "current",
         "source_version": "1",
         "cmake_path": "/tools/cmake",
+        "machine": "x86_64",
         "compiler_path": "/tools/c++",
         "ASCEND_HOME_PATH": "/sdk/cann",
         "SHMEM_ROOT": "/sdk/shmem",
@@ -363,6 +364,7 @@ def test_packaging_uses_cmake_capabilities_and_removes_old_library(
     command.build_extension(ext)
     assert "-DCMAKE_BUILD_TYPE=RelWithDebInfo" in calls[0]
     assert "-DDEEPEP_DEVICE_JOBS=6" in calls[0]
+    assert "-DDEEPEP_HOST_PROCESSOR=x86_64" in calls[0]
     assert f"-DDEEPEP_SHMEM_RDMA_BACKEND={rdma_backend}" in calls[0]
     assert f"-DDEEPEP_BUILD_MEGAMOE={'ON' if beta else 'OFF'}" in calls[0]
     assert f"-DDEEPEP_MEGAMOE_TIMER={'ON' if timer else 'OFF'}" in calls[0]
