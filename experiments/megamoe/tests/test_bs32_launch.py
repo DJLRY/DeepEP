@@ -70,7 +70,7 @@ def test_repeated_run_reuses_settings_without_prompt_or_environment_override(sav
     monkeypatch.setattr(launcher, "dispatch", lambda *a, **kw: calls.append((a, kw)))
     for _ in range(2):
         launcher.main(["run", "--config", str(path)])
-    assert calls == [(("run", config), {"rebuild_shmem": False})] * 2
+    assert calls == [(("run", config), {"rebuild_shmem": False, "errors_only": False})] * 2
     assert path.read_bytes() == before
 
 
@@ -134,7 +134,7 @@ def test_bad_edit_preserves_previous_configuration(saved, options):
 
 def test_runtime_cannot_mutate_config_or_rebuild_sdk(saved):
     path, _ = saved
-    for options in (["--master-addr", "192.0.2.20"], ["--rebuild-shmem"]):
+    for options in (["--master-addr", "192.0.2.20"], ["--rebuild-shmem"], ["--errors-only"]):
         with pytest.raises(SystemExit):
             launcher.main(["run", "--config", str(path), *options])
 
@@ -159,7 +159,11 @@ def test_stage_separation_and_fixed_case(saved, monkeypatch, action, expected):
             "--rebuild-shmem",
         ]
         assert not probes
-        assert not Path(config["case_dir"]).exists()
+        log = Path(calls[0][0][2])
+        assert log.parent.parent == Path(config["case_dir"])
+        assert log.name == "build.log"
+        assert calls[0][0][1]["PIP_VERBOSE"] == "1"
+        assert calls[0][1] == {"cwd": ROOT, "errors_only": False}
     else:
         assert len(probes) == 1
         golden = calls[0][0][0]
@@ -222,3 +226,57 @@ def test_logged_child_failure_is_not_reported_as_success(tmp_path):
         )
     assert error.value.returncode == 7
     assert "test failure" in log.read_text(encoding="utf-8")
+
+
+def test_errors_only_preserves_diagnostics_full_log_and_exit_code(tmp_path, capsys):
+    # Model noisy Clang/CANN diagnostics, including template notes and a warning promoted to error.
+    lines = [f"warning flood {index}: warning: deprecated API" for index in range(50)]
+    lines += [
+        "In file included from kernel.cpp:13:",
+        "\x1b[31mkernel.hpp:724:9: error: no matching function for call to 'CombineWaveTokenRange'\x1b[0m",
+        "  CombineWaveTokenRange(output);",
+        "  ^~~~~~~~~~~~~~~~~~~~~~~~~~~~",
+        "stage.hpp:459:24: note: candidate not viable: would lose const qualifier",
+        "kernel.hpp:730:9: error: unused variable [-Werror,-Wunused-variable]",
+        "gmake: *** [Makefile:136: all] Error 2",
+    ]
+    log = tmp_path / "build.log"
+    code = "\n".join([f"print({line!r})" for line in lines] + ["raise SystemExit(2)"])
+    # Avoid printing the test's embedded warning strings as part of the [EXEC] command.
+    child = tmp_path / "compiler.py"
+    child.write_text(code, encoding="utf-8")
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        launcher.execute([sys.executable, "-I", str(child)], dict(os.environ), log, cwd=tmp_path, errors_only=True)
+    assert error.value.returncode == 2
+    output = capsys.readouterr().out
+    assert "warning flood 0:" not in output
+    assert "In file included from kernel.cpp:13:" in output
+    assert "error: no matching function" in output
+    assert "would lose const qualifier" in output
+    assert "[-Werror,-Wunused-variable]" in output
+    assert "Error 2" in output
+    assert log.read_text(encoding="utf-8").splitlines() == lines
+
+
+def test_errors_only_success_and_unknown_failure_keep_full_logs(saved, tmp_path, monkeypatch, capsys):
+    log = tmp_path / "warnings.log"
+    child = tmp_path / "warnings.py"
+    child.write_text("print('file.cpp:1: warning: deprecated API')\n", encoding="utf-8")
+    launcher.execute([sys.executable, "-I", str(child)], dict(os.environ), log, cwd=tmp_path, errors_only=True)
+    assert "warning: deprecated" not in capsys.readouterr().out
+    assert "warning: deprecated" in log.read_text(encoding="utf-8")
+
+    _, config = saved
+    monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(launcher, "environment", lambda _: {})
+
+    def fail(command, env, log, **kwargs):
+        assert kwargs["errors_only"]
+        Path(log).write_text("custom failure without a recognized diagnostic\n", encoding="utf-8")
+        raise subprocess.CalledProcessError(7, command)
+
+    monkeypatch.setattr(launcher, "execute", fail)
+    with pytest.raises(subprocess.CalledProcessError) as error:
+        launcher.dispatch("build", config, errors_only=True)
+    assert error.value.returncode == 7
+    assert "full log:" in capsys.readouterr().err

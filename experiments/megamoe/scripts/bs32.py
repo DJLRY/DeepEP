@@ -3,11 +3,13 @@
 """Persist per-host settings, build separately, and run the two-host EP32 BS32 accuracy case."""
 
 import argparse
+from collections import deque
 import ipaddress
 import json
 import os
 from pathlib import Path
 import platform
+import re
 import shlex
 import shutil
 import socket
@@ -174,19 +176,55 @@ def environment(config):
     return env
 
 
-def execute(command, env, log=None, cwd="/tmp"):
+class ErrorOutput:
+    """Show diagnostic context without dumping every compiler warning to the terminal."""
+
+    error = re.compile(
+        r"\b(?:fatal\s+)?error\s*:|\berror\s+\d+\b|\bundefined (?:reference|symbol)\b|"
+        r"\bkilled signal\b|^\s*(?:\[ERROR\]|CMake Error\b|Traceback\b|FAILED:)",
+        re.IGNORECASE,
+    )
+    ansi = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+    def __init__(self):
+        self.before = deque(maxlen=6)
+        self.after = 0
+
+    def write(self, line):
+        plain = self.ansi.sub("", line)
+        if self.error.search(plain):
+            for previous in self.before:
+                print(previous, end="", flush=True)
+            self.before.clear()
+            print(line, end="", flush=True)
+            self.after = 8
+        elif self.after:
+            print(line, end="", flush=True)
+            self.after -= 1
+        elif plain.lstrip().startswith("[BUILD]"):
+            print(line, end="", flush=True)
+            self.before.clear()
+        else:
+            self.before.append(line)
+
+
+def execute(command, env, log=None, cwd="/tmp", *, errors_only=False):
     print("[EXEC] " + shlex.join(map(str, command)), flush=True)
     if log is None:
         subprocess.run(command, env=env, cwd=cwd, check=True)
         return
+    display = ErrorOutput() if errors_only else None
     with Path(log).open("w", encoding="utf-8") as stream:
         with subprocess.Popen(
             command, env=env, cwd=cwd, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT
         ) as process:
             for line in process.stdout:
-                print(line, end="", flush=True)
                 stream.write(line)
                 stream.flush()
+                if display is None:
+                    print(line, end="", flush=True)
+                else:
+                    display.write(line)
             code = process.wait()
     if code:
         raise subprocess.CalledProcessError(code, command)
@@ -270,7 +308,7 @@ def test_commands(config, run_dir):
     return golden, benchmark
 
 
-def dispatch(action, config, *, rebuild_shmem=False):
+def dispatch(action, config, *, rebuild_shmem=False, errors_only=False):
     if platform.system() != "Linux":
         raise RuntimeError("Build/run require Linux; configure/show-config can run without devices")
     env = environment(config)
@@ -278,7 +316,19 @@ def dispatch(action, config, *, rebuild_shmem=False):
         command = ["bash", str(ROOT / "experiments/megamoe/scripts/build.sh"), "--rdma-backend", config["rdma_backend"]]
         if rebuild_shmem:
             command.append("--rebuild-shmem")
-        execute(command, env, cwd=ROOT)
+        directory = Path(config["case_dir"])
+        directory.mkdir(parents=True, exist_ok=True)
+        log_dir = Path(tempfile.mkdtemp(prefix=f"build_node_{config['node_rank']}_", dir=directory))
+        log = log_dir / "build.log"
+        print(f"[BUILD] Full log: {log}", flush=True)
+        # Let pip stream native compiler diagnostics, rather than buffering them until failure.
+        env.setdefault("PIP_VERBOSE", "1")
+        try:
+            execute(command, env, log, cwd=ROOT, errors_only=errors_only)
+        except subprocess.CalledProcessError:
+            print(f"[ERROR] Build failed; full log: {log}", file=sys.stderr, flush=True)
+            raise
+        print(f"[DONE] Build/install completed; full log: {log}", flush=True)
         return
     preflight(config, env)
     directory = Path(config["case_dir"])
@@ -303,6 +353,11 @@ def main(argv=None):
     parser.add_argument(
         "--rebuild-shmem", action="store_true", help="build only: rebuild the bundled SDK after stopping its users"
     )
+    parser.add_argument(
+        "--errors-only",
+        action="store_true",
+        help="build only: show errors with nearby context; retain all output in build.log",
+    )
     for name in FIELDS:
         parser.add_argument(
             "--" + name.replace("_", "-"),
@@ -314,6 +369,8 @@ def main(argv=None):
         parser.error("Settings may only be changed with configure")
     if args.rebuild_shmem and args.action != "build":
         parser.error("--rebuild-shmem requires build")
+    if args.errors_only and args.action != "build":
+        parser.error("--errors-only requires build")
     path = args.config.expanduser().absolute()
     if args.action == "configure":
         configure(path, args)
@@ -328,7 +385,7 @@ def main(argv=None):
     if args.action == "show-config":
         print(json.dumps(config, indent=2, ensure_ascii=False))
         return
-    dispatch(args.action, config, rebuild_shmem=args.rebuild_shmem)
+    dispatch(args.action, config, rebuild_shmem=args.rebuild_shmem, errors_only=args.errors_only)
 
 
 if __name__ == "__main__":

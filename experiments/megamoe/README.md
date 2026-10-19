@@ -174,6 +174,12 @@ bash experiments/megamoe/scripts/run_bs32.sh build
 bash experiments/megamoe/scripts/run_bs32.sh run
 ```
 
+编译 warning 太多时使用 `bash experiments/megamoe/scripts/run_bs32.sh build --errors-only`。
+终端只显示构建阶段提示、错误及其前6行/后8行上下文；完整输出（包括 warning）仍写入
+`<case_dir>/build_node_<rank>_<随机字符>/build.log`，成功或失败时都会打印日志路径。
+这是终端显示选项，不改变编译器检查或失败退出码，也不会隐藏被提升为 error 的 warning。
+默认 `build` 同样保存日志，并显示完整输出。屏蔽模式下没有持续输出时，可用 `tail -f <日志路径>` 查看进度。
+
 配置默认保存到 `.megamoe-bs32/<hostname>.json`，已加入 Git 忽略规则；共享 checkout 的两台主机也各用自己的文件。
 Python 使用保存的绝对路径，后续自动加载保存的 CANN 环境；迁移或删除 Python 环境后需显式更新配置。
 可以用 `--config /absolute/path/node.json` 指定其他配置文件，之后各阶段都须传同一路径。
