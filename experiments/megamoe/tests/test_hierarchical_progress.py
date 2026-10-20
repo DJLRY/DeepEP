@@ -49,6 +49,7 @@ def hierarchical_progress_binary(tmp_path_factory):
         "drain",
         "topology",
         "telemetry",
+        "cursor-oracle",
     ],
 )
 def test_hierarchical_progress_contract(hierarchical_progress_binary, scenario):

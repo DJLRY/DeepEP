@@ -87,17 +87,66 @@ __aicore__ inline void InitializeHierarchicalCombineProgress(const MoeStageCommo
     progress.initialized = true;
 }
 
-__aicore__ inline bool IsHierarchicalCombineRowReady(const MoeStageCommonConfig& common, const Params& params,
-                                                     const HierarchicalCombineProgress& progress, uint32_t row)
-{
-    const uint32_t token = row / common.topK;
-    const uint32_t topk = row % common.topK;
-    if ((progress.pendingTopkMasks[token] & (uint32_t(1) << topk)) == 0U) {
-        return false;
+// Keep the current token's remaining bits in scalar state. Advancing still
+// visits every row for exact scan-budget accounting, including holes and sent
+// rows, but needs no per-row division or pending-mask reload.
+struct HierarchicalCombineScanCursor {
+    uint32_t row;
+    uint32_t token;
+    uint32_t topk;
+    uint32_t pending;
+
+    __aicore__ inline HierarchicalCombineScanCursor(const HierarchicalCombineProgress& progress, uint32_t topK)
+        : row(progress.nextRow),
+          token(row / topK),
+          topk(row - token * topK),
+          pending(progress.pendingTopkMasks[token] >> topk)
+    {
     }
-    auto* ready = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.gatewayCombineReadyPtr +
-                                                    static_cast<uint64_t>(row) * HIERARCHICAL_FLAG_BYTES);
-    return static_cast<uint32_t>(ReadGmByPassDCache(ready)) == params.tilingData->hierarchicalSequence;
+
+    __aicore__ inline bool Ready(const Params& params) const
+    {
+        if ((pending & 1U) == 0U) {
+            return false;
+        }
+        auto* ready = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.gatewayCombineReadyPtr +
+                                                        static_cast<uint64_t>(row) * HIERARCHICAL_FLAG_BYTES);
+        return static_cast<uint32_t>(ReadGmByPassDCache(ready)) == params.tilingData->hierarchicalSequence;
+    }
+
+    __aicore__ inline void Advance(const MoeStageCommonConfig& common, const HierarchicalCombineProgress& progress)
+    {
+        ++row;
+        pending >>= 1U;
+        if (++topk == common.topK) {
+            topk = 0U;
+            ++token;
+            pending = token < common.tokenNum ? progress.pendingTopkMasks[token] : 0U;
+        }
+    }
+
+    __aicore__ inline void Wrap(const HierarchicalCombineProgress& progress)
+    {
+        row = token = topk = 0U;
+        pending = progress.pendingTopkMasks[0];
+    }
+};
+
+// Called only after Put returns. A run may cross tokens, but clearing each
+// token once avoids repeated division and read/modify/write for every sent row.
+__aicore__ inline void ClearHierarchicalCombineRun(HierarchicalCombineProgress& progress, uint32_t topK, uint32_t token,
+                                                   uint32_t topk, uint32_t rows)
+{
+    while (rows != 0U) {
+        const uint32_t available = topK - topk;
+        const uint32_t count = rows < available ? rows : available;
+        // count is in [1, 32]; neither shift can be 32, including a full token.
+        const uint32_t mask = (0xffffffffU >> (32U - count)) << topk;
+        progress.pendingTopkMasks[token] &= ~mask;
+        rows -= count;
+        ++token;
+        topk = 0U;
+    }
 }
 
 // Probe at most one sweep without waiting for unfinished producers. The cursor
@@ -132,48 +181,52 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
     const uint32_t scanLimit = budget.maxScannedRows < rowCount ? budget.maxScannedRows : rowCount;
     const uint32_t rowBytes = common.tokenHiddenDim * sizeof(bfloat16_t);
     const uint32_t destination = HierarchicalGateway(common.rankId);
-    uint32_t row = progress.nextRow;
+    HierarchicalCombineScanCursor cursor(progress, common.topK);
     uint32_t scanned = 0U;
     uint32_t posts = 0U;
     while (scanned < scanLimit && posts < budget.maxPosts) {
         ++scanned;
-        if (!IsHierarchicalCombineRowReady(common, params, progress, row)) {
-            ++row;
-            if (row == rowCount) {
-                row = 0U;
+        if (!cursor.Ready(params)) {
+            cursor.Advance(common, progress);
+            if (cursor.row == rowCount) {
+                cursor.Wrap(progress);
             }
             continue;
         }
-        const uint32_t runStart = row++;
+        const uint32_t runStart = cursor.row;
+        const uint32_t runToken = cursor.token;
+        const uint32_t runTopk = cursor.topk;
+        cursor.Advance(common, progress);
         // Probe a terminating hole only once. It remains pending and is retried
         // on a later sweep if its producer publishes readiness in the meantime.
         bool skippedHole = false;
-        while (row < rowCount && scanned < scanLimit) {
+        while (cursor.row < rowCount && scanned < scanLimit) {
             ++scanned;
-            if (!IsHierarchicalCombineRowReady(common, params, progress, row)) {
+            if (!cursor.Ready(params)) {
                 skippedHole = true;
                 break;
             }
-            ++row;
+            cursor.Advance(common, progress);
         }
+        const uint32_t runRows = cursor.row - runStart;
         const uint64_t byteOffset = static_cast<uint64_t>(runStart) * rowBytes;
         timing.StopScan();
         RocePutBytes(params.peermemInfo.combineSendPtr + byteOffset, params.peermemInfo.gatewayCombinePtr + byteOffset,
-                     (row - runStart) * rowBytes, destination, roceScratch, timer, AscendTimer::RdmaPhase::Combine);
+                     runRows * rowBytes, destination, roceScratch, timer, AscendTimer::RdmaPhase::Combine);
         timing.StartScan();
-        for (uint32_t sent = runStart; sent < row; ++sent) {
-            progress.pendingTopkMasks[sent / common.topK] &= ~(uint32_t(1) << (sent % common.topK));
-        }
-        progress.sentRows += row - runStart;
+        ClearHierarchicalCombineRun(progress, common.topK, runToken, runTopk, runRows);
+        // The cached bits begin at cursor.row, beyond the cleared run. A wrap
+        // reloads token zero so previously submitted rows cannot reappear.
+        progress.sentRows += runRows;
         ++posts;
         if (skippedHole) {
-            ++row;
+            cursor.Advance(common, progress);
         }
-        if (row == rowCount) {
-            row = 0U;
+        if (cursor.row == rowCount) {
+            cursor.Wrap(progress);
         }
     }
-    progress.nextRow = row;
+    progress.nextRow = cursor.row;
     timing.Finish(pendingBefore, progress.expectedRows - progress.sentRows, posts, scanned);
     return posts != 0U;
 }

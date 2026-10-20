@@ -23,6 +23,7 @@
 #include "../common/ascend_timer_v2_device.hpp"
 #include "mega_moe_token_quant.hpp"
 #include "mega_moe_count_arrival.hpp"
+#include "mega_moe_gateway_readiness.hpp"
 
 namespace MegaMoeImpl {
 
@@ -649,27 +650,8 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
         }
         if (UseHierarchicalRoce(params.tilingData)) {
             AscendTimerFixedScope payload(timer, AscendTimer::AIV_GATEWAY_PAYLOAD_CHECK);
-            // Counts may arrive before the paired payload. Only wait for gateways
-            // that actually supply this rank; route metadata retains original S.
-            const uint64_t readyOffset = params.peermemInfo.hierarchicalControlPtr -
-                                         params.peermemInfo.rankSyncInWorldPtr +
-                                         HierarchicalSignalOffset(HierarchicalSignal::RelayPayloadReady);
-            for (uint32_t source = 0; source < common.worldSize; ++source) {
-                if (HierarchicalHost(source) == HierarchicalHost(common.rankId)) {
-                    continue;
-                }
-                bool needed = false;
-                for (uint32_t expert = 0; expert < common.moeExpertPerRank; ++expert) {
-                    needed |= scratch.cumsumInfoTensor.GetValue(expert * common.worldSize + source) != 0;
-                }
-                if (needed) {
-                    const uint32_t gateway = HierarchicalGateway(source);
-                    AscendTimerGatewayWaitScope wait(timer, source, gateway, params.tilingData->hierarchicalSequence);
-                    auto* ready = reinterpret_cast<__gm__ int32_t*>(g_winRankAddr_[gateway] + readyOffset);
-                    WaitUntilGmFlagEquals(ready, static_cast<int32_t>(params.tilingData->hierarchicalSequence));
-                }
-            }
-            SyncFuncStatic<HardEvent::S_MTE2, 7U>();
+            AcquireHierarchicalGatewayPayload(common, countWorkspace, params, g_winRankAddr_,
+                                               scratch.cumsumInfoTensor, timer);
         }
     } else {
         AscendTimerFixedScope counts(timer, AscendTimer::AIV_COUNT_METADATA_WAIT);

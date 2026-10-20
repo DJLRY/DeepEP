@@ -160,23 +160,35 @@ void check_workspace_ready_region(uint8_t mode)
         assert(hybrid.gmm2ReadyPtr >= hybrid.flagActivationToGmm2Ptr);
         auto* flagsEnd = hybrid.flagActivationToGmm2Ptr + hybrid.flagResetElementCount * sizeof(int32_t);
         const int64_t readyBytes = static_cast<int64_t>(t.moeExpertPerRank) * groups * 64;
-        assert(hybrid.gmm2ReadyPtr + readyBytes == flagsEnd);
+        auto* priorFlagsEnd = hybrid.gmm2ReadyPtr + readyBytes;
+        const int64_t gatewayBytes = HIERARCHICAL_RANKS_PER_HOST * HIERARCHICAL_FLAG_BYTES;
+        assert(hybrid.gatewayPayloadReadyPtr >= priorFlagsEnd);
+        assert(hybrid.gatewayPayloadReadyPtr - priorFlagsEnd < HIERARCHICAL_FLAG_BYTES);
+        assert(reinterpret_cast<uintptr_t>(hybrid.gatewayPayloadReadyPtr) % HIERARCHICAL_FLAG_BYTES == 0);
+        assert(hybrid.gatewayPayloadReadyPtr + gatewayBytes == flagsEnd);
         assert(flagsEnd <= hybrid.gmm2MmadResPtr);
         // The reset span must include the final expert's final M-group, while
         // leaving the subsequent data/workspace byte untouched.
         std::fill(hybrid.flagActivationToGmm2Ptr, flagsEnd, uint8_t{0});
         assert(hybrid.gmm2ReadyPtr[readyBytes - 1] == 0);
+        for (uint32_t slot = 0; slot < HIERARCHICAL_RANKS_PER_HOST; ++slot) {
+            assert(hybrid.gatewayPayloadReadyPtr[slot * HIERARCHICAL_FLAG_BYTES] == 0);
+        }
+        assert(hybrid.gatewayPayloadReadyPtr[gatewayBytes - 1] == 0);
         assert(flagsEnd[0] == 0xA5);
 
         t.topoType = TOPO_TYPE_MTE;
         WorkspaceInfo legacy(base, &t);
+        assert(legacy.gatewayPayloadReadyPtr == nullptr);
+        const int64_t priorElements = (priorFlagsEnd - hybrid.flagActivationToGmm2Ptr) / sizeof(int32_t);
         if (mode == GROUPED_MATMUL_MODE_GENERAL) {
             assert(legacy.gmm2ReadyPtr == nullptr);
-            assert(hybrid.flagResetElementCount - legacy.flagResetElementCount == readyBytes / 4);
+            assert(priorElements - legacy.flagResetElementCount == readyBytes / 4);
         } else {
             assert(legacy.gmm2ReadyPtr == hybrid.gmm2ReadyPtr);
-            assert(legacy.flagResetElementCount == hybrid.flagResetElementCount);
+            assert(legacy.flagResetElementCount == priorElements);
         }
+        assert(hybrid.flagResetElementCount == CalcGatewayPayloadReadyFlagEnd(priorElements));
     }
 }
 

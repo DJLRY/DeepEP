@@ -120,12 +120,15 @@ struct State {
     std::vector<bool> expected;
     std::vector<uint32_t> sent;
     std::vector<uint32_t> probes;
+    std::vector<uint32_t> probeOrder;
     std::vector<Post> posts;
     std::vector<Copy> copies;
     const int32_t* pairedRail = nullptr;
     uint32_t railSlotWords = 0U;
     uint32_t rowBytes = 0U;
     uint32_t rows = 0U;
+    uint32_t topK = 0U;
+    const uint32_t* pendingMasks = nullptr;
     uint32_t peer = 0U;
     uint32_t sequence = 0U;
     uint32_t flagReads = 0U;
@@ -305,6 +308,7 @@ inline int32_t ReadGmByPassDCache(const int32_t* address)
     Check(row < s.rows && s.expected[row] && s.sent[row] == 0U, "probed an unused or already-submitted row");
     Check(++s.flagReads < 1000000U, "flag polling did not terminate");
     ++s.probes[row];
+    s.probeOrder.push_back(row);
     return *address;
 }
 inline void RocePutBytes(uint8_t* destination, uint8_t* source, uint32_t bytes, uint32_t peer, uint8_t* scratch,
@@ -327,6 +331,8 @@ inline void RocePutBytes(uint8_t* destination, uint8_t* source, uint32_t bytes, 
     for (uint32_t row = first; row < first + count; ++row) {
         Check(s.expected[row], "Put merged across an unused route");
         Check(s.flags[row * kFlagWords] == static_cast<int32_t>(s.sequence), "Put merged across an unready row");
+        Check((s.pendingMasks[row / s.topK] & (uint32_t(1) << (row % s.topK))) != 0U,
+              "pending row was cleared before Put returned");
         Check(s.sent[row]++ == 0U, "row submitted more than once");
     }
     s.posts.push_back({first, count, source, destination});
@@ -358,6 +364,8 @@ public:
         common.rankId = rank;
         tiling.hierarchicalSequence = s.sequence = sequence;
         s.rows = tokens * topk;
+        s.topK = topk;
+        s.pendingMasks = progress.pendingTopkMasks;
         s.rowBytes = common.tokenHiddenDim * sizeof(bfloat16_t);
         s.peer = HierarchicalGateway(rank);
         s.railSlotWords = static_cast<uint32_t>(CalcRailTopkIdsSlotBytes(&tiling) / sizeof(int32_t));
@@ -469,7 +477,7 @@ public:
 void Routing()
 {
     for (uint32_t tokens : {1U, 2U, 7U, 31U, 32U}) {
-        for (uint32_t topk : {1U, 8U, 32U}) {
+        for (uint32_t topk : {1U, 3U, 8U, 31U, 32U}) {
             for (uint32_t rank : {0U, 7U, 16U, 31U}) {
                 for (const char* pattern : {"none", "all", "mixed", "duplicate", "holes", "last"}) {
                     Fixture f(tokens, topk, rank);
@@ -693,6 +701,142 @@ void Telemetry()
           "completed fast path added scan events or repeated initialization");
     f.CheckPayload();
 }
+
+// This oracle first materializes the bounded circular row sequence, then
+// partitions eligible coordinates into contiguous runs. It has no token masks,
+// cached cursor, production readiness helper, or mutable scan/send loop.
+void OracleStep(Fixture& f, uint32_t maxPosts, uint32_t maxScans)
+{
+    Check(f.progress.initialized, "oracle requires initialized routing");
+    const uint32_t beforeRow = f.progress.nextRow;
+    const uint32_t pendingBefore = f.Expected() - f.progress.sentRows;
+    const auto beforePosts = f.s.posts.size();
+    const auto beforeProbes = f.s.probeOrder.size();
+    const auto beforeFlags = f.s.flags;
+    std::vector<uint32_t> visits;
+    std::vector<bool> pending(f.s.rows), eligible(f.s.rows);
+    for (uint32_t row = 0U; row < f.s.rows; ++row) {
+        pending[row] = f.s.expected[row] && f.s.sent[row] == 0U;
+        eligible[row] = pending[row] && f.s.flags[row * kFlagWords] == static_cast<int32_t>(f.s.sequence);
+    }
+    if (pendingBefore != 0U && maxPosts != 0U && maxScans != 0U) {
+        for (uint32_t i = 0U; i < std::min(f.s.rows, maxScans); ++i) {
+            visits.push_back((beforeRow + i) % f.s.rows);
+        }
+    }
+    struct Run {
+        uint32_t first;
+        uint32_t count;
+        uint32_t visitEnd;
+    };
+    std::vector<Run> runs;
+    for (uint32_t i = 0U; i < visits.size(); ++i) {
+        const uint32_t row = visits[i];
+        if (eligible[row]) {
+            if (i != 0U && eligible[visits[i - 1U]] && visits[i - 1U] + 1U == row) {
+                ++runs.back().count;
+                runs.back().visitEnd = i + 1U;
+            } else {
+                runs.push_back({row, 1U, i + 1U});
+            }
+        }
+    }
+    uint32_t scanned = static_cast<uint32_t>(visits.size());
+    if (maxPosts != 0U && runs.size() >= maxPosts) {
+        runs.resize(maxPosts);
+        const auto& last = runs.back();
+        scanned = last.visitEnd;
+        // A false slot that terminates a run is consumed once. The physical
+        // tensor end terminates independently, without consuming row zero.
+        if (scanned < visits.size() && last.first + last.count < f.s.rows && !eligible[visits[scanned]]) {
+            ++scanned;
+        }
+    }
+    std::vector<uint32_t> probes;
+    for (uint32_t i = 0U; i < scanned; ++i) {
+        if (pending[visits[i]]) {
+            probes.push_back(visits[i]);
+        }
+    }
+    AscendTimerDevice timer;
+    const bool made =
+        TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {maxPosts, maxScans});
+    Check(made == !runs.empty() && f.s.posts.size() - beforePosts == runs.size(),
+          "POST count differs from contiguous-coordinate oracle");
+    uint32_t sent = 0U;
+    for (uint32_t i = 0U; i < runs.size(); ++i) {
+        const auto& actual = f.s.posts[beforePosts + i];
+        Check(actual.firstRow == runs[i].first && actual.rowCount == runs[i].count,
+              "POST order/coalescing differs from contiguous-coordinate oracle");
+        sent += runs[i].count;
+    }
+    Check(f.s.probeOrder.size() - beforeProbes == probes.size() &&
+              std::equal(probes.begin(), probes.end(), f.s.probeOrder.begin() + beforeProbes),
+          "flag probe order differs from pending-coordinate oracle");
+    const uint32_t nextRow = scanned == 0U ? beforeRow : (beforeRow + scanned) % f.s.rows;
+    Check(f.progress.nextRow == nextRow, "resumed cursor differs from bounded circular row sequence");
+    Check(f.progress.sentRows == f.Expected() - pendingBefore + sent, "oracle sentRows count mismatch");
+    Check(f.s.flags == beforeFlags, "progress changed producer epochs");
+    for (uint32_t row = 0U; row < f.s.rows; ++row) {
+        const bool remains =
+            (f.progress.pendingTopkMasks[row / f.common.topK] & (uint32_t(1) << (row % f.common.topK))) != 0U;
+        Check(remains == (f.s.expected[row] && f.s.sent[row] == 0U), "pending mask differs from unsent route set");
+    }
+    if (visits.empty()) {
+        Check(timer.records.empty(), "zero-budget/completed oracle path emitted a progress record");
+    } else {
+        Check(timer.records.size() == 1U && timer.records[0].scanned == scanned &&
+                  timer.records[0].posts == runs.size() && timer.records[0].before == pendingBefore &&
+                  timer.records[0].after == pendingBefore - sent,
+              "telemetry differs from exact oracle slot/send counts");
+    }
+}
+
+void CursorOracle()
+{
+    std::mt19937 random(20261020U);
+    for (uint32_t topk : {1U, 3U, 8U, 31U, 32U}) {
+        for (uint32_t tokens : {1U, 2U, 3U, 7U, 32U}) {
+            for (const char* pattern : {"all", "mixed", "duplicate", "holes", "last"}) {
+                Fixture f(tokens, topk, 16U);
+                f.Routes(pattern);
+                f.Init();
+                f.progress.nextRow = f.s.rows - 1U;
+                for (uint32_t call = 0U; call < 40U; ++call) {
+                    // Publications arrive in arbitrary order; already-sent flags
+                    // remain ready so accidental rereads/resubmissions fail.
+                    for (uint32_t row = 0U; row < f.s.rows; ++row) {
+                        if (random() % 17U == 0U) {
+                            f.Publish(row, f.s.sequence);
+                        }
+                    }
+                    const std::array<uint32_t, 8> scans = {0U, 1U, 2U, topk, topk + 1U, 63U, 64U, 0xffffffffU};
+                    OracleStep(f, random() % 6U, scans[random() % scans.size()]);
+                }
+                ReleaseAll();
+                for (uint32_t call = 0U; f.progress.sentRows != f.Expected(); ++call) {
+                    Check(call <= f.s.rows + 1U, "oracle completion failed to visit all pending rows");
+                    OracleStep(f, 2U, 7U);
+                }
+                OracleStep(f, 4U, 64U);
+                f.CheckPayload();
+            }
+        }
+        // Start at the last slot of a token and cut a contiguous ready run
+        // inside a later token. This also exercises a full32-bit token clear.
+        Fixture crossing(4U, topk);
+        crossing.Routes("all");
+        crossing.Init();
+        crossing.progress.nextRow = topk - 1U;
+        ReleaseAll();
+        OracleStep(crossing, 1U, topk + 2U);
+        Check(crossing.s.posts.size() == 1U && crossing.s.posts[0].rowCount == topk + 2U,
+              "cross-token run was fragmented before its scan budget");
+        OracleStep(crossing, 1U, 0xffffffffU);
+        OracleStep(crossing, 0xffffffffU, 0xffffffffU);
+        crossing.CheckPayload();
+    }
+}
 }  // namespace ProgressTest
 
 int main(int argc, char** argv)
@@ -711,6 +855,7 @@ int main(int argc, char** argv)
         else if (scenario == "drain") Drain();
         else if (scenario == "topology") Topology();
         else if (scenario == "telemetry") Telemetry();
+        else if (scenario == "cursor-oracle") CursorOracle();
         else throw std::runtime_error("unknown test scenario");
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
