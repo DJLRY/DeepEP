@@ -333,7 +333,7 @@ def parse_timer_ranks(value):
     return sorted(ranks)
 
 
-def performance_summary(config, run_dir, action, local_timer_ranks):
+def performance_summary(config, run_dir):
     # Every rank's profiling.json contains the same all-EP statistics. Read a
     # local rank so separate node output disks work without copying reports.
     rank = config["node_rank"] * 16
@@ -348,16 +348,25 @@ def performance_summary(config, run_dir, action, local_timer_ranks):
         f"All-rank statistics: {path}",
         f"Local raw samples/profiler: {run_dir}/rank_<rank>/bs_32/",
     ]
-    if action == "trace":
-        lines.extend(
+    summary = "\n".join(lines) + "\n"
+    (run_dir / "summary.txt").write_text(summary, encoding="utf-8")
+    print(summary, end="", flush=True)
+
+
+def trace_summary(run_dir, case, local_timer_ranks):
+    summary = (
+        "\n".join(
             [
-                "Timer data comes from a separate instrumented pass; do not use it as the performance baseline.",
+                "[TRACE SUMMARY] EP32 BS32; FP8 input / FP4 weights; balanced routing",
+                f"Warmup calls: {case['warmup']}; trace batch calls: {case['iters']}; only the final call is instrumented.",
+                "Performance profiler disabled; run the perf action for a performance baseline.",
                 f"Local traced ranks: {local_timer_ranks}",
                 f"Local timer files: {run_dir / 'bs_32' / 'timer'}",
                 "Trace time is relative to each rank; merged ranks are not globally clock-aligned.",
             ]
         )
-    summary = "\n".join(lines) + "\n"
+        + "\n"
+    )
     (run_dir / "summary.txt").write_text(summary, encoding="utf-8")
     print(summary, end="", flush=True)
 
@@ -399,12 +408,16 @@ def dispatch(
     preflight(config, env)
     directory = Path(config["case_dir"])
     directory.mkdir(parents=True, exist_ok=True)
-    performance = action in ("perf", "trace")
-    prefix = f"{action}_node_" if performance else "node_"
+    sampling = action in ("perf", "trace")
+    prefix = f"{action}_node_" if sampling else "node_"
     run_dir = Path(tempfile.mkdtemp(prefix=f"{prefix}{config['node_rank']}_", dir=directory))
     case = dict(CASE)
-    if performance:
-        case.update(warmup=20 if warmup is None else warmup, iters=100 if iters is None else iters)
+    if sampling:
+        default_warmup, default_iters = (2, 1) if action == "trace" else (20, 100)
+        case.update(
+            warmup=default_warmup if warmup is None else warmup,
+            iters=default_iters if iters is None else iters,
+        )
     selected = ([0, 16] if timer_ranks is None else timer_ranks) if action == "trace" else None
     (run_dir / "case.json").write_text(json.dumps(case, indent=2) + "\n", encoding="utf-8")
     (run_dir / "launch.json").write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
@@ -423,8 +436,8 @@ def dispatch(
         encoding="utf-8",
     )
     print(f"[RUN] node={config['node_rank']} master={config['master_addr']} output={run_dir}", flush=True)
-    golden, benchmark = test_commands(config, run_dir, mode="perf" if performance else "accuracy", timer_ranks=selected)
-    if not performance:
+    golden, benchmark = test_commands(config, run_dir, mode=action if sampling else "accuracy", timer_ranks=selected)
+    if not sampling:
         execute(golden, env, run_dir / "golden.log")
     if action != "golden":
         execute(benchmark, env, run_dir / "console.log")
@@ -445,8 +458,10 @@ def dispatch(
             env,
             run_dir / "parse_timer.log",
         )
-    if performance:
-        performance_summary(config, run_dir, action, local_ranks)
+    if action == "perf":
+        performance_summary(config, run_dir)
+    elif action == "trace":
+        trace_summary(run_dir, case, local_ranks)
     print(f"[DONE] {action}: {run_dir}", flush=True)
 
 
@@ -482,8 +497,12 @@ def main(argv=None):
         action="store_false",
         help="trace only: hide WAIT events without changing timestamps or raw samples",
     )
-    parser.add_argument("--warmup", type=int, help="perf/trace only: warmup calls (default: 20)")
-    parser.add_argument("--iters", type=int, help="perf/trace only: collected calls (default: 100; report last half)")
+    parser.add_argument("--warmup", type=int, help="perf/trace only: warmup calls (default: perf 20, trace 2)")
+    parser.add_argument(
+        "--iters",
+        type=int,
+        help="perf/trace only: batch calls (default: perf 100, report last half; trace 1, instrument final call)",
+    )
     parser.add_argument(
         "--timer-ranks", type=parse_timer_ranks, help="trace only: selected global ranks (default: 0,16; all: 0-31)"
     )

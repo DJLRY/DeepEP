@@ -1,7 +1,7 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by SimpleBright_Man 2026
 
-"""Installed-package accuracy/performance runner. Launch with torchrun, not st/run.sh."""
+"""Installed-package accuracy/performance/trace runner. Launch with torchrun, not st/run.sh."""
 
 import argparse
 from datetime import datetime, timezone
@@ -117,7 +117,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default="smoke", help="Packaged name or JSON path")
     parser.add_argument("--bs-values", help="Only model config override, e.g. 96,4096")
-    parser.add_argument("--mode", choices=("accuracy", "perf"), default="accuracy")
+    parser.add_argument("--mode", choices=("accuracy", "perf", "trace"), default="accuracy")
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
     parser.add_argument(
         "--routing",
@@ -126,7 +126,7 @@ def main():
         help="Reproducible accuracy stress pattern; record the same pattern for performance comparisons",
     )
     parser.add_argument("--output-dir", type=Path, required=True, help="New run directory; must not already exist")
-    parser.add_argument("--timer", action="store_true", help="One separate instrumented call per case")
+    parser.add_argument("--timer", action="store_true", help="Collect device timers; always enabled in trace mode")
     parser.add_argument("--timer-ranks", type=parse_ranks, help="Default: global ranks 0..min(7,EP-1)")
     parser.add_argument("--check-tokens", type=int, default=0, help="Accuracy samples per rank; default 0 checks all")
     parser.add_argument(
@@ -134,6 +134,7 @@ def main():
     )
     parser.add_argument("--relative-rmse", type=float, default=0.02, help="Timer on/off output tolerance only")
     args = parser.parse_args()
+    args.timer = args.timer or args.mode == "trace"
     config = load_config(args.config, args.bs_values)
     if args.check_tokens < 0 or not 0 < args.relative_rmse < 1:
         parser.error("Invalid accuracy sample count or tolerance")
@@ -295,16 +296,18 @@ def run(args, config, group):
                 error = f"rank={rank} BS={bs} alignment={config['alignment']}: {failure}"
             collective_check(group, f"alignment allocation BS={bs}", error)
             if rank == 0:
+                stage = "TRACE" if args.mode == "trace" else "PROFILE"
                 print(
-                    f"[PROFILE] BS={bs} alignment={alignment} "
+                    f"[{stage}] BS={bs} alignment={alignment} "
                     f"temporary_bytes={alignment['rows'] * alignment['cols'] * 4} "
                     f"batch_iterations={config['iters']}",
                     flush=True,
                 )
-        for _ in range(config["warmup"]):
-            call()
-        torch.npu.synchronize()
-        group.barrier(f"warmup BS={bs}")
+        if args.mode != "trace":
+            for _ in range(config["warmup"]):
+                call()
+            torch.npu.synchronize()
+            group.barrier(f"warmup BS={bs}")
         if args.mode == "accuracy":
             stats = torch.full((model["num_experts"] // world,), 7, dtype=torch.int32, device="npu")
             call(stats=stats)
@@ -333,7 +336,7 @@ def run(args, config, group):
                     f"[ACCURACY] BS={bs} all {world} ranks passed ({args.input}, sampled={args.check_tokens})",
                     flush=True,
                 )
-        else:
+        elif args.mode == "perf":
             samples = collect_profile(call, group, torch, config, prefix, case / "profiler", bs)
             (case / "kernel_samples.json").write_text(json.dumps(samples, indent=2), encoding="utf-8")
             timings = [sample["duration_us"] for sample in samples]

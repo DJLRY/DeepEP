@@ -286,7 +286,7 @@ def test_errors_only_success_and_unknown_failure_keep_full_logs(saved, tmp_path,
 
 
 @pytest.mark.parametrize("node,action", [(0, "perf"), (1, "perf"), (0, "trace"), (1, "trace")])
-def test_performance_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, node, action):
+def test_sampling_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, node, action):
     path, config = saved
     config["node_rank"] = node
     launcher.save_config(path, config)
@@ -303,23 +303,25 @@ def test_performance_workflow_reuses_settings_and_skips_golden(saved, monkeypatc
         assert env["DEEPEP_MEGAMOE_TIMER"] == ("ON" if action == "trace" else "OFF")
         if "torch.distributed.run" in command:
             assert command[command.index("--node-rank") + 1] == str(node)
-            assert command[command.index("--mode") + 1] == "perf"
+            assert command[command.index("--mode") + 1] == action
             assert command[command.index("--input") + 1] == "fp8"
             assert command[command.index("--routing") + 1] == "balanced"
             assert command[command.index("--nproc-per-node") + 1] == "16"
             case = json.loads(Path(command[command.index("--config") + 1]).read_text())
-            assert case == dict(launcher.CASE, warmup=20, iters=100)
+            warmup, iters = (2, 1) if action == "trace" else (20, 100)
+            assert case == dict(launcher.CASE, warmup=warmup, iters=iters)
             output = Path(command[command.index("--output-dir") + 1])
             outputs.append(output)
-            report_dir = output / f"rank_{node * 16}" / "bs_32"
-            report_dir.mkdir(parents=True)
-            (report_dir / "profiling.json").write_text(
-                json.dumps(dict(rounds=50, recorded_rounds=100, mean_us=12.5, rank_max_mean_us=25.0))
-            )
             if action == "trace":
+                assert "--timer" in command
                 assert command[command.index("--timer-ranks") + 1] == "0,16"
             else:
                 assert "--timer" not in command
+                report_dir = output / f"rank_{node * 16}" / "bs_32"
+                report_dir.mkdir(parents=True)
+                (report_dir / "profiling.json").write_text(
+                    json.dumps(dict(rounds=50, recorded_rounds=100, mean_us=12.5, rank_max_mean_us=25.0))
+                )
         else:
             assert "deep_ep_experimental.megamoe.timer" in command
             assert command[command.index("--ranks") + 1] == str(node * 16)
@@ -331,9 +333,16 @@ def test_performance_workflow_reuses_settings_and_skips_golden(saved, monkeypatc
     assert len(calls) == (4 if action == "trace" else 2)
     assert outputs[0] != outputs[1]
     summary = (outputs[-1] / "summary.txt").read_text()
-    assert "minimum rank: 12.500 us" in summary and "maximum rank: 25.000 us" in summary
-    assert "50/100 rounds" in summary
-    assert "not a cross-device timestamp span" in summary
+    if action == "perf":
+        assert "minimum rank: 12.500 us" in summary and "maximum rank: 25.000 us" in summary
+        assert "50/100 rounds" in summary
+        assert "not a cross-device timestamp span" in summary
+    else:
+        assert "[TRACE SUMMARY]" in summary
+        assert "Warmup calls: 2; trace batch calls: 1" in summary
+        assert "Performance profiler disabled" in summary
+        assert f"Local traced ranks: [{node * 16}]" in summary
+        assert not list(outputs[-1].rglob("profiling.json"))
     assert path.read_bytes() == before
     assert launcher.CASE["warmup"] == 0 and launcher.CASE["iters"] == 1
 
@@ -344,7 +353,7 @@ def test_trace_wait_option_reaches_parser_and_run_manifest(saved, monkeypatch, f
     monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
     monkeypatch.setattr(launcher, "environment", lambda _: {})
     monkeypatch.setattr(launcher, "preflight", lambda *args: None)
-    monkeypatch.setattr(launcher, "performance_summary", lambda *args: None)
+    monkeypatch.setattr(launcher, "performance_summary", lambda *args: pytest.fail("trace entered performance summary"))
     calls = []
     monkeypatch.setattr(launcher, "execute", lambda command, *args, **kwargs: calls.append(command))
     launcher.main(["trace", "--config", str(path), *([flag] if flag else [])])
@@ -377,7 +386,7 @@ def test_trace_round_overrides_and_host_without_selected_ranks(saved, monkeypatc
     calls = []
     monkeypatch.setattr(launcher, "execute", lambda *args, **kwargs: calls.append(args))
     summaries = []
-    monkeypatch.setattr(launcher, "performance_summary", lambda *args: summaries.append(args))
+    monkeypatch.setattr(launcher, "trace_summary", lambda *args: summaries.append(args))
     launcher.main(["trace", "--config", str(path), "--warmup", "0", "--iters", "5", "--timer-ranks", "16-18,31"])
     assert len(calls) == 1  # node0 still joins the benchmark; no local timer files to parse.
     command = calls[0][0]
@@ -406,7 +415,7 @@ def test_failed_trace_does_not_print_done_or_summary(saved, monkeypatch, capsys,
 
     monkeypatch.setattr(launcher, "preflight", preflight)
     monkeypatch.setattr(launcher, "execute", execute)
-    monkeypatch.setattr(launcher, "performance_summary", lambda *args: pytest.fail("summary after failed trace"))
+    monkeypatch.setattr(launcher, "trace_summary", lambda *args: pytest.fail("summary after failed trace"))
     with pytest.raises((RuntimeError, subprocess.CalledProcessError)):
         launcher.dispatch("trace", config)
     assert len(calls) == {"preflight": 0, "benchmark": 1, "parse": 2}[failure]

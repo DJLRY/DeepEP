@@ -237,11 +237,15 @@ bash experiments/megamoe/scripts/run_bs32.sh build --timer --errors-only
 bash experiments/megamoe/scripts/run_bs32.sh trace
 
 # 默认采集跨机配对 rank0、rank16；也可扩大覆盖范围，两台参数必须相同。
-bash experiments/megamoe/scripts/run_bs32.sh trace --timer-ranks 0-31 --warmup 20 --iters 100
+bash experiments/megamoe/scripts/run_bs32.sh trace --timer-ranks 0-31 --warmup 2 --iters 1
 ```
 
-`trace` 先执行 timer 关闭的 profiler 采样，再单独运行一批调用，仅在最后一轮、选中的 rank 上设备打点。
-它不会自动构建；未安装支持 timer 的 wheel 时会在启动 worker 前提示执行 `build --timer`。
+`trace` 独立采集设备流水，不执行性能 Profiler 或 Golden 校验。默认预热2轮、运行1轮，
+每个 rank 共调用3次 MegaMoE；仅在采集批次的最后一轮、选中的 rank 上设备打点。
+可用 `--warmup`、`--iters` 覆盖次数；采样前仍保留原有的 Exp 对齐计算，临时占用约12 GB显存/卡。
+正式性能测试使用 `perf`，其默认预热20轮、采集100轮不变。
+`trace` 不会自动构建；未安装支持 timer 的 wheel 时会在启动 worker 前提示执行 `build --timer`。
+更新后需在两台机器重新执行上述 `build --timer` 安装新版 Python 包，才能使用独立的 trace 模式；SHMEM 可复用。
 32个 rank 始终全部参加运行；采集后各节点只自动解析自己拥有的选中 rank，默认隐藏 WAIT 事件。
 `trace --include-wait` 显示全部 WAIT，`trace --hide-wait` 显式隐藏。该开关只影响流水 JSON 和事件汇总，
 原始 BIN/解析 CSV 仍保留 WAIT，其他事件的时间戳不变，不压缩等待时间。
@@ -293,10 +297,12 @@ python -I -m deep_ep_experimental.megamoe.timer.trace_parser \
 始终保留启动 WAIT，不受 JSON 的 `--include-wait` 开关影响。时间基准为每个 rank 的原始首事件；
 `scope=envelope` 是父区间，各核和父子区间不可累计当作端到端耗时。
 新启动打点再次扩展了 buffer 布局，旧 BIN 需使用采集时的解析器；旧采样无法补出此前未记录的阶段。
-结果位于 `<case_dir>/trace_node_<rank>_<随机字符>/`，除上述性能文件外，还包含：
+结果位于 `<case_dir>/trace_node_<rank>_<随机字符>/`，保留配置快照、`console.log` 和各 rank 的资源信息，
+不生成 `profiling.json`、`kernel_samples.json` 或 `profiler/`，流水输出包括：
 
 | 文件 | 内容 |
 | --- | --- |
+| `summary.txt` | 流水采集次数、本机选中 ranks 及输出路径 |
 | `parse_timer.log` | 本机流水解析日志 |
 | `bs_32/timer/rank_<r>_npu_time.bin` | 原始设备打点，可重复离线解析 |
 | `bs_32/timer/rank_<r>_npu_time.json` | 单 rank 的 AIC/AIV 流水，支持 Chrome JSON trace 查看器 |
