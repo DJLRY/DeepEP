@@ -270,6 +270,43 @@ public:
         }
     }
 
+    // Progress can surround RDMA calls while a compute tile/span or wait is
+    // active. Capture the scheduler's wave without changing any active handle.
+    __aicore__ inline int BeginCombineProgress(AscendTimer::DynamicTimingType type)
+    {
+        if (type != AscendTimer::AIV_COMBINE_PROGRESS && type != AscendTimer::AIV_COMBINE_DRAIN) {
+            return -1;
+        }
+        return BeginIndependent(type, 0, 0, waveId_);
+    }
+
+    __aicore__ inline void EndCombineProgress(AscendTimer::DynamicTimingType type, int index, uint32_t pendingBefore,
+                                              uint32_t pendingAfter, uint32_t posts, uint32_t scannedRows,
+                                              uint64_t scanControlCycles)
+    {
+        if (!Enabled() || index < 0 || index >= AscendTimer::MAX_DYNAMIC_ITER ||
+            (type != AscendTimer::AIV_COMBINE_PROGRESS && type != AscendTimer::AIV_COMBINE_DRAIN)) {
+            return;
+        }
+        int64_t cycle = AscendC::GetSystemCycle();
+        if (type == AscendTimer::AIV_COMBINE_DRAIN) {
+            posts = scannedRows = 0;
+            scanControlCycles = 0;
+        }
+        // Scheduler counters are bounded by 1024. Masks keep the wire fields
+        // independent even if a caller supplies an invalid wider value.
+        uint64_t counts = static_cast<uint64_t>(pendingBefore & 0xffffU) |
+                          (static_cast<uint64_t>(pendingAfter & 0xffffU) << 16) |
+                          (static_cast<uint64_t>(posts & 0xffffU) << 32) |
+                          (static_cast<uint64_t>(scannedRows & 0xffffU) << 48);
+        int typeId = static_cast<int>(type);
+        int offset = AscendTimer::TASK_METADATA_OFFSET +
+                     ((coreId_ * AscendTimer::DYNAMIC_TYPE_COUNT + typeId) * AscendTimer::MAX_DYNAMIC_ITER + index) * 2;
+        WriteValue(offset, static_cast<int64_t>(counts));
+        WriteValue(offset + 1, static_cast<int64_t>(scanControlCycles));
+        EndRaw(typeId, index, cycle);
+    }
+
     __aicore__ inline void FlushDynamicCounts()
     {
         if (!Enabled()) {
@@ -299,7 +336,8 @@ private:
     uint32_t rowStart_ = 0;
     uint32_t rows_ = 0;
 
-    __aicore__ inline int BeginIndependent(AscendTimer::DynamicTimingType type, uint64_t first, uint64_t second)
+    __aicore__ inline int BeginIndependent(AscendTimer::DynamicTimingType type, uint64_t first, uint64_t second,
+                                            int64_t waveId = AscendTimer::NO_WAVE)
     {
         if (!Enabled()) {
             return -1;
@@ -313,7 +351,7 @@ private:
                      ((coreId_ * AscendTimer::DYNAMIC_TYPE_COUNT + typeId) * AscendTimer::MAX_DYNAMIC_ITER + index) * 2;
         WriteValue(offset, static_cast<int64_t>(first));
         WriteValue(offset + 1, static_cast<int64_t>(second));
-        WriteWave(DynamicTimingIndex(typeId, index), AscendTimer::NO_WAVE);
+        WriteWave(DynamicTimingIndex(typeId, index), waveId);
         WriteStart(DynamicTimingIndex(typeId, index), AscendC::GetSystemCycle());
         return index;
     }
@@ -467,6 +505,60 @@ private:
     AscendTimerDevice* timer_;
     AscendTimer::DynamicTimingType type_;
     int index_;
+};
+
+// Construct after initialization, which has its own fixed timing. Progress then
+// covers scan/post work; drain surrounds child progress calls and backoff. Scan
+// segments exclude RocePutBytes and paused backoff. Each segment includes the
+// call-boundary and timestamp overhead between its StartScan and StopScan cycle
+// reads; bookkeeping after the StopScan read and work while paused are excluded.
+// Timing never determines whether scheduler work executes, and adds no barrier.
+class AscendTimerCombineProgressScope {
+public:
+    __aicore__ inline AscendTimerCombineProgressScope(AscendTimerDevice* timer, AscendTimer::DynamicTimingType type)
+        : timer_(timer), type_(type), index_(timer ? timer->BeginCombineProgress(type) : -1)
+    {
+    }
+    __aicore__ inline ~AscendTimerCombineProgressScope()
+    {
+        // Early exits still close the envelope. Normal callers supply counters
+        // explicitly; no scheduler state is read or changed by this fallback.
+        Finish(0, 0, 0, 0);
+    }
+
+    __aicore__ inline void StartScan()
+    {
+        if (index_ >= 0 && timer_->Enabled() && type_ == AscendTimer::AIV_COMBINE_PROGRESS && !scanActive_) {
+            scanStart_ = AscendC::GetSystemCycle();
+            scanActive_ = true;
+        }
+    }
+
+    __aicore__ inline void StopScan()
+    {
+        if (index_ >= 0 && timer_->Enabled() && scanActive_) {
+            scanControlCycles_ += static_cast<uint64_t>(AscendC::GetSystemCycle()) - scanStart_;
+            scanActive_ = false;
+        }
+    }
+
+    __aicore__ inline void Finish(uint32_t pendingBefore, uint32_t pendingAfter, uint32_t posts, uint32_t scannedRows)
+    {
+        if (index_ < 0) {
+            return;
+        }
+        StopScan();
+        timer_->EndCombineProgress(type_, index_, pendingBefore, pendingAfter, posts, scannedRows, scanControlCycles_);
+        index_ = -1;
+    }
+
+private:
+    AscendTimerDevice* timer_;
+    AscendTimer::DynamicTimingType type_;
+    int index_;
+    bool scanActive_ = false;
+    uint64_t scanStart_ = 0;
+    uint64_t scanControlCycles_ = 0;
 };
 
 class AscendTimerTileScope {

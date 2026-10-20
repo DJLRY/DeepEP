@@ -5,6 +5,7 @@ from pathlib import Path
 import re
 import struct
 import csv
+import json
 
 import pytest
 
@@ -229,3 +230,195 @@ def test_gateway_invalid_metadata_rejected(first, second):
     logical = len(p.FIXED_NAMES) + p.DYNAMIC_NAMES.index("AIV_GATEWAY_PAYLOAD_WAIT") * p.MAX_DYNAMIC_ITER
     with pytest.raises(ValueError, match="invalid gateway wait metadata"):
         p.task_metadata(Metadata(), 2, logical)
+
+
+@pytest.mark.parametrize("scan_cycles", [0, 2501, 2**53 + 17, 2**63 + 17, 2**64 - 1])
+def test_combine_progress_metadata_preserves_unsigned_counters(scan_cycles):
+    first = 128 | (120 << 16) | (4 << 32) | (1024 << 48)
+
+    def signed(value):
+        return value if value < 2**63 else value - 2**64
+
+    class Metadata:
+        def __getitem__(self, key):
+            return signed(first), signed(scan_cycles)
+
+    logical = len(p.FIXED_NAMES) + p.DYNAMIC_NAMES.index("AIV_COMBINE_PROGRESS") * p.MAX_DYNAMIC_ITER
+    task = p.task_metadata(Metadata(), 1, logical)
+    assert task == dict(
+        granularity="combine_progress",
+        pending_before=128,
+        pending_after=120,
+        posts=4,
+        scanned_rows=1024,
+        scan_control_cycles=scan_cycles,
+        scan_control_us=scan_cycles / p.CYCLE_TO_US,
+    )
+    assert type(task["scan_control_cycles"]) is int
+
+
+@pytest.mark.parametrize("family", ["AIV_COMBINE_PROGRESS", "AIV_COMBINE_DRAIN"])
+def test_empty_combine_call_is_metadata_not_an_unidentified_task(family):
+    class Metadata:
+        def __getitem__(self, key):
+            return 0, 0
+
+    logical = len(p.FIXED_NAMES) + p.DYNAMIC_NAMES.index(family) * p.MAX_DYNAMIC_ITER
+    task = p.task_metadata(Metadata(), 1, logical)
+    assert task["pending_before"] == task["pending_after"] == 0
+    assert task["granularity"] == ("combine_progress" if family == "AIV_COMBINE_PROGRESS" else "combine_drain")
+    if family == "AIV_COMBINE_PROGRESS":
+        assert task["posts"] == task["scanned_rows"] == task["scan_control_cycles"] == 0
+    else:
+        assert task == dict(granularity="combine_drain", pending_before=0, pending_after=0)
+
+
+@pytest.mark.parametrize(
+    "family,first,second",
+    [
+        ("AIV_COMBINE_PROGRESS", 1025, 0),
+        ("AIV_COMBINE_PROGRESS", 1 | 2 << 16, 0),
+        ("AIV_COMBINE_PROGRESS", 8 | 9 << 32 | 8 << 48, 0),
+        ("AIV_COMBINE_PROGRESS", 8 | 1 << 32 | 7 << 48, 0),
+        ("AIV_COMBINE_PROGRESS", 8 | 1 << 32 | 1025 << 48, 0),
+        ("AIV_COMBINE_PROGRESS", 8 | 8 << 48, 0),
+        ("AIV_COMBINE_PROGRESS", 8 | 8 << 16 | 1 << 32 | 8 << 48, 0),
+        ("AIV_COMBINE_DRAIN", 1025, 0),
+        ("AIV_COMBINE_DRAIN", 1 | 2 << 16, 0),
+        ("AIV_COMBINE_DRAIN", 8 | 1 << 32, 0),
+        ("AIV_COMBINE_DRAIN", 8 | 1 << 48, 0),
+        ("AIV_COMBINE_DRAIN", 8, 1),
+    ],
+)
+def test_combine_invalid_metadata_rejected(family, first, second):
+    class Metadata:
+        def __getitem__(self, key):
+            return first, second
+
+    logical = len(p.FIXED_NAMES) + p.DYNAMIC_NAMES.index(family) * p.MAX_DYNAMIC_ITER
+    with pytest.raises(ValueError, match="invalid combine metadata"):
+        p.task_metadata(Metadata(), 1, logical)
+
+
+def test_combine_progress_binary_csv_text_roundtrip(raw_file, tmp_path):
+    from deep_ep_experimental.megamoe.timer import text_transfer as transfer
+
+    core = 1
+    with raw_file.open("r+b") as stream:
+
+        def put(index, *values):
+            stream.seek(index * 8)
+            stream.write(struct.pack("<" + "q" * len(values), *values))
+
+        for family, start, end in (
+            ("AIV_COMBINE_INIT", 110100, 110900),
+            ("AIV_HOST_COMBINE_BARRIER_WAIT", 131000, 140000),
+        ):
+            logical = p.FIXED_NAMES.index(family)
+            put(core * p.COUNTERS_PER_CORE + logical * 2, start, end)
+            put(p.WAVE_ID_OFFSET + core * p.WAVE_ID_PER_CORE + logical, p.NO_WAVE)
+
+        for name, index, start, end, first, second, wave in (
+            ("AIV_COMBINE_PROGRESS", 0, 111000, 120000, 128 | 120 << 16 | 4 << 32 | 32 << 48, 2501, 4),
+            ("AIV_COMBINE_PROGRESS", 1, 145000, 153000, 120 | 6 << 32 | 256 << 48, 6203, p.NO_WAVE),
+            ("AIV_COMBINE_DRAIN", 0, 142000, 160000, 120, 0, p.NO_WAVE),
+            ("AIV_RDMA_POST", 0, 112000, 114000, 17 << 32 | 3, 14336, 4),
+        ):
+            family = p.DYNAMIC_NAMES.index(name)
+            slot = family * p.MAX_DYNAMIC_ITER + index
+            logical = len(p.FIXED_NAMES) + slot
+            put(core * p.COUNTERS_PER_CORE + logical * 2, start, end)
+            put(p.N_TIMING_COUNTER + core * p.DYNAMIC_ITER_PER_CORE + family, index + 1)
+            put(p.TASK_METADATA_OFFSET + (core * len(p.DYNAMIC_NAMES) * p.MAX_DYNAMIC_ITER + slot) * 2, first, second)
+            put(p.WAVE_ID_OFFSET + core * p.WAVE_ID_PER_CORE + logical, wave)
+
+    parsed = raw_file.with_name("rank_0_npu_time_parsed.csv")
+    decode(raw_file, parsed)
+    raw = raw_events_for_rank(parsed, 0)
+    base = first_start_cycle(raw)
+    shown = trace_events(raw, "keep", base, include_wait=True, time_origin="rank")
+    combine = [event for event in shown if event["tid"].endswith("/COMBINE_PROGRESS")]
+    assert len(combine) == 5
+    assert all(event["tid"] == "group_0_AIV_0/COMBINE_PROGRESS" for event in combine)
+    assert all("expert_id" not in event["args"] for event in combine)
+    progress = [event for event in combine if event["args"].get("granularity") == "combine_progress"]
+    assert [(event["dur"], event["args"]["scan_control_cycles"]) for event in progress] == [(9, 2501), (8, 6203)]
+    assert [event["args"]["wave_id"] for event in progress] == [4, None]
+    drain = next(event for event in combine if event["args"].get("granularity") == "combine_drain")
+    assert drain["dur"] == 18 and drain["args"]["pending_before"] == 120 and drain["args"]["pending_after"] == 0
+    for key in ("posts", "scanned_rows", "scan_control_cycles", "scan_control_us"):
+        assert key not in drain["args"]
+    child = next(event for event in shown if event["args"].get("granularity") == "rdma")
+    assert child["tid"].endswith("/RDMA") and child["dur"] == 2
+    hidden = trace_events(raw, "keep", base, time_origin="rank")
+    assert not any("WAIT" in event["args"]["event_family"] for event in hidden)
+    assert sum(event["tid"].endswith("/COMBINE_PROGRESS") for event in hidden) == 4
+    for event in hidden:
+        counterpart = next(e for e in shown if e["name"] == event["name"] and e["tid"] == event["tid"])
+        assert (event["ts"], event["dur"]) == (counterpart["ts"], counterpart["dur"])
+
+    output, index = transfer.export_text(raw_file.parent, tmp_path / "export", max_bytes=1024)
+    parts = [transfer.show_part(output, number) for number in range(1, len(index["parts"]) + 1)]
+    restored = tmp_path / "restored"
+    transfer.restore_text(parts, restored)
+    assert (restored / "timer" / parsed.name).read_bytes() == parsed.read_bytes()
+    assert json.loads((restored / "timer/rank_0_npu_time.json").read_text(encoding="utf-8")) == shown
+    with (restored / "timer/combine_progress_breakdown.csv").open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == 5
+    assert next(row for row in rows if row["phase"] == "host_barrier_wait")["elapsed_us"] == "9.000000"
+    measured = [row for row in rows if row["phase"] == "progress"]
+    assert [(row["scan_control_cycles"], row["scan_control_us"]) for row in measured] == [
+        ("2501", "2.501"),
+        ("6203", "6.203"),
+    ]
+    assert [(row["posts"], row["scanned_rows"]) for row in measured] == [("4", "32"), ("6", "256")]
+    drain_row = next(row for row in rows if row["phase"] == "drain")
+    assert drain_row["scope"] == "envelope" and drain_row["elapsed_us"] == "18.000000"
+    assert (drain_row["pending_before"], drain_row["pending_after"]) == ("120", "0")
+    for key in ("posts", "scanned_rows", "scan_control_cycles", "scan_control_us"):
+        assert drain_row[key] == ""
+    with (restored / "timer/startup_breakdown.csv").open(newline="", encoding="utf-8") as stream:
+        assert not list(csv.DictReader(stream))
+
+
+def test_legacy_parsed_csv_renders_without_new_events(tmp_path):
+    from deep_ep_experimental.megamoe.timer.__main__ import main
+
+    # Previous parsed schemas do not need new raw-buffer offsets or event columns.
+    parsed = tmp_path / "rank_0_npu_time_parsed.csv"
+    fields = [
+        "core_id",
+        "group_id",
+        "core_type",
+        "sub_id",
+        "AIC_GMM1_0_start_cycle",
+        "AIC_GMM1_0_end_cycle",
+        "AIC_GMM1_task_count",
+    ]
+    with parsed.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(fields)
+        writer.writerow([0, 0, "AIC", 0, 2**55 + 1000, 2**55 + 6000, 1])
+    main([str(tmp_path), "--ranks", "0", "--include-wait"])
+    trace = json.loads((tmp_path / "rank_0_npu_time.json").read_text(encoding="utf-8"))
+    assert len(trace) == 1 and trace[0]["name"] == "AIC_GMM1_0"
+    assert trace[0]["ts"] == 0 and trace[0]["dur"] == 5
+    with (tmp_path / "combine_progress_breakdown.csv").open(newline="", encoding="utf-8") as stream:
+        assert not list(csv.DictReader(stream))
+
+
+def test_previous_raw_schema_size_is_rejected(tmp_path):
+    fixed, dynamic = len(p.FIXED_NAMES) - 2, len(p.DYNAMIC_NAMES) - 2
+    items = fixed + dynamic * p.MAX_DYNAMIC_ITER
+    counters = (items * 2 + 15) // 16 * 16 * p.N_CORE_COUNT
+    iterations = (dynamic + 15) // 16 * 16 * p.N_CORE_COUNT
+    metadata = dynamic * p.MAX_DYNAMIC_ITER * 2 * p.N_CORE_COUNT
+    waves = (items + 15) // 16 * 16 * p.N_CORE_COUNT
+    previous_size = counters + iterations + metadata + waves
+    assert previous_size < p.TOTAL_BUFFER_SIZE
+    previous = tmp_path / "old_timer.bin"
+    with previous.open("wb") as stream:
+        stream.truncate(previous_size * 8)
+    with pytest.raises(ValueError, match="invalid binary timer size"):
+        load_raw(previous)

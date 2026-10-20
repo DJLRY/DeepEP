@@ -97,11 +97,11 @@ protected:
     {
         if constexpr (g_coreType == AIV) {
             if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob(rankId_)) {
-                // AIV1 returns frequently to activation priority checks. AIV0
-                // progresses only at completed compute slices, so it needs a
-                // larger budget to avoid shifting all sends into the final drain.
+                // Bound both posting and flag scans before returning to the
+                // next prologue/activation. AIV0 has fewer safe call sites but
+                // must not spend long batches delaying the next weight tile.
                 const HierarchicalCombineProgressBudget budget =
-                    GetSubBlockIdx() == 0U ? HierarchicalCombineProgressBudget{8U, 128U}
+                    GetSubBlockIdx() == 0U ? HierarchicalCombineProgressBudget{4U, 64U}
                                           : HierarchicalCombineProgressBudget{2U, 64U};
                 return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_,
                                                       HierarchicalRoceScratch(params_),
@@ -1031,7 +1031,11 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
             // The host barrier closes every local producer and Dispatch reader,
             // including ranks with no rows for this gateway. The reciprocal
             // commits then close the two-host buffer lifetime before reuse.
-            CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
+            {
+                AscendTimerFixedScope barrier(timer_.Enabled() ? &timer_ : nullptr,
+                                               AscendTimer::AIV_HOST_COMBINE_BARRIER_WAIT);
+                CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
+            }
             if (aivJob_.jobIndex == HierarchicalSendJob(rankId_)) {
                 auto* scratch = HierarchicalRoceScratch(params_);
                 auto* rdmaTimer = timer_.Enabled() ? &timer_ : nullptr;

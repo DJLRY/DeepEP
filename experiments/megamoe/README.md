@@ -297,6 +297,30 @@ python -I -m deep_ep_experimental.megamoe.timer.trace_parser \
 始终保留启动 WAIT，不受 JSON 的 `--include-wait` 开关影响。时间基准为每个 rank 的原始首事件；
 `scope=envelope` 是父区间，各核和父子区间不可累计当作端到端耗时。
 新启动打点再次扩展了 buffer 布局，旧 BIN 需使用采集时的解析器；旧采样无法补出此前未记录的阶段。
+
+跨机 Combine 的推进开销在 `/COMBINE_PROGRESS` 子轨道单独记录：
+
+| 事件 | 测量范围 |
+| --- | --- |
+| `AIV_COMBINE_INIT` | 首次构建私有 pending masks 的元数据 DMA 和标量处理；每次算子只记录一次 |
+| `AIV_COMBINE_PROGRESS` | 初始化后的单次扫描和提交；记录进入/退出时待发的行数、POST 数、扫描槽位数及扫描/控制累计周期 |
+| `AIV_HOST_COMBINE_BARRIER_WAIT` | 已有16卡机内完成屏障的完整调用，包含发布、轮询及本卡同步 |
+| `AIV_COMBINE_DRAIN` | 屏障后最终 drain 的父区间，包含子 progress 和退避；记录进入/退出时待发行数 |
+
+`scan_control_us` 包含游标扫描、ready flag 检查和私有 pending 状态维护，排除初始化、
+`RocePutBytes` 调用和 drain 退避；它仍包含测量边界的开销，不能当作纯 GM 访存耗时。
+progress/drain 的父区间不能与内部 RDMA 或子 progress 相加。初始化是独立区间，
+已全部发送的 progress 快返不产生扫描记录；零待发的最终 drain 仍记录0行，便于确认完成。
+这些观测不新增流水排空、跨核同步或通信，不以计时结果决定调度。
+
+解析另输出 `combine_progress_breakdown.csv`，始终保留上述四类数据，即使 JSON 隐藏 WAIT。
+其中 `pending_before` / `pending_after` 是行数；`posts` / `scanned_rows` 只属于 progress，
+drain 行的这些字段留空。通过它比较单次推进耗时与最终剩余行数，判断缩减预算是否把工作移到了尾部。
+完整 parsed CSV 的文本导出会保留新记录，恢复时自动重建此报告，无需额外附件。
+
+本轮扩展了 timer buffer 布局：两节点均须重新 `build --timer` 并使用同版本解析器采集新 trace；
+已有 SHMEM SDK 可复用。旧 BIN 使用采集时版本解析器；旧 parsed CSV 仍可读取，但没有新增观测。
+
 结果位于 `<case_dir>/trace_node_<rank>_<随机字符>/`，保留配置快照、`console.log` 和各 rank 的资源信息，
 不生成 `profiling.json`、`kernel_samples.json` 或 `profiler/`，流水输出包括：
 
@@ -308,6 +332,7 @@ python -I -m deep_ep_experimental.megamoe.timer.trace_parser \
 | `bs_32/timer/rank_<r>_npu_time.json` | 单 rank 的 AIC/AIV 流水，支持 Chrome JSON trace 查看器 |
 | `bs_32/timer/all_rank_trace.json` | 本机选中 ranks 的合并流水，不包含另一台机器的原始数据 |
 | `bs_32/timer/timer_breakdown.txt/json` | 阶段耗时拆分；本机自动解析后对应本机选中 ranks |
+| `bs_32/timer/combine_progress_breakdown.csv` | Combine 初始化、逐次推进、机内屏障和最终 drain 的耗时及待发行数 |
 
 流水按每个 rank 自己的起点归零，不能用不同 rank 的坐标相减计算跨机延迟。
 设备打点反映代码阶段及等待，不是逐 WQE 的网卡执行轨迹；正式性能基线使用 `perf` 的结果。
@@ -403,11 +428,12 @@ FP8 和内部量化的 BF16 输入均沿用原接口，容量可大于实际 B�
 A8W8 当前只运行路由专家，`num_shared_experts` 必须为0，不能传入 timer。
 
 A8W4 的跨机 Combine 在计算间隙分批推进：AIV1 每次最多提交2个 Put、扫描64个
-`[token, top-k]` 槽位，AIV0 每次最多提交8个 Put、扫描128个槽位。扫描游标跨调用保留，
-已发送槽位不再读取 ready flag；全部发送后立即返回。AIV0 还在后续 wave 的 GMM1 slice
-完成后推进通信，让较小的单次预算仍有足够发送机会。最终 host barrier 后完整 drain，
-再执行 payload quiet、commit、commit quiet 和对端 commit 等待。
-这些预算是首轮性能调优起点，单次 Put 内部仍可能因队列回压等待，并非硬性时间上限。
+`[token, top-k]` 槽位，AIV0 每次最多提交4个 Put、扫描64个槽位。扫描游标跨调用保留，
+已发送槽位不再读取 ready flag；全部发送后立即返回。AIV0 在 GMM2 专家 slice 完成后
+推进通信，GMM1 阶段连续供数，避免延迟下一 wave 的激活依赖。GMM2 中本核无计算 tile
+的非空专家 slice 仍保留推进机会，以免过度减少发送次数；最终 host barrier 后完整
+drain，再执行 payload quiet、commit、commit quiet 和对端 commit 等待。
+单次 Put 内部仍可能因队列回压等待，这些计数预算并非硬性时间上限。
 
 Combine 路由首次初始化使用 owner 专用256 B UB 分块 DMA 读取已接收的 rail 元数据；
 BS32、K8 时为5次256 B DMA，跳过每个512 B packet 的末尾 marker。

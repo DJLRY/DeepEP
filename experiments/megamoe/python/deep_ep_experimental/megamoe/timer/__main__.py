@@ -15,6 +15,7 @@ from .trace_parser import (
     raw_events_for_rank,
     synchronized_rank_bases,
     trace_events,
+    write_combine_progress_breakdown,
     write_summary,
     write_startup_breakdown,
 )
@@ -67,6 +68,7 @@ def main(argv=None):
             raise ValueError(f"rank={rank}: empty trace; check timer-enabled build and collection")
     bases = {rank: first_start_cycle(raw) for rank, raw in events.items()}
     write_startup_breakdown(events, args.directory / "startup_breakdown.csv")
+    write_combine_progress_breakdown(events, args.directory / "combine_progress_breakdown.csv")
     write_breakdown(
         [rank_breakdown(raw, rank) for rank, raw in events.items()], args.directory, args.directory.parent.name
     )

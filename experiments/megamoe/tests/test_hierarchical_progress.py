@@ -48,6 +48,7 @@ def hierarchical_progress_binary(tmp_path_factory):
         "metadata",
         "drain",
         "topology",
+        "telemetry",
     ],
 )
 def test_hierarchical_progress_contract(hierarchical_progress_binary, scenario):

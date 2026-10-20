@@ -38,11 +38,13 @@ struct HierarchicalCombineProgressBudget {
 // Count only experts on this gateway's host. Original (token, top-k) coordinates
 // are retained, including holes and duplicate destination ranks.
 __aicore__ inline void InitializeHierarchicalCombineProgress(const MoeStageCommonConfig& common, const Params& params,
-                                                             HierarchicalCombineProgress& progress)
+                                                             HierarchicalCombineProgress& progress,
+                                                             AscendTimerDevice* timer = nullptr)
 {
     if (progress.initialized) {
         return;
     }
+    AscendTimerFixedScope initialization(timer, AscendTimer::AIV_COMBINE_INIT);
     const uint32_t localHost = HierarchicalHost(common.rankId);
     const uint32_t sourceHost = HierarchicalHost(HierarchicalGateway(common.rankId));
     const uint64_t sourceSlotOffset = static_cast<uint64_t>(sourceHost) * CalcRailTopkIdsSlotBytes(params.tilingData);
@@ -119,10 +121,13 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
     if (budget.maxPosts == 0U || budget.maxScannedRows == 0U) {
         return false;
     }
-    InitializeHierarchicalCombineProgress(common, params, progress);
+    InitializeHierarchicalCombineProgress(common, params, progress, timer);
     if (progress.sentRows == progress.expectedRows) {
         return false;
     }
+    const uint32_t pendingBefore = progress.expectedRows - progress.sentRows;
+    AscendTimerCombineProgressScope timing(timer, AscendTimer::AIV_COMBINE_PROGRESS);
+    timing.StartScan();
     const uint32_t rowCount = common.tokenNum * common.topK;
     const uint32_t scanLimit = budget.maxScannedRows < rowCount ? budget.maxScannedRows : rowCount;
     const uint32_t rowBytes = common.tokenHiddenDim * sizeof(bfloat16_t);
@@ -152,8 +157,10 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
             ++row;
         }
         const uint64_t byteOffset = static_cast<uint64_t>(runStart) * rowBytes;
+        timing.StopScan();
         RocePutBytes(params.peermemInfo.combineSendPtr + byteOffset, params.peermemInfo.gatewayCombinePtr + byteOffset,
                      (row - runStart) * rowBytes, destination, roceScratch, timer, AscendTimer::RdmaPhase::Combine);
+        timing.StartScan();
         for (uint32_t sent = runStart; sent < row; ++sent) {
             progress.pendingTopkMasks[sent / common.topK] &= ~(uint32_t(1) << (sent % common.topK));
         }
@@ -167,6 +174,7 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
         }
     }
     progress.nextRow = row;
+    timing.Finish(pendingBefore, progress.expectedRows - progress.sentRows, posts, scanned);
     return posts != 0U;
 }
 
@@ -190,7 +198,9 @@ __aicore__ inline void DrainHierarchicalCombine(const MoeStageCommonConfig& comm
     if (!UseHierarchicalRoce(params.tilingData)) {
         return;
     }
-    InitializeHierarchicalCombineProgress(common, params, progress);
+    InitializeHierarchicalCombineProgress(common, params, progress, timer);
+    const uint32_t pendingBefore = progress.expectedRows - progress.sentRows;
+    AscendTimerCombineProgressScope drain(timer, AscendTimer::AIV_COMBINE_DRAIN);
     while (progress.sentRows < progress.expectedRows) {
         if (!TryProgressHierarchicalCombine(common, params, progress, roceScratch, timer, {})) {
             const int64_t waitStart = GetSystemCycle();
@@ -198,6 +208,9 @@ __aicore__ inline void DrainHierarchicalCombine(const MoeStageCommonConfig& comm
             }
         }
     }
+    // The parent includes child progress calls and backoff. Their scan/POST
+    // counters belong to the child records, not to this completion envelope.
+    drain.Finish(pendingBefore, progress.expectedRows - progress.sentRows, 0U, 0U);
 }
 
 }  // namespace MegaMoeImpl

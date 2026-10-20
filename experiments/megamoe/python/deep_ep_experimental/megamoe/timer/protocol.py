@@ -18,6 +18,11 @@ STARTUP_FIXED_NAMES = [
     "AIV_COUNT_READY_WAIT",
 ]
 
+COMBINE_PROGRESS_FIXED_NAMES = [
+    "AIV_COMBINE_INIT",
+    "AIV_HOST_COMBINE_BARRIER_WAIT",
+]
+
 FIXED_NAMES = [
     "KERNEL_TIMING",
     "AIV_INPUT_BUFFER_INIT",
@@ -30,6 +35,7 @@ FIXED_NAMES = [
     "AIV_UNPERMUTE",
     "AIC_WAIT_INPUT_PREP",
     *STARTUP_FIXED_NAMES,
+    *COMBINE_PROGRESS_FIXED_NAMES,
 ]
 
 DYNAMIC_NAMES = [
@@ -53,6 +59,8 @@ DYNAMIC_NAMES = [
     "AIV_RDMA_QUIET_WAIT",
     "AIV_RDMA_RECV_WAIT",
     "AIV_GATEWAY_PAYLOAD_WAIT",
+    "AIV_COMBINE_PROGRESS",
+    "AIV_COMBINE_DRAIN",
 ]
 
 RDMA_PHASES = ("dispatch_meta", "dispatch_payload", "combine")
@@ -82,6 +90,34 @@ def task_metadata(raw, core_id, logical_index):
     first, second = raw[offset : offset + 2]
     family = DYNAMIC_NAMES[dynamic_index // MAX_DYNAMIC_ITER]
     mask = (1 << 32) - 1
+    if family in ("AIV_COMBINE_PROGRESS", "AIV_COMBINE_DRAIN"):
+        # Raw storage is signed int64; these two metadata words are uint64.
+        first = int(first) & ((1 << 64) - 1)
+        result = dict(
+            granularity="combine_progress" if family == "AIV_COMBINE_PROGRESS" else "combine_drain",
+            pending_before=first & 0xFFFF,
+            pending_after=(first >> 16) & 0xFFFF,
+        )
+        before, after = result["pending_before"], result["pending_after"]
+        if not 0 <= after <= before <= 1024:
+            raise ValueError(f"invalid combine metadata: core={core_id}, slot={dynamic_index}, pending counts")
+        if family == "AIV_COMBINE_PROGRESS":
+            scan_cycles = int(second) & ((1 << 64) - 1)
+            posts, scanned = (first >> 32) & 0xFFFF, (first >> 48) & 0xFFFF
+            sent = before - after
+            if not (posts <= sent <= scanned <= 1024 and (posts == 0) == (sent == 0)):
+                raise ValueError(f"invalid combine metadata: core={core_id}, slot={dynamic_index}, progress counts")
+            result.update(
+                posts=posts,
+                scanned_rows=scanned,
+                scan_control_cycles=scan_cycles,
+                scan_control_us=scan_cycles / CYCLE_TO_US,
+            )
+        elif (first >> 32) != 0 or int(second) != 0:
+            raise ValueError(f"invalid combine metadata: core={core_id}, slot={dynamic_index}, unused drain fields")
+        # Drain is an enclosing interval, not a second scan measurement. Its
+        # unused metadata fields must not become measured zeroes in reports.
+        return result
     if family == "AIV_GATEWAY_PAYLOAD_WAIT":
         source = ((first >> 32) & mask) - 1
         gateway = (first & mask) - 1

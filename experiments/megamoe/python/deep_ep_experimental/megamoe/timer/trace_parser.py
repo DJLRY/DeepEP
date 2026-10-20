@@ -12,7 +12,7 @@ from pathlib import Path
 import re
 from statistics import median
 
-from .protocol import CYCLE_TO_US, STARTUP_FIXED_NAMES
+from .protocol import COMBINE_PROGRESS_FIXED_NAMES, CYCLE_TO_US, STARTUP_FIXED_NAMES
 
 SYNC_ANCHOR_EVENT = "AIV_INPUT_CROSS_RANK_SYNC"
 
@@ -208,6 +208,15 @@ def trace_events(
             if granularity == "startup_dependency":
                 display_name += f"_source{task['source_rank']}_gateway{task['gateway_rank']}_seq{task['sequence']}"
             wave_metadata["display_index_semantics"] = "per_core_startup_phase_or_dependency"
+        if family in COMBINE_PROGRESS_FIXED_NAMES or granularity in ("combine_progress", "combine_drain"):
+            lane += "/COMBINE_PROGRESS"
+            category = "combine_wait" if "WAIT" in family else "combine_progress"
+            if family in COMBINE_PROGRESS_FIXED_NAMES:
+                display_name = family
+            # Progress encloses scan/control and RDMA posts; Drain encloses
+            # child progress calls and backoff. Initialization is independent.
+            # Parent elapsed time is not additive with its child intervals.
+            wave_metadata["display_index_semantics"] = "per_core_combine_phase_or_call"
         result.append(
             {
                 "ph": "X",
@@ -284,6 +293,69 @@ def write_startup_breakdown(raw_by_rank, path: Path):
                         start_us=f"{(event['start_cycle'] - base) / CYCLE_TO_US:.6f}",
                         duration_us=f"{(event['end_cycle'] - event['start_cycle']) / CYCLE_TO_US:.6f}",
                         **{key: task.get(key, "") for key in ("source_rank", "gateway_rank", "sequence")},
+                    )
+                )
+
+
+def write_combine_progress_breakdown(raw_by_rank, path: Path):
+    """Keep waits and envelopes; elapsed, child RDMA and scan times are not additive."""
+    phases = {
+        "AIV_COMBINE_INIT": "init",
+        "AIV_HOST_COMBINE_BARRIER_WAIT": "host_barrier_wait",
+        "AIV_COMBINE_PROGRESS": "progress",
+        "AIV_COMBINE_DRAIN": "drain",
+    }
+    fields = [
+        "rank",
+        "group_id",
+        "core_type",
+        "sub_id",
+        "wave_id",
+        "event_family",
+        "phase",
+        "scope",
+        "start_us",
+        "elapsed_us",
+        "scan_control_cycles",
+        "scan_control_us",
+        "pending_before",
+        "pending_after",
+        "posts",
+        "scanned_rows",
+    ]
+    with path.open("w", newline="", encoding="utf-8") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        writer.writeheader()
+        for rank, events in sorted(raw_by_rank.items()):
+            base = first_start_cycle(events)
+            for event in sorted(events, key=lambda e: (e["group_id"], e["core_type"], e["sub_id"], e["start_cycle"])):
+                family = event_family(event["name"])
+                if family not in phases:
+                    continue
+                task = event.get("task", {})
+                metrics = {}
+                if family in ("AIV_COMBINE_PROGRESS", "AIV_COMBINE_DRAIN"):
+                    metrics.update({key: task.get(key, "") for key in ("pending_before", "pending_after")})
+                if family == "AIV_COMBINE_PROGRESS":
+                    metrics.update(
+                        {
+                            key: task.get(key, "")
+                            for key in ("scan_control_cycles", "scan_control_us", "posts", "scanned_rows")
+                        }
+                    )
+                writer.writerow(
+                    dict(
+                        rank=rank,
+                        group_id=event["group_id"],
+                        core_type=event["core_type"],
+                        sub_id=event["sub_id"],
+                        wave_id=event.get("wave_id", ""),
+                        event_family=family,
+                        phase=phases[family],
+                        scope="envelope" if family in ("AIV_COMBINE_PROGRESS", "AIV_COMBINE_DRAIN") else "phase",
+                        start_us=f"{(event['start_cycle'] - base) / CYCLE_TO_US:.6f}",
+                        elapsed_us=f"{(event['end_cycle'] - event['start_cycle']) / CYCLE_TO_US:.6f}",
+                        **metrics,
                     )
                 )
 
@@ -405,6 +477,7 @@ def main():
     summary_output = args.output_dir / "timer_summary.csv"
     write_summary(merged_raw, summary_output)
     write_startup_breakdown(raw_by_rank, args.output_dir / "startup_breakdown.csv")
+    write_combine_progress_breakdown(raw_by_rank, args.output_dir / "combine_progress_breakdown.csv")
     print(f"[TIMER] merged {len(merged_trace)} events -> {merged_output}")
     print(f"[TIMER] summary -> {summary_output}")
 

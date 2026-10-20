@@ -25,10 +25,73 @@ constexpr int AIC = 0;
 constexpr int AIV = 1;
 constexpr int g_coreType = AIV;
 using bfloat16_t = uint16_t;
-class AscendTimerDevice {};
 namespace AscendTimer {
 enum class RdmaPhase { Combine };
+enum FixedTiming { AIV_COMBINE_INIT };
+enum DynamicTimingType { AIV_COMBINE_PROGRESS, AIV_COMBINE_DRAIN };
 }
+
+// The timer itself has a separate production-header test. This double checks
+// that the production scheduler brackets scans/Put and reports actual counters.
+class AscendTimerDevice {
+public:
+    struct Record {
+        AscendTimer::DynamicTimingType type;
+        uint32_t before;
+        uint32_t after;
+        uint32_t posts;
+        uint32_t scanned;
+    };
+    std::vector<Record> records;
+    uint32_t initializations = 0U;
+    uint32_t scanStarts = 0U;
+    uint32_t scanStops = 0U;
+    bool scanActive = false;
+};
+
+class AscendTimerFixedScope {
+public:
+    AscendTimerFixedScope(AscendTimerDevice* timer, AscendTimer::FixedTiming)
+    {
+        if (timer != nullptr) {
+            ++timer->initializations;
+        }
+    }
+};
+
+class AscendTimerCombineProgressScope {
+public:
+    AscendTimerCombineProgressScope(AscendTimerDevice* timer, AscendTimer::DynamicTimingType type)
+        : timer_(timer), type_(type) {}
+    void StartScan()
+    {
+        if (timer_ != nullptr) {
+            if (timer_->scanActive) {
+                throw std::runtime_error("scan timer started twice");
+            }
+            timer_->scanActive = true;
+            ++timer_->scanStarts;
+        }
+    }
+    void StopScan()
+    {
+        if (timer_ != nullptr && timer_->scanActive) {
+            timer_->scanActive = false;
+            ++timer_->scanStops;
+        }
+    }
+    void Finish(uint32_t before, uint32_t after, uint32_t posts, uint32_t scanned)
+    {
+        StopScan();
+        if (timer_ != nullptr) {
+            timer_->records.push_back({type_, before, after, posts, scanned});
+        }
+    }
+
+private:
+    AscendTimerDevice* timer_;
+    AscendTimer::DynamicTimingType type_;
+};
 
 namespace ProgressTest {
 inline void Check(bool condition, const char* message)
@@ -245,10 +308,11 @@ inline int32_t ReadGmByPassDCache(const int32_t* address)
     return *address;
 }
 inline void RocePutBytes(uint8_t* destination, uint8_t* source, uint32_t bytes, uint32_t peer, uint8_t* scratch,
-                         AscendTimerDevice*, AscendTimer::RdmaPhase phase)
+                         AscendTimerDevice* timer, AscendTimer::RdmaPhase phase)
 {
     using namespace ProgressTest;
     auto& s = *state;
+    Check(timer == nullptr || !timer->scanActive, "scan timer included RDMA submission");
     Check(phase == AscendTimer::RdmaPhase::Combine && peer == s.peer, "Put used wrong phase or paired rank");
     Check(scratch == s.ub.data() && s.pendingDma == nullptr && s.overwriteOrdered,
           "Put reused metadata scratch before its reads completed");
@@ -463,7 +527,7 @@ void Fairness()
 void Budgets()
 {
     for (uint32_t scans : {0U, 1U, 2U, 3U, 63U, 64U, 127U, 128U, 1024U}) {
-        for (uint32_t posts : {0U, 1U, 2U, 8U}) {
+        for (uint32_t posts : {0U, 1U, 2U, 4U, 8U}) {
             Fixture f(32U, 8U);
             f.Routes("mixed");
             f.Init();
@@ -591,6 +655,44 @@ void Topology()
     Check(!f.progress.initialized && f.s.copies.empty() && f.s.posts.empty() && f.s.flagReads == 0U,
           "non-hierarchical topology touched transport state");
 }
+
+void Telemetry()
+{
+    Fixture f(32U, 8U, 16U);
+    f.Routes("all");
+    ReleaseAll();
+    AscendTimerDevice timer;
+    Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {4U, 64U}),
+          "instrumented progress failed to send ready rows");
+    Check(timer.initializations == 1U && timer.records.size() == 1U, "missing initialization/progress observation");
+    const auto first = timer.records.front();
+    Check(first.type == AscendTimer::AIV_COMBINE_PROGRESS && first.before == 256U && first.after == 192U &&
+              first.posts == 1U && first.scanned == 64U,
+          "progress counters do not match the bounded production loop");
+    Check(timer.scanStarts == 2U && timer.scanStops == 2U && !timer.scanActive,
+          "scan time did not exclude one asynchronous Put");
+    // An unready sweep must still report its examined slots, with no sends.
+    for (uint32_t row = 64U; row < 128U; ++row) {
+        f.Publish(row, f.s.sequence - 1U);
+    }
+    Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {4U, 64U}),
+          "unready instrumented sweep submitted a row");
+    const auto idle = timer.records.back();
+    Check(idle.before == 192U && idle.after == 192U && idle.posts == 0U && idle.scanned == 64U,
+          "no-progress scan counters were omitted or changed");
+    ReleaseAll();
+    DrainHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer);
+    const auto drain = timer.records.back();
+    Check(drain.type == AscendTimer::AIV_COMBINE_DRAIN && drain.before == 192U && drain.after == 0U &&
+              drain.posts == 0U && drain.scanned == 0U,
+          "drain did not report its entry/exit pending rows independently of child scans");
+    const auto records = timer.records.size();
+    Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {4U, 64U}),
+          "completed instrumented state reported progress");
+    Check(timer.initializations == 1U && timer.records.size() == records && !timer.scanActive,
+          "completed fast path added scan events or repeated initialization");
+    f.CheckPayload();
+}
 }  // namespace ProgressTest
 
 int main(int argc, char** argv)
@@ -608,6 +710,7 @@ int main(int argc, char** argv)
         else if (scenario == "metadata") Metadata();
         else if (scenario == "drain") Drain();
         else if (scenario == "topology") Topology();
+        else if (scenario == "telemetry") Telemetry();
         else throw std::runtime_error("unknown test scenario");
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
