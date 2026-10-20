@@ -521,6 +521,12 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
                     timer_.SetWave(static_cast<int64_t>(gmm1Count));
                     RunGmm1ActivationForExpert(gmm1State, gmm1AddrInfo, gmm1StartBlockIdx, gmm1TileReadySequence,
                                                sliceTokenStartIndexInExpert, sliceTokenCount, gmm1TilesPerMGroup);
+                    // The completed slice has drained its prologue pipeline.
+                    // Later waves can forward earlier GMM2 output here; the
+                    // first wave has none and must not pay initialization cost.
+                    if (gmm1Count != 0U) {
+                        this->TryProgressRemoteCombine();
+                    }
                 }
                 waveEndPosition = gmm1Position;
                 currentWaveNeedsGmm1 = IsPositionWithinWave(gmm1Position, currentWaveMGroupCount);

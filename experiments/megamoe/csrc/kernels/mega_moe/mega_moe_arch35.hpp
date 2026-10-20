@@ -97,9 +97,15 @@ protected:
     {
         if constexpr (g_coreType == AIV) {
             if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob(rankId_)) {
+                // AIV1 returns frequently to activation priority checks. AIV0
+                // progresses only at completed compute slices, so it needs a
+                // larger budget to avoid shifting all sends into the final drain.
+                const HierarchicalCombineProgressBudget budget =
+                    GetSubBlockIdx() == 0U ? HierarchicalCombineProgressBudget{8U, 128U}
+                                          : HierarchicalCombineProgressBudget{2U, 64U};
                 return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_,
                                                       HierarchicalRoceScratch(params_),
-                                                      timer_.Enabled() ? &timer_ : nullptr);
+                                                      timer_.Enabled() ? &timer_ : nullptr, budget);
             }
         }
         return false;

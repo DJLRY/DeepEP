@@ -23,7 +23,15 @@ struct HierarchicalCombineProgress {
     uint32_t pendingTopkMasks[HIERARCHICAL_MAX_TOKENS + 1U]{};
     uint32_t expectedRows = 0U;
     uint32_t sentRows = 0U;
+    uint32_t nextRow = 0U;
     bool initialized = false;
+};
+
+// The default retains a full sweep for callers with infrequent progress points.
+// A8W4 supplies separate budgets for its priority scheduler and prologue owner.
+struct HierarchicalCombineProgressBudget {
+    uint32_t maxPosts = 0xffffffffU;
+    uint32_t maxScannedRows = 0xffffffffU;
 };
 
 // The caller has already acquired the paired source's metadata during Dispatch.
@@ -38,22 +46,42 @@ __aicore__ inline void InitializeHierarchicalCombineProgress(const MoeStageCommo
     const uint32_t localHost = HierarchicalHost(common.rankId);
     const uint32_t sourceHost = HierarchicalHost(HierarchicalGateway(common.rankId));
     const uint64_t sourceSlotOffset = static_cast<uint64_t>(sourceHost) * CalcRailTopkIdsSlotBytes(params.tilingData);
-    auto* sourceTopk = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.railTopkIdsRecvPtr + sourceSlotOffset);
+    GlobalTensor<int32_t> sourceTopk;
+    sourceTopk.SetGlobalBuffer(
+        reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.railTopkIdsRecvPtr + sourceSlotOffset));
+    constexpr uint32_t scratchWords = MEGAMOE_ROCE_SCRATCH_BYTES / sizeof(int32_t);
+    LocalTensor<int32_t> topkScratch(TPosition::VECCALC, params.tilingData->roceScratchUbOffset, scratchWords);
     const uint32_t expertsPerHost = HIERARCHICAL_RANKS_PER_HOST * common.moeExpertPerRank;
+    progress.expectedRows = 0U;
     for (uint32_t token = 0U; token < common.tokenNum; ++token) {
-        uint32_t pending = 0U;
-        for (uint32_t topk = 0U; topk < common.topK; ++topk) {
-            const uint32_t row = token * common.topK + topk;
-            const uint32_t packedOffset =
-                row / RAIL_PACKET_DATA_WORDS * RAIL_PACKET_WORDS + row % RAIL_PACKET_DATA_WORDS;
-            const int32_t expert = ReadGmByPassDCache(sourceTopk + packedOffset);
-            if (expert >= 0 && static_cast<uint32_t>(expert) / expertsPerHost == localHost) {
-                pending |= uint32_t(1) << topk;
-                ++progress.expectedRows;
+        progress.pendingTopkMasks[token] = 0U;
+    }
+    // Dispatch transferred whole 512B packets. Read each in two aligned chunks
+    // using the owner's reserved 256B UB; the last word is a marker, not an ID.
+    // This runs only before the first Combine Post, after Dispatch is drained.
+    const uint32_t rowCount = common.tokenNum * common.topK;
+    for (uint32_t packet = 0U, firstRow = 0U; firstRow < rowCount;
+         ++packet, firstRow += RAIL_PACKET_DATA_WORDS) {
+        const uint32_t remaining = rowCount - firstRow;
+        const uint32_t validPacket = remaining < RAIL_PACKET_DATA_WORDS ? remaining : RAIL_PACKET_DATA_WORDS;
+        for (uint32_t firstWord = 0U; firstWord < validPacket; firstWord += scratchWords) {
+            SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
+            DataCopy(topkScratch, sourceTopk[packet * RAIL_PACKET_WORDS + firstWord], scratchWords);
+            SyncFuncStatic<HardEvent::MTE2_S, MEGAMOE_ROCE_EVENT_ID>();
+            const uint32_t left = validPacket - firstWord;
+            const uint32_t valid = left < scratchWords ? left : scratchWords;
+            for (uint32_t i = 0U; i < valid; ++i) {
+                const int32_t expert = topkScratch.GetValue(i);
+                if (expert >= 0 && static_cast<uint32_t>(expert) / expertsPerHost == localHost) {
+                    const uint32_t row = firstRow + firstWord + i;
+                    progress.pendingTopkMasks[row / common.topK] |= uint32_t(1) << (row % common.topK);
+                    ++progress.expectedRows;
+                }
             }
         }
-        progress.pendingTopkMasks[token] = pending;
     }
+    // Finish scalar reads before the RDMA backend reuses this UB for its WQE.
+    SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
     progress.initialized = true;
 }
 
@@ -70,15 +98,17 @@ __aicore__ inline bool IsHierarchicalCombineRowReady(const MoeStageCommonConfig&
     return static_cast<uint32_t>(ReadGmByPassDCache(ready)) == params.tilingData->hierarchicalSequence;
 }
 
-// Probe once without waiting for any unfinished producer. Adjacent ready slots
-// form one Put; an unready/unused slot ends the run. No top-k weighting, local
-// reduction, padding copy, or quantization is introduced by the gateway.
+// Probe at most one sweep without waiting for unfinished producers. The cursor
+// survives a bounded call, so late slots cannot starve behind early ready rows.
+// Adjacent ready slots form one Put; holes, the row budget, and the tensor end
+// terminate a run. No weighting, reduction, padding copy, or quantization occurs.
 //
 // Only the rank's designated communication owner may call this routine. Its UB
 // scratch and QP are the same resources used by the completed Dispatch stage.
 __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig& common, const Params& params,
                                                       HierarchicalCombineProgress& progress,
-                                                      __ubuf__ uint8_t* roceScratch, AscendTimerDevice* timer = nullptr)
+                                                      __ubuf__ uint8_t* roceScratch, AscendTimerDevice* timer = nullptr,
+                                                      HierarchicalCombineProgressBudget budget = {})
 {
     if constexpr (g_coreType == AIC) {
         return false;
@@ -86,18 +116,39 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
     if (!UseHierarchicalRoce(params.tilingData)) {
         return false;
     }
+    if (budget.maxPosts == 0U || budget.maxScannedRows == 0U) {
+        return false;
+    }
     InitializeHierarchicalCombineProgress(common, params, progress);
+    if (progress.sentRows == progress.expectedRows) {
+        return false;
+    }
     const uint32_t rowCount = common.tokenNum * common.topK;
+    const uint32_t scanLimit = budget.maxScannedRows < rowCount ? budget.maxScannedRows : rowCount;
     const uint32_t rowBytes = common.tokenHiddenDim * sizeof(bfloat16_t);
     const uint32_t destination = HierarchicalGateway(common.rankId);
-    bool madeProgress = false;
-    for (uint32_t row = 0U; row < rowCount;) {
+    uint32_t row = progress.nextRow;
+    uint32_t scanned = 0U;
+    uint32_t posts = 0U;
+    while (scanned < scanLimit && posts < budget.maxPosts) {
+        ++scanned;
         if (!IsHierarchicalCombineRowReady(common, params, progress, row)) {
             ++row;
+            if (row == rowCount) {
+                row = 0U;
+            }
             continue;
         }
         const uint32_t runStart = row++;
-        while (row < rowCount && IsHierarchicalCombineRowReady(common, params, progress, row)) {
+        // Probe a terminating hole only once. It remains pending and is retried
+        // on a later sweep if its producer publishes readiness in the meantime.
+        bool skippedHole = false;
+        while (row < rowCount && scanned < scanLimit) {
+            ++scanned;
+            if (!IsHierarchicalCombineRowReady(common, params, progress, row)) {
+                skippedHole = true;
+                break;
+            }
             ++row;
         }
         const uint64_t byteOffset = static_cast<uint64_t>(runStart) * rowBytes;
@@ -107,9 +158,16 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
             progress.pendingTopkMasks[sent / common.topK] &= ~(uint32_t(1) << (sent % common.topK));
         }
         progress.sentRows += row - runStart;
-        madeProgress = true;
+        ++posts;
+        if (skippedHole) {
+            ++row;
+        }
+        if (row == rowCount) {
+            row = 0U;
+        }
     }
-    return madeProgress;
+    progress.nextRow = row;
+    return posts != 0U;
 }
 
 // Final drain is legal only after all local AIV producer work is complete and
@@ -134,7 +192,7 @@ __aicore__ inline void DrainHierarchicalCombine(const MoeStageCommonConfig& comm
     }
     InitializeHierarchicalCombineProgress(common, params, progress);
     while (progress.sentRows < progress.expectedRows) {
-        if (!TryProgressHierarchicalCombine(common, params, progress, roceScratch, timer)) {
+        if (!TryProgressHierarchicalCombine(common, params, progress, roceScratch, timer, {})) {
             const int64_t waitStart = GetSystemCycle();
             while (GetSystemCycle() - waitStart < GM_FLAG_POLL_BACKOFF_CYCLES) {
             }

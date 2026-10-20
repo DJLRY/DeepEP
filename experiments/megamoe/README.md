@@ -402,6 +402,20 @@ python3 experiments/megamoe/scripts/trace_text.py restore part1.txt part2.txt \
 FP8 和内部量化的 BF16 输入均沿用原接口，容量可大于实际 B。B>32 及更多16卡主机暂不支持。
 A8W8 当前只运行路由专家，`num_shared_experts` 必须为0，不能传入 timer。
 
+A8W4 的跨机 Combine 在计算间隙分批推进：AIV1 每次最多提交2个 Put、扫描64个
+`[token, top-k]` 槽位，AIV0 每次最多提交8个 Put、扫描128个槽位。扫描游标跨调用保留，
+已发送槽位不再读取 ready flag；全部发送后立即返回。AIV0 还在后续 wave 的 GMM1 slice
+完成后推进通信，让较小的单次预算仍有足够发送机会。最终 host barrier 后完整 drain，
+再执行 payload quiet、commit、commit quiet 和对端 commit 等待。
+这些预算是首轮性能调优起点，单次 Put 内部仍可能因队列回压等待，并非硬性时间上限。
+
+Combine 路由首次初始化使用 owner 专用256 B UB 分块 DMA 读取已接收的 rail 元数据；
+BS32、K8 时为5次256 B DMA，跳过每个512 B packet 的末尾 marker。
+该初始化优化也适用于 A8W8，其现有通信 owner 和每次完整扫描策略保持不变。
+更新后两台均需重新构建安装；按上述 BS32 流程先执行 `run` 校验精度，再执行
+`perf` 比较 `rank-max-mean`，并用配对 rank0/16 的 `trace --include-wait`
+检查计算尾部、Combine POST 分布和最终 quiet/commit 等待。CPU 回归不能替代这些设备检查。
+
 两机 RoCE runtime 的 `barrier()` 和 `destroy()` 先同步本卡全部 stream，再通过现有
 StoreGroup（TCPStore）或 ProcessGroup 交换完成状态；全部 rank 成功后才允许清理 SHMEM。
 当前 kernel 在返回前已等待应用 QP1 完成，这一顺序确保释放前没有未完成的通信。
