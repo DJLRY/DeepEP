@@ -314,6 +314,77 @@ python -I -m deep_ep_experimental.megamoe.timer.trace_parser \
 `trace` 默认只采两张卡，以控制原始 timer 文件及解析开销；分析慢 rank 时可通过 `--timer-ranks` 定点采集。
 运行、导出或自动解析失败均返回非零退出码，不打印成功的 `[DONE] trace`。
 
+### 通过限长文本复制传输流水
+
+服务器只能复制文本、每次最多65535字节时，使用离线工具 `experiments/megamoe/scripts/trace_text.py`。
+只需更新仓库中的 Python 文件；已有采样可直接导出，**无需重编译、重新安装 wheel 或重跑算子**。
+工具使用 Python 标准库，不需要 Torch、NPU 或额外压缩软件，也可在 Windows 上恢复。
+
+先在每台服务器分别导出一个已完成的 trace 结果目录：
+
+```bash
+# 也可直接传 bs_32/ 或 bs_32/timer/；有多个 BS 时必须指定一个。
+# output-dir 必须尚不存在，避免混入上次导出的分片。
+python3 experiments/megamoe/scripts/trace_text.py export \
+  /实际结果目录/trace_node_0_xxx \
+  --output-dir /tmp/trace-share-node0 \
+  --label "EP32-BS32-node0"
+
+# 每次只显示一块；完整复制 BEGIN 到 END（含这两行），作为一条消息发送。
+python3 experiments/megamoe/scripts/trace_text.py show /tmp/trace-share-node0 --part 1
+# 按 export 报告的总块数继续 --part 2、--part 3……
+```
+
+默认导出目录中**所有已解析的 rank**，也可用 `--ranks 0,3-5` 缩小范围。每块默认不超过60000字节，
+可用 `export --max-bytes 65535` 调整；上限计算包括编号、SHA-256、Base64、头尾标记、最终换行，
+并按 CRLF 换行预留空间。`show` 的标准输出只有一块 ASCII 文本，不带日志或颜色。
+不要一次打印所有分片，也不要把终端提示符、命令、`...` 或手工删改后的内容放进块内。
+每块的完整校验信息都在文本中，**不必另行复制导出目录的 manifest.json**。
+
+传输保留各 rank 的 `rank_<r>_npu_time_parsed.csv` **完整原始字节**，包括全部核、WAIT、
+整数 cycle、wave/tile/expert、RDMA 和网关元数据；不裁时间、不抽样、不根据界面的 WAIT 隐藏设置删事件。
+整个包先 XZ 无损压缩，再 Base64 编码和分片。导出会检查 CSV 的核覆盖、列数和任务计数，
+拒绝明显截断的文件。输出块数取决于实际数据，不保证完整流水只需一块。
+
+标准结果目录下的 `case.json`、`run.json`、所选 rank 的 `manifest.json` 和 `resources.json`
+会一起打包。额外的性能结果可显式附带，例如：
+
+```bash
+python3 experiments/megamoe/scripts/trace_text.py export /实际结果目录/bs_32/timer \
+  --output-dir /tmp/trace-share-with-perf \
+  --attach /对应perf结果目录/rank_0/bs_32/profiling.json
+```
+
+默认不收集 `launch.json`、环境变量或其他日志。两个节点分别生成独立包，不要把不同节点、不同导出或
+不同次运行的分片合并为同一个包；label、rank 列表和运行 manifest 用于识别各自的采样。
+只会传输实际采集的卡，导出不能补出未打点的 rank。
+
+接收端把复制的文本存入 UTF-8 文件：可以每块一个文件，也可以在同一个文件中连续粘贴多个完整块。
+可以乱序；重复粘贴内容完全相同的块不会影响恢复。检查和恢复示例：
+
+```bash
+# 检查已收到多少块、缺哪些编号；不写恢复文件。
+python3 experiments/megamoe/scripts/trace_text.py inspect copied-messages.txt
+
+# 校验全部分片、整包和每个原文件后，恢复到一个新目录。
+python3 experiments/megamoe/scripts/trace_text.py restore copied-messages.txt \
+  --output-dir restored-trace-node0
+
+# 也可传多个文本文件，或用单独的 "-" 从 stdin 读取。
+python3 experiments/megamoe/scripts/trace_text.py restore part1.txt part2.txt \
+  --output-dir another-restored-trace
+```
+
+缺块、冲突重复、Base64 损坏、SHA-256 不符或混包时会明确报错。CRLF 和 Base64 的普通空白/换行变化可接受，
+不会尝试猜测修复其他字符。恢复目录必须尚不存在，已有文件不会被覆盖。
+恢复后 `timer/` 中包含逐字节一致的 CSV，并自动生成保留 WAIT 的单 rank/合并 JSON、
+`startup_breakdown.csv` 和阶段拆分；使用 `restore --no-render` 可只恢复文件。
+附带配置位于 `context/`，显式附带文件位于 `attachments/`。
+**跨 rank 的时间仍各自归零，不能据此把两张卡的坐标差当作机间延迟。**
+
+已安装新版 Python 包时，也可通过
+`python -I -m deep_ep_experimental.megamoe.timer.text_transfer` 使用相同子命令。
+
 ### 两机各16卡：MTE＋RoCE Decode
 
 通信模式由已有的 `ranks_per_node` 决定，没有新增公开 `transport` 参数：

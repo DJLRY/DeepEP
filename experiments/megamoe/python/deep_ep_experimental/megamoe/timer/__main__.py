@@ -38,7 +38,7 @@ def parse_ranks(value):
     return result
 
 
-def main():
+def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("directory", type=Path, help="One case's timer directory")
     parser.add_argument("--ranks", type=parse_ranks, default=parse_ranks("0-7"))
@@ -50,7 +50,7 @@ def main():
         default="rank",
         help="sync is an approximate barrier-anchor alignment, NOT absolute time",
     )
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     events = {}
     for rank in args.ranks:
         stem = args.directory / f"rank_{rank}_npu_time"
@@ -58,7 +58,10 @@ def main():
         if not raw.exists():
             raw = stem.with_suffix(".csv")
         parsed = args.directory / f"{stem.name}_parsed.csv"
-        decode(raw, parsed)
+        if raw.exists():
+            decode(raw, parsed)
+        elif not parsed.exists():
+            raise FileNotFoundError(f"No raw timer or parsed CSV for rank {rank} under {args.directory}")
         events[rank] = raw_events_for_rank(parsed, rank)
         if not events[rank]:
             raise ValueError(f"rank={rank}: empty trace; check timer-enabled build and collection")
