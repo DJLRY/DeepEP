@@ -328,7 +328,11 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     ExpertTokenPosition dispatch{};
     uint32_t dispatchGroups = 0U;
     uint64_t dispatchWave = 0U;
-    while (hasActivation || hasCombine || !shared.done || dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
+    const bool ownsRemoteCombine =
+        UseHierarchicalRoce(params_.tilingData) && this->aivJob_.jobIndex == HierarchicalSendJob();
+    bool remoteCombinePending = false;
+    while (hasActivation || hasCombine || !shared.done || dispatch.expertIdx < commonConfig_.moeExpertPerRank ||
+           remoteCombinePending) {
         if (hasActivation && TryRunReadyActivation(activation, readySequence)) {
             activation.nextTile += gmmExecutionConfig_.blockJob.totalJobs;
             if (activation.nextTile >= activation.tileCount) {
@@ -347,9 +351,18 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         if (!shared.done && TryRunSharedExpertActivation(shared)) {
             continue;
         }
+        if (remoteCombinePending) {
+            // 就绪的激活先执行，再兑现上次本地 Combine 的推进机会；不能被下一次 Combine 覆盖。
+            // 循环条件包含 pending，最后一个本地 slice 完成后也不会漏掉这次推进。
+            remoteCombinePending = false;
+            this->TryProgressRemoteCombine();
+            continue;
+        }
         if (hasCombine && TryRunReadyCombine(combine)) {
             hasCombine = NextAivSlice(combine, false);
-            this->TryProgressRemoteCombine();
+            // 本地搬运期间可能有新的 GMM1 tile 就绪。回到唯一的激活消费入口，
+            // 连同 readySequence 和 tile/slice 游标一起推进，再启动远端初始化或扫描。
+            remoteCombinePending = ownsRemoteCombine;
             continue;
         }
         if (this->TryProgressRemoteCombine()) {

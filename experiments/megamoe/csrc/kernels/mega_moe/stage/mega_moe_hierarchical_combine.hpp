@@ -28,7 +28,7 @@ struct HierarchicalCombineProgress {
 };
 
 // The default retains a full sweep for callers with infrequent progress points.
-// A8W4 supplies separate budgets for its priority scheduler and prologue owner.
+// A8W4 supplies a bounded budget for its designated communication owner.
 struct HierarchicalCombineProgressBudget {
     uint32_t maxPosts = 0xffffffffU;
     uint32_t maxScannedRows = 0xffffffffU;
@@ -62,8 +62,7 @@ __aicore__ inline void InitializeHierarchicalCombineProgress(const MoeStageCommo
     // using the owner's reserved 256B UB; the last word is a marker, not an ID.
     // This runs only before the first Combine Post, after Dispatch is drained.
     const uint32_t rowCount = common.tokenNum * common.topK;
-    for (uint32_t packet = 0U, firstRow = 0U; firstRow < rowCount;
-         ++packet, firstRow += RAIL_PACKET_DATA_WORDS) {
+    for (uint32_t packet = 0U, firstRow = 0U; firstRow < rowCount; ++packet, firstRow += RAIL_PACKET_DATA_WORDS) {
         const uint32_t remaining = rowCount - firstRow;
         const uint32_t validPacket = remaining < RAIL_PACKET_DATA_WORDS ? remaining : RAIL_PACKET_DATA_WORDS;
         for (uint32_t firstWord = 0U; firstWord < validPacket; firstWord += scratchWords) {
@@ -224,6 +223,11 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
         }
         if (cursor.row == rowCount) {
             cursor.Wrap(progress);
+        }
+        // Preserve the terminating-hole advance and wrap, then stop once this
+        // Put has submitted the last pending row; no remaining slot can help.
+        if (progress.sentRows == progress.expectedRows) {
+            break;
         }
     }
     progress.nextRow = cursor.row;

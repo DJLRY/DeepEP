@@ -29,7 +29,7 @@ namespace AscendTimer {
 enum class RdmaPhase { Combine };
 enum FixedTiming { AIV_COMBINE_INIT };
 enum DynamicTimingType { AIV_COMBINE_PROGRESS, AIV_COMBINE_DRAIN };
-}
+}  // namespace AscendTimer
 
 // The timer itself has a separate production-header test. This double checks
 // that the production scheduler brackets scans/Put and reports actual counters.
@@ -62,7 +62,9 @@ public:
 class AscendTimerCombineProgressScope {
 public:
     AscendTimerCombineProgressScope(AscendTimerDevice* timer, AscendTimer::DynamicTimingType type)
-        : timer_(timer), type_(type) {}
+        : timer_(timer), type_(type)
+    {
+    }
     void StartScan()
     {
         if (timer_ != nullptr) {
@@ -178,7 +180,10 @@ public:
         s.overwriteOrdered = false;
         return data_[index];
     }
-    T* Data() const { return data_; }
+    T* Data() const
+    {
+        return data_;
+    }
 
 private:
     T* data_ = nullptr;
@@ -188,14 +193,20 @@ private:
 template <typename T>
 class GlobalTensor {
 public:
-    void SetGlobalBuffer(T* address) { data_ = address; }
+    void SetGlobalBuffer(T* address)
+    {
+        data_ = address;
+    }
     GlobalTensor operator[](uint32_t offset) const
     {
         GlobalTensor result;
         result.data_ = data_ + offset;
         return result;
     }
-    T* Data() const { return data_; }
+    T* Data() const
+    {
+        return data_;
+    }
 
 private:
     T* data_ = nullptr;
@@ -267,9 +278,18 @@ struct Params {
         uint8_t* gatewayCombinePtr = nullptr;
     } peermemInfo;
 };
-inline uint32_t HierarchicalHost(uint32_t rank) { return rank / HIERARCHICAL_RANKS_PER_HOST; }
-inline uint32_t HierarchicalGateway(uint32_t rank) { return rank ^ HIERARCHICAL_RANKS_PER_HOST; }
-inline bool UseHierarchicalRoce(const MegaMoeTilingData* tiling) { return tiling->hierarchical; }
+inline uint32_t HierarchicalHost(uint32_t rank)
+{
+    return rank / HIERARCHICAL_RANKS_PER_HOST;
+}
+inline uint32_t HierarchicalGateway(uint32_t rank)
+{
+    return rank ^ HIERARCHICAL_RANKS_PER_HOST;
+}
+inline bool UseHierarchicalRoce(const MegaMoeTilingData* tiling)
+{
+    return tiling->hierarchical;
+}
 inline uint64_t CalcRailTopkIdsSlotBytes(const MegaMoeTilingData* tiling)
 {
     const auto rows = tiling->numMaxTokensPerRank * tiling->topK;
@@ -405,13 +425,12 @@ public:
             if (pattern == "last") {
                 remoteContribution = row + 1U == s.rows;
             }
-            const uint32_t expert = remoteContribution ? localBase + (pattern == "duplicate" ? 7U : row % 511U)
-                                                       : otherBase + row % 511U;
-            ids[row] = pattern == "holes" || (pattern == "mixed" && row % 11U == 3U)
-                           ? -1
-                           : static_cast<int32_t>(expert);
-            s.expected[row] = ids[row] >= 0 && static_cast<uint32_t>(ids[row]) / expertsPerHost ==
-                                                       HierarchicalHost(common.rankId);
+            const uint32_t expert =
+                remoteContribution ? localBase + (pattern == "duplicate" ? 7U : row % 511U) : otherBase + row % 511U;
+            ids[row] =
+                pattern == "holes" || (pattern == "mixed" && row % 11U == 3U) ? -1 : static_cast<int32_t>(expert);
+            s.expected[row] =
+                ids[row] >= 0 && static_cast<uint32_t>(ids[row]) / expertsPerHost == HierarchicalHost(common.rankId);
             paired[row / 127U * 128U + row % 127U] = ids[row];
         }
     }
@@ -421,6 +440,17 @@ public:
         Check(progress.initialized, "initializer did not finish");
         Check(progress.expectedRows == Expected(), "metadata route count differs from independent route set");
         Check(s.pendingDma == nullptr, "initializer left metadata DMA in flight");
+    }
+    void RouteRows(const std::vector<uint32_t>& rows)
+    {
+        Routes("holes");
+        auto* paired = const_cast<int32_t*>(s.pairedRail);
+        for (uint32_t row : rows) {
+            Check(row < s.rows, "test attempted to route nonexistent row");
+            ids[row] = static_cast<int32_t>(HierarchicalHost(common.rankId) * 16U * common.moeExpertPerRank);
+            s.expected[row] = true;
+            paired[row / 127U * 128U + row % 127U] = ids[row];
+        }
     }
     uint32_t Expected() const
     {
@@ -437,7 +467,8 @@ public:
         const auto beforeReads = s.flagReads;
         const auto beforeFlags = s.flags;
         const auto beforeRow = progress.nextRow;
-        const bool made = TryProgressHierarchicalCombine(common, params, progress, s.ub.data(), nullptr, {posts, scans});
+        const bool made =
+            TryProgressHierarchicalCombine(common, params, progress, s.ub.data(), nullptr, {posts, scans});
         const auto afterPosts = s.posts.size() - beforePosts;
         Check(made == (afterPosts != 0U), "progress result did not describe actual submission");
         Check(afterPosts <= posts && s.flagReads - beforeReads <= scans, "progress exceeded its operation budget");
@@ -741,9 +772,17 @@ void OracleStep(Fixture& f, uint32_t maxPosts, uint32_t maxScans)
             }
         }
     }
-    uint32_t scanned = static_cast<uint32_t>(visits.size());
-    if (maxPosts != 0U && runs.size() >= maxPosts) {
+    if (runs.size() > maxPosts) {
         runs.resize(maxPosts);
+    }
+    uint32_t sent = 0U;
+    for (const auto& run : runs) {
+        sent += run.count;
+    }
+    uint32_t scanned = static_cast<uint32_t>(visits.size());
+    // Stop at the last accepted run if the POST budget or all outstanding
+    // route coordinates are covered. Otherwise every bounded visit is needed.
+    if (!runs.empty() && (runs.size() == maxPosts || sent == pendingBefore)) {
         const auto& last = runs.back();
         scanned = last.visitEnd;
         // A false slot that terminates a run is consumed once. The physical
@@ -763,12 +802,10 @@ void OracleStep(Fixture& f, uint32_t maxPosts, uint32_t maxScans)
         TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {maxPosts, maxScans});
     Check(made == !runs.empty() && f.s.posts.size() - beforePosts == runs.size(),
           "POST count differs from contiguous-coordinate oracle");
-    uint32_t sent = 0U;
     for (uint32_t i = 0U; i < runs.size(); ++i) {
         const auto& actual = f.s.posts[beforePosts + i];
         Check(actual.firstRow == runs[i].first && actual.rowCount == runs[i].count,
               "POST order/coalescing differs from contiguous-coordinate oracle");
-        sent += runs[i].count;
     }
     Check(f.s.probeOrder.size() - beforeProbes == probes.size() &&
               std::equal(probes.begin(), probes.end(), f.s.probeOrder.begin() + beforeProbes),
@@ -792,6 +829,83 @@ void OracleStep(Fixture& f, uint32_t maxPosts, uint32_t maxScans)
     }
 }
 
+void CompleteInCall()
+{
+    struct Case {
+        uint32_t tokens;
+        uint32_t topk;
+        uint32_t first;
+        std::vector<uint32_t> rows;
+        uint32_t posts;
+        uint32_t scanned;
+        uint32_t next;
+    };
+    const std::vector<Case> cases = {
+        {32U, 8U, 0U, {0U}, 1U, 2U, 2U},
+        {32U, 8U, 252U, {0U, 1U}, 1U, 7U, 3U},
+        {32U, 8U, 250U, {255U}, 1U, 6U, 0U},
+        {32U, 8U, 6U, {6U, 7U, 8U}, 1U, 4U, 10U},
+        {32U, 8U, 254U, {255U, 0U, 1U}, 2U, 5U, 3U},
+        {32U, 31U, 30U, {30U, 31U}, 1U, 3U, 33U},
+        {4U, 32U, 31U, {31U, 32U, 33U}, 1U, 4U, 35U},
+        {1U, 1U, 0U, {0U}, 1U, 1U, 0U},
+    };
+    for (const auto& c : cases) {
+        Fixture f(c.tokens, c.topk, 16U);
+        f.RouteRows(c.rows);
+        ReleaseAll();
+        AscendTimerDevice timer;
+        // Even immediately ready sparse routes must not initialize or submit
+        // anything when either budget is zero.
+        Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {0U, 64U}) &&
+                  !TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {2U, 0U}),
+              "zero budget submitted sparse routes");
+        Check(!f.progress.initialized && f.s.copies.empty() && f.s.posts.empty() && f.s.flagReads == 0U &&
+                  timer.initializations == 0U && timer.records.empty() && timer.scanStarts == 0U,
+              "zero budget touched progress state");
+        f.progress.nextRow = c.first;
+        Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {2U, 64U}),
+              "sparse completion failed to submit ready routes");
+        Check(f.progress.sentRows == c.rows.size() && f.progress.sentRows == f.progress.expectedRows &&
+                  f.progress.nextRow == c.next && f.s.posts.size() == c.posts && f.s.probeOrder == c.rows,
+              "sparse completion lost routes, cursor position, or probe order");
+        Check(timer.records.size() == 1U && timer.records[0].before == c.rows.size() && timer.records[0].after == 0U &&
+                  timer.records[0].posts == c.posts && timer.records[0].scanned == c.scanned &&
+                  timer.scanStarts == c.posts + 1U && timer.scanStops == timer.scanStarts && !timer.scanActive,
+              "last Put did not stop scans at its terminating hole or tensor end");
+        Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {2U, 64U}) &&
+                  timer.records.size() == 1U && f.s.probeOrder == c.rows,
+              "completed sparse routes were scanned again");
+        f.CheckPayload();
+    }
+
+    // An unfinished call still scans all 64 slots when its sole ready run is
+    // early, and still stops at two Posts when more runs are ready.
+    Fixture unfinished(32U, 8U);
+    unfinished.RouteRows({0U, 200U});
+    unfinished.Init();
+    ReleaseAll();
+    OracleStep(unfinished, 2U, 64U);
+    Check(unfinished.progress.sentRows == 1U && unfinished.progress.nextRow == 64U && unfinished.s.posts.size() == 1U,
+          "unfinished progress stopped before its row budget");
+    for (uint32_t call = 0U; call < 3U; ++call) {
+        OracleStep(unfinished, 2U, 64U);
+    }
+    unfinished.CheckPayload();
+
+    Fixture capped(32U, 8U);
+    capped.RouteRows({0U, 2U, 4U});
+    capped.Init();
+    ReleaseAll();
+    OracleStep(capped, 2U, 64U);
+    Check(capped.progress.sentRows == 2U && capped.progress.nextRow == 4U && capped.s.posts.size() == 2U,
+          "completion optimization exceeded the two-Post budget");
+    OracleStep(capped, 2U, 64U);
+    Check(capped.progress.sentRows == 3U && capped.progress.nextRow == 6U && capped.s.posts.size() == 3U,
+          "resumed final run did not stop after its terminating hole");
+    capped.CheckPayload();
+}
+
 void CursorOracle()
 {
     std::mt19937 random(20261020U);
@@ -810,8 +924,8 @@ void CursorOracle()
                             f.Publish(row, f.s.sequence);
                         }
                     }
-                    const std::array<uint32_t, 11> scans = {
-                        0U, 1U, 2U, topk, topk + 1U, 47U, 48U, 49U, 63U, 64U, 0xffffffffU};
+                    const std::array<uint32_t, 11> scans = {0U,  1U,  2U,  topk, topk + 1U,  47U,
+                                                            48U, 49U, 63U, 64U,  0xffffffffU};
                     OracleStep(f, random() % 6U, scans[random() % scans.size()]);
                 }
                 ReleaseAll();
@@ -846,18 +960,32 @@ int main(int argc, char** argv)
     try {
         Check(argc == 2, "expected one test scenario");
         const std::string scenario = argv[1];
-        if (scenario == "routing") Routing();
-        else if (scenario == "late-ready") LateReady();
-        else if (scenario == "fairness") Fairness();
-        else if (scenario == "budgets") Budgets();
-        else if (scenario == "epochs") Epochs();
-        else if (scenario == "completed") Completed();
-        else if (scenario == "metadata") Metadata();
-        else if (scenario == "drain") Drain();
-        else if (scenario == "topology") Topology();
-        else if (scenario == "telemetry") Telemetry();
-        else if (scenario == "cursor-oracle") CursorOracle();
-        else throw std::runtime_error("unknown test scenario");
+        if (scenario == "routing")
+            Routing();
+        else if (scenario == "late-ready")
+            LateReady();
+        else if (scenario == "fairness")
+            Fairness();
+        else if (scenario == "budgets")
+            Budgets();
+        else if (scenario == "epochs")
+            Epochs();
+        else if (scenario == "completed")
+            Completed();
+        else if (scenario == "complete-in-call")
+            CompleteInCall();
+        else if (scenario == "metadata")
+            Metadata();
+        else if (scenario == "drain")
+            Drain();
+        else if (scenario == "topology")
+            Topology();
+        else if (scenario == "telemetry")
+            Telemetry();
+        else if (scenario == "cursor-oracle")
+            CursorOracle();
+        else
+            throw std::runtime_error("unknown test scenario");
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

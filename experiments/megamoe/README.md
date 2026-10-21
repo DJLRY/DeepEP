@@ -458,11 +458,16 @@ gateway 检查调用由448次降为16次；这些是依赖检查调用数，未�
 A8W4 的跨机 Combine 在 AIV1 的计算间隙分批推进：两台机器均每次最多提交2个 Put、
 扫描64个 `[token, top-k]` 槽位。扫描游标跨调用保留，已发送槽位不再读取 ready flag；
 全部发送后立即返回。推进穿插于 AIV1 的 activation、dispatch 和本地 Combine 工作，
+本地 Combine 完成后先回到激活优先入口，消费此时已经就绪的 routed/shared activation；
+保留一次待执行的远端推进，在下一次本地 Combine 前执行，最后一个 slice 也不会漏掉。
+仅 RoCE 发送 owner 保留此待办；激活的 ready sequence 和 tile/slice 游标仍由同一入口推进。
+连续就绪的激活可以推迟这次推进，计数预算和优先级均不提供固定时间上限。
 最终 host barrier 后完整 drain，再执行 payload quiet、commit、commit quiet 和对端 commit 等待。
 单次 Put 内部仍可能因队列回压等待，这些计数预算并非硬性时间上限。
 扫描在单次调用内缓存当前 token 的 pending mask，通过递增槽位推进，避免逐行除模；
 连续发送段在 Put 返回后按 token 清除对应位。扫描仍逐槽计数，保留洞、游标绕回、
-预算截断和相邻行合并的原有语义，不减少推进机会。
+预算截断和相邻行合并的原有语义；最后一次 Put 提交完全部待发行后立即结束本次扫描，
+不再为用满预算遍历剩余空槽。完成判定只表示全部行已提交，传输完成仍由后续 quiet 保证。
 
 Combine 路由首次初始化使用 owner 专用256 B UB 分块 DMA 读取已接收的 rail 元数据；
 BS32、K8 时为5次256 B DMA，跳过每个512 B packet 的末尾 marker。

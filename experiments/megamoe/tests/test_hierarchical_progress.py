@@ -45,6 +45,7 @@ def hierarchical_progress_binary(tmp_path_factory):
         "budgets",
         "epochs",
         "completed",
+        "complete-in-call",
         "metadata",
         "drain",
         "topology",
