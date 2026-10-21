@@ -664,6 +664,66 @@ python -m deep_ep_experimental.megamoe.timer /实际结果目录/bs_96/bs_96/tim
 
 所有 BS 执行成功后，终端输出 `[DONE] all nodes completed`；执行或报告校验失败时返回非零退出码。
 
+### 融合 GMM1 → GMM2 的独立性能测试（当前 BS32 场景）
+
+[`scripts/bench_gmm_chain.py`](scripts/bench_gmm_chain.py) 在单张 Ascend950 上测试：
+`npu_grouped_matmul_swiglu_quant_v2`（GMM1 + SwiGLU + MX 量化）→ `npu_grouped_matmul`（GMM2）。
+GMM2 直接消费融合算子产出的 FP8 激活及 E8M0 scale；权重为 MXFP4、NZ 格式，最终输出 BF16。
+接口按官方 [融合算子 MxA8W4 示例](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_grouped_matmul_swiglu_quant_v2.md)
+及 [GMM mx 伪量化示例](https://github.com/Ascend/op-plugin/blob/master/docs/zh/custom_APIs/torch_npu/torch_npu-npu_grouped_matmul.md) 接入。
+需要支持这些接口和数据类型的 CANN、PyTorch/torch_npu 环境；缺失时直接报错，结果中保留实际版本和算子 schema。
+
+默认复现 EP32、每个源 rank BS32、H3584、I1280、E384、TopK8、S0、balanced 路由，seed=20260922。
+复用现有 benchmark 的输入、路由、原始权重和 MXFP8 输入量化，按专家分组重建 Dispatch 的逻辑输出。
+每卡12个专家，**实际 GMM 总行数 M=256**，各专家行数为 `[22,22,22,22,21,21,21,21,21,21,21,21]`。
+GMM1 的 K/N 为3584/2560，GMM2 为1280/3584。`--bs` 是每个源 rank 的 token 数，不能直接当作 GMM 的 M。
+
+在仓库根目录、已激活的 CANN/torch_npu 环境中直接运行，无需重编 DeepEP、初始化 SHMEM 或启动 torchrun：
+
+```bash
+# CPU 预览实际路由和矩阵形状，不导入 Torch，不生成权重。
+python experiments/megamoe/scripts/bench_gmm_chain.py --dry-run
+
+# 单卡测量，默认20轮预热、100轮正式采样。
+python experiments/megamoe/scripts/bench_gmm_chain.py --device 0
+
+# 可选：NPUGraph replay，减少 Python 下发造成的空隙；结果单独标记 graph。
+python experiments/megamoe/scripts/bench_gmm_chain.py --device 0 --mode graph
+
+# 复现逻辑 rank30 的输入和权重，仍只需一张物理卡。
+python experiments/megamoe/scripts/bench_gmm_chain.py --device 0 --rank 30 --iters 200
+```
+
+`--device` 选择进程可见的 NPU，`--rank` 选择逻辑专家归属，两者互不绑定。
+可通过 `--ep-size/--bs/--hidden/--intermediate/--experts/--topk/--routing/--seed` 调整场景。
+此脚本只测路由专家，S固定为0。测试期间应让所选设备空闲。
+
+每次创建独立的 `benchmark-runs/gmm-chain/rank_<r>_<随机编号>/`，可通过 `--output` 更改父目录。
+其中 `results.json` 保存场景、精度报告、输入/权重摘要、软件版本、全部采样及汇总；
+`summary.txt` 是可读摘要，`profiler/` 保留原始 trace 和 `kernel_details*.csv`。
+按现有性能测试口径取正式采样的后半段（奇数向上取整），每项报告 mean/median/min/max，单位均为微秒：
+
+| 指标 | 范围 |
+| --- | --- |
+| `fused_gmm1_us` | 融合 GMM1 + SwiGLU + MX 量化的 kernel Duration |
+| `gmm2_us` | GMM2 的 kernel Duration |
+| `kernel_sum_us` | 同一轮两个 kernel Duration 之和 |
+| `chain_span_us` | 从融合 kernel 开始到 GMM2 kernel 结束，包含两者间隙 |
+| `inter_kernel_gap_us` | 两个 kernel 之间的空隙，eager 模式下可能受 CPU 下发影响 |
+
+两个算子之间及正式轮次之间不插入 synchronize、Event、CPU 拷贝或额外量化。
+统计要求每轮恰好两个匹配的 kernel、处于同一设备同一 stream；发现额外 kernel、重复导出、缺失样本或时序异常会报错，保留原始数据供排查。
+若所用版本把一个算子展开为多个 kernel，需要根据该版本的 trace 调整归属解析后再统计。
+
+默认在计时前按每个非空专家抽取最多2行，与现有 NumPy `expert_forward` 比较；
+使用现有混合误差阈值并报告相对 RMSE。该参考包含 BF16 中间舍入，不是融合算子逐位仿真，
+不通过时停止性能采样。`--check-rows-per-expert` 可提高覆盖，设为0显式跳过数值参考（仍检查输出形状、类型和有限值），
+跳过结果会标为 `explicitly_skipped`，不能视作精度已验证。Graph 模式还会在计时前检查 replay 与 eager 输出一致。
+
+计时排除 Dispatch、Combine、路由权重乘法、输入量化、权重转换和 CPU 校验。
+这里得到的是单卡计算链基线，不是32卡同时运行的统计；与已有 Dispatch/Combine 数据相加可作分段估算，
+实际端到端 MoE 耗时仍需用一致的数据、执行模式和计时范围另行测量。
+
 ## 4. 测试与验证范围
 
 ```bash
