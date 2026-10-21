@@ -77,7 +77,7 @@ void check_hybrid(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch, u
     assert(CalcSendMaskExpertCapacity(&t, 46) >= 16 * t.moeExpertPerRank);
 
     // Switching actual BS must leave persistent regions at identical addresses.
-    for (uint32_t bs : {1U, 17U, 31U, 32U, 1U, 32U}) {
+    for (uint32_t bs : {1U, 7U, 17U, 31U, 32U, 1U, 32U}) {
         if (bs > capacity) continue;
         t.bs = bs;
         assert(UseDecodeRailRouting(&t));
@@ -89,6 +89,11 @@ void check_hybrid(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch, u
         assert(next.relayPayloadPtr == hybrid.relayPayloadPtr);
         assert(next.gatewayCombineReadyPtr == hybrid.gatewayCombineReadyPtr);
         assert(next.hierarchicalControlPtr == hybrid.hierarchicalControlPtr);
+        // Dispatch sends actual rows, while the persistent window reserves the
+        // declared capacity. Both the GM source and relay destination must fit.
+        const auto payloadBytes = static_cast<int64_t>(bs) * CalcQuantTokenScaleBytes(h, 1, topk, false);
+        assert(next.quantTokenScalePtr + payloadBytes <= next.combineSendPtr);
+        assert(next.relayPayloadPtr + payloadBytes <= next.gatewayCombinePtr);
     }
 
     if (capacity == 32 && topk == 32) {

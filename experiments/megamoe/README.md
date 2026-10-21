@@ -429,6 +429,17 @@ python3 experiments/megamoe/scripts/trace_text.py restore part1.txt part2.txt \
 FP8 和内部量化的 BF16 输入均沿用原接口，容量可大于实际 B。B>32 及更多16卡主机暂不支持。
 A8W8 当前只运行路由专家，`num_shared_experts` 必须为0，不能传入 timer。
 
+跨机输入 payload 在本卡全部 token/scale 准备完成后，按实际 B 一次 Put 到配对 gateway，
+不再扫描路由并拆成多个连续 token 段；B 小于预分配容量时只发送实际 B 行。
+接收区保留原 token 编号，专家仍按路由元数据读取，多传的行不会增加计算。
+该策略用于上述 B≤32 的 A8W4/A8W8 路径，包括没有远端路由的批次。
+元数据仍先完成并发布通知；payload 完成等待仍延后到 owner 的 reset/shared-input 工作之后，
+保留 quiet、commit、commit quiet 和对端 commit 等待顺序。
+H=3584、B=32 时 payload 为118784 B；相较已测 EP32/K8 balanced 样本的8次7424 B提交，
+该策略以每 rank 额外59392 B流量换取一次提交和更少的发送端扫描工作。
+性能验证应同时检查 payload POST 次数、quiet、输入准备结束及首 GMM 时间，
+并以关闭打点的 `rank-max-mean` 判断整体收益，不能仅由 POST 次数推断加速比例。
+
 跨机输入的 gateway 依赖按 AIV1 block 分工：各核从同一份有效 count 表得到本 rank
 实际需要的来源；唯一检查者确认对应 gateway 就绪后，向本卡独立的512 B槽发布当前 epoch，
 所有消费者等到所需本卡槽就绪后才发布 count-ready。各检查者先完成自己的检查和发布，
@@ -459,8 +470,8 @@ Combine 路由首次初始化使用 owner 专用256 B UB 分块 DMA 读取已接
 BS32、K8 时为5次256 B DMA，跳过每个512 B packet 的末尾 marker。
 该初始化优化也适用于 A8W8，其现有通信 owner 和每次完整扫描策略保持不变。
 更新后两台均需重新构建安装；按上述 BS32 流程先执行 `run` 校验精度，再执行
-`perf` 比较 `rank-max-mean`，并用配对 rank0/16 的 `trace --include-wait`
-检查计算尾部、Combine POST 分布和最终 quiet/commit 等待。CPU 回归不能替代这些设备检查。
+`perf` 比较 `rank-max-mean`，并固定 `trace --timer-ranks 0,14,16,30 --include-wait`
+检查输入 payload、计算尾部、Combine POST 分布和 quiet/commit 等待。CPU 回归不能替代这些设备检查。
 
 两机 RoCE runtime 的 `barrier()` 和 `destroy()` 先同步本卡全部 stream，再通过现有
 StoreGroup（TCPStore）或 ProcessGroup 交换完成状态；全部 rank 成功后才允许清理 SHMEM。

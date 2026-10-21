@@ -27,11 +27,10 @@ __aicore__ inline void WaitHierarchicalLocalSignal(const Params& params, Hierarc
 }
 
 // Local packing preserves the existing rail format. RDMA reads its stable GM
-// copy, never the packer's reusable UB. Each selected token keeps its original
-// row index at the gateway; holes require neither packing nor a remapping table.
+// copy, never the packer's reusable UB. Payload rows retain their original token
+// indices at the gateway; route metadata determines which rows consumers read.
 __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& common, const Params& params,
-                                                const SendMaskConfig& config, SendMaskScratch& scratch,
-                                                AscendTimerDevice* timer = nullptr)
+                                                const SendMaskConfig& config, AscendTimerDevice* timer = nullptr)
 {
     const uint32_t myHost = HierarchicalHost(common.rankId);
     const uint32_t gateway = HierarchicalGateway(common.rankId);
@@ -48,43 +47,16 @@ __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& comm
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence)), gateway,
         roceScratch, timer, AscendTimer::RdmaPhase::DispatchMeta);
 
-    GlobalTensor<int32_t> rail;
-    rail.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(packedRail));
-    uint32_t remoteTokens = 0U;
-    const uint32_t expertsPerHost = HIERARCHICAL_RANKS_PER_HOST * common.moeExpertPerRank;
-    const uint32_t itemsPerBatch = static_cast<uint32_t>(RailItemsPerBatch(config.bufferConfig));
-    const uint32_t totalItems = common.tokenNum * common.topK;
-    for (uint32_t start = 0U, batch = 0U; start < totalItems; start += itemsPerBatch, ++batch) {
-        const uint32_t remaining = totalItems - start;
-        const uint32_t count = remaining < itemsPerBatch ? remaining : itemsPerBatch;
-        SyncFuncStatic<HardEvent::S_MTE2, SYNC_EVENT_ID2>();
-        LoadRailTopkIdsBatch(config, scratch, rail, static_cast<int32_t>(batch), static_cast<int32_t>(count));
-        SyncFuncStatic<HardEvent::MTE2_S, SYNC_EVENT_ID2>();
-        for (uint32_t item = 0U; item < count; ++item) {
-            const int32_t expert = scratch.topkIdsTensor.GetValue(item);
-            if (expert >= 0 && static_cast<uint32_t>(expert) / expertsPerHost != myHost) {
-                remoteTokens |= 1U << ((start + item) / common.topK);
-            }
-        }
-    }
+    // All local token/scale rows are ready before this stage. Decode is bounded
+    // to 32 tokens and both regions reserve the full batch, so one contiguous
+    // Put avoids route rescans and per-run posting overhead. Send actual B, not
+    // the persistent buffer capacity; unused remote rows have no consumers.
     const uint32_t rowBytes =
         static_cast<uint32_t>(CalcQuantTokenScaleBytes(common.tokenHiddenDim, 1U, common.topK, false));
-    uint32_t token = 0U;
-    while (token < common.tokenNum) {
-        if ((remoteTokens & (1U << token)) == 0U) {
-            ++token;
-            continue;
-        }
-        const uint32_t first = token++;
-        while (token < common.tokenNum && (remoteTokens & (1U << token)) != 0U) {
-            ++token;
-        }
-        const uint64_t offset = static_cast<uint64_t>(first) * rowBytes;
-        RocePutBytes(params.peermemInfo.relayPayloadPtr + offset, params.peermemInfo.quantTokenScalePtr + offset,
-                     (token - first) * rowBytes, gateway, roceScratch, timer, AscendTimer::RdmaPhase::DispatchPayload);
-    }
+    RocePutBytes(params.peermemInfo.relayPayloadPtr, params.peermemInfo.quantTokenScalePtr, common.tokenNum * rowBytes,
+                 gateway, roceScratch, timer, AscendTimer::RdmaPhase::DispatchPayload);
     // Completion is deliberately deferred until after this owner's reset/shared
-    // input work. Even a zero-payload batch sends the later completion epoch.
+    // input work. Batches with no remote routes still publish the completion epoch.
 }
 
 __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& job, const MoeStageCommonConfig& common,
@@ -104,7 +76,7 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
         return;
     }
     if (job.jobIndex == otherHost) {
-        PostHierarchicalDispatch(common, params, config, scratch, timer);
+        PostHierarchicalDispatch(common, params, config, timer);
         return;
     }
     if (job.jobIndex >= job.totalJobs || job.totalJobs <= 2U) {

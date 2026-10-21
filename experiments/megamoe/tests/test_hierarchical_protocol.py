@@ -62,10 +62,8 @@ def input_records(bs, seed):
 
 
 def hierarchical_dispatch(ids, records):
-    """Deduplicate payload messages by original source/token/destination host."""
-    transfer_keys = {
-        (source, token, host(owner)) for (source, token, _), owner, _ in routes(ids) if host(owner) != host(source)
-    }
+    """Stage every actual token once; original routes alone select consumers."""
+    transfer_keys = {(source, token, 1 - host(source)) for source in range(WORLD) for token in range(ids.shape[1])}
     relayed = {(pair(source), token): records[source, token] for source, token, _ in transfer_keys}
     consumers = {}
     for key, owner, expert in routes(ids):
@@ -175,14 +173,17 @@ def test_hierarchical_messages_match_direct_routing(bs, topk, pattern):
     transfers, consumers = hierarchical_dispatch(ids, records)
     direct = {(owner, expert, key): records[key[:2]] for key, owner, expert in routes(ids)}
     assert consumers == direct
-    expected_tokens = {
-        (source, token, 1 - host(source))
-        for source in range(WORLD)
-        for token in range(bs)
-        if any(host(int(expert) // EXPERTS_PER_RANK) != host(source) for expert in ids[source, token])
-    }
+    expected_tokens = {(source, token, 1 - host(source)) for source in range(WORLD) for token in range(bs)}
     assert transfers == expected_tokens
-    assert len(transfers) <= WORLD * bs
+    assert len(transfers) == WORLD * bs
+    # Extra staging rows must not create extra expert invocations. In particular,
+    # all-local routing still transfers payload but has no cross-host consumer.
+    remote_consumers = {key for key in consumers if host(key[0]) != host(key[2][0])}
+    assert remote_consumers == {
+        (owner, expert, key) for key, owner, expert in routes(ids) if host(owner) != host(key[0])
+    }
+    if pattern == "local":
+        assert not remote_consumers
     if pattern == "duplicate-rank":
         assert len(transfers) == WORLD * bs
         assert all(len(set(token_ids // EXPERTS_PER_RANK)) == 1 for token_ids in ids.reshape(-1, topk))
@@ -238,16 +239,18 @@ def test_late_rows_do_not_block_ready_runs_or_merge_over_holes():
 
 
 def test_token_31_and_topk_31_preserve_dispatch_and_combine_payloads():
-    # Only the last route crosses hosts. The independent route model must retain
-    # its source/token identity; the production path represents these two
-    # coordinates with the high bits of separate uint32 masks.
+    # Only the final token's final top-k slot crosses hosts. Dispatch and Combine
+    # must preserve its source/token/slot identity at both supported boundaries.
     ids = routing(32, 32, "local")
     for source in range(WORLD):
         ids[source, 31, 31] = pair(source) * EXPERTS_PER_RANK + 31
     records = input_records(32, seed=3131)
     transfers, consumers = hierarchical_dispatch(ids, records)
-    assert transfers == {(source, 31, 1 - host(source)) for source in range(WORLD)}
+    assert transfers == {(source, token, 1 - host(source)) for source in range(WORLD) for token in range(32)}
     assert consumers == {(owner, expert, key): records[key[:2]] for key, owner, expert in routes(ids)}
+    assert {key[2] for key in consumers if host(key[0]) != host(key[2][0])} == {
+        (source, 31, 31) for source in range(WORLD)
+    }
 
     model = CombineMessages(ids, sequence=3131)
     expected_remote = {(source, 31, 31) for source in range(WORLD)}
