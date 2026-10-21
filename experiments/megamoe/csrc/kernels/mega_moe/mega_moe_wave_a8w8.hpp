@@ -95,10 +95,10 @@ private:
     __aicore__ inline bool TryProgressRemoteCombine()
     {
         if constexpr (g_coreType == AIV) {
-            // Dispatch hands its fully drained QP to physical AIV1 after the
-            // public input barrier. A8W8's AIC can FIX across AIV0's full UB,
-            // whereas AIV1 has no FIX writer and safely owns the RDMA scratch.
-            if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == 1U) {
+            // Physical AIV1 owns QP1 throughout Dispatch and Combine. A8W8's
+            // AIC can FIX across AIV0's full UB; AIV1 has no FIX writer and
+            // safely owns the RDMA scratch.
+            if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
                 return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_,
                                                       HierarchicalRoceScratch(params_));
             }
@@ -1067,9 +1067,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         }
     }
     // FinishHierarchicalDispatch has quieted both payload and commit before this
-    // full-core barrier. A8W8 transfers QP1 ownership from the Dispatch owner
-    // (physical 0 or 1) to physical AIV1 on both hosts here; only AIV1 posts or
-    // consumes its CQ throughout Combine. A8W4 retains its original owner policy.
+    // full-core barrier. Physical AIV1 retains QP1 ownership through Combine
+    // on both hosts; only AIV1 posts or consumes its CQ.
     SyncAll<false>();  // AIC 等待 AIV 完成输入准备与 flag 清零后再进入计算
 
     ProcessGmmPipeline();
@@ -1081,7 +1080,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
             // Every routed producer and Dispatch reader on this host must finish
             // before a commit can allow the paired source to reuse its buffers.
             CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
-            if (aivJob_.jobIndex == 1U) {
+            if (aivJob_.jobIndex == HierarchicalSendJob()) {
                 auto* scratch = HierarchicalRoceScratch(params_);
                 DrainHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch);
                 RocePublishCommit(reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(

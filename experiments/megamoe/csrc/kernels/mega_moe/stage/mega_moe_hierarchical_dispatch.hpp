@@ -69,13 +69,13 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
     }
     const uint32_t myHost = HierarchicalHost(common.rankId);
     const uint32_t otherHost = 1U - myHost;
-    if (job.jobIndex == myHost) {
+    if (job.jobIndex == HierarchicalPackJob()) {
         PublishHierarchicalLocalSignal(params, HierarchicalSignal::Sequence);
-        SendTopkIdsToRailServer(common, winRankAddr, config, params, scratch, myHost);
+        SendTopkIdsToRailServer(common, winRankAddr, config, params, scratch, myHost, job.jobIndex);
         PublishHierarchicalLocalSignal(params, HierarchicalSignal::LocalRailPacked);
         return;
     }
-    if (job.jobIndex == otherHost) {
+    if (job.jobIndex == HierarchicalSendJob()) {
         PostHierarchicalDispatch(common, params, config, timer);
         return;
     }
@@ -114,7 +114,7 @@ __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, cons
     if constexpr (g_coreType == AIC) {
         return;
     }
-    if (job.jobIndex != HierarchicalSendJob(common.rankId)) {
+    if (job.jobIndex != HierarchicalSendJob()) {
         return;
     }
     const uint32_t gateway = HierarchicalGateway(common.rankId);

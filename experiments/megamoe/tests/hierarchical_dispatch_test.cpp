@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Lu Lu
 
 // Execute the production Dispatch, transport completion, and memory layout.
-// Only device primitives and the unused metadata pack/relay entry points are
+// Only device primitives and the metadata pack/relay entry points are
 // doubled. This validates byte ranges and protocol order, not NIC visibility.
 #include <algorithm>
 #include <array>
@@ -77,12 +77,21 @@ void SyncFuncStatic()
     AscendC::WaitFlag<Event>(Id);
 }
 
-// These complete the production header's type environment, but no scenario is
-// allowed to run a different job's packing, relay, or host barrier work.
-inline void SendTopkIdsToRailServer(const MoeStageCommonConfig&, GM_ADDR*, const SendMaskConfig&, const Params&,
-                                    SendMaskScratch&, uint32_t)
+// Rail bytes are prepared by the fixture; validate the actual packer's identity,
+// destination and publication order when production Dispatch invokes it.
+inline void SendTopkIdsToRailServer(const MoeStageCommonConfig& common, GM_ADDR*, const SendMaskConfig&,
+                                    const Params& params, SendMaskScratch&, uint32_t targetServerIdx, uint32_t jobIdx)
 {
-    throw std::runtime_error("sender unexpectedly ran metadata packing");
+    using namespace DispatchTest;
+    Check(RoceTest::blockIndex == 0 && jobIdx == 0U, "metadata packer/epoch owner is not physical AIV0");
+    Check(targetServerIdx == HierarchicalHost(common.rankId), "packer used its AIV index as the host rail slot");
+    Check(static_cast<uint32_t>(ReadGmByPassDCache(
+              HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence))) == sequence,
+          "packer started before the current sequence was published");
+    Check(static_cast<uint32_t>(ReadGmByPassDCache(
+              HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::LocalRailPacked))) != sequence,
+          "rail readiness was published before packing finished");
+    ++packCalls;
 }
 inline void CalcRailRelayExpertRange(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t&, uint32_t&)
 {
@@ -133,7 +142,7 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     remote.assign(heapBytes, 0xA5U);
     posts.clear();
     queued.clear();
-    quiets = waits = 0U;
+    quiets = waits = packCalls = 0U;
     peer = HierarchicalGateway(rank);
     sequence = t.hierarchicalSequence;
     RoceTest::operations.clear();
@@ -149,8 +158,6 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     payloadCommit = flagOffset(HierarchicalSignal::NetPayloadCommit);
     relayReady = flagOffset(HierarchicalSignal::RelayPayloadReady);
     txDone = flagOffset(HierarchicalSignal::TxDone);
-    WriteGmByPassDCache(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence), sequence);
-    WriteGmByPassDCache(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::LocalRailPacked), sequence);
     // Model the opposite sender's completed incoming notification. Finish must
     // still close its own outgoing source lifetime before observing this flag.
     WriteGmByPassDCache(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit), sequence);
@@ -186,10 +193,21 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     auto expected = remote;
     std::copy_n(local.data() + rail, railBytes, expected.data() + rail);
     std::memcpy(expected.data() + metaCommit, &sequence, sizeof(sequence));
-    const AivJobContext owner{HierarchicalSendJob(rank), 56U};
-    FinishHierarchicalDispatch({2U, 56U}, common, params);
-    Check(posts.empty() && quiets == 0U && waits == 0U, "nonowner touched the QP");
+    RoceTest::blockIndex = RoceTest::subBlockIndex = 0;
+    GatherAndPostHierarchicalDispatch({0U, 56U}, common, params, nullptr, config, scratch);
+    Check(packCalls == 1U && ReadWord(local, flagOffset(HierarchicalSignal::LocalRailPacked)) == sequence,
+          "AIV0 did not finish packing and publish readiness");
+    for (uint32_t job = 0U; job < 56U; ++job) {
+        if (job == 1U) continue;
+        RoceTest::blockIndex = static_cast<int>(job);
+        RoceTest::subBlockIndex = static_cast<int>(job % 2U);
+        FinishHierarchicalDispatch({job, 56U}, common, params);
+    }
+    Check(posts.empty() && quiets == 0U && waits == 0U, "packer/nonowner touched the QP");
+    RoceTest::blockIndex = RoceTest::subBlockIndex = 1;
+    const AivJobContext owner{1U, 56U};
     GatherAndPostHierarchicalDispatch(owner, common, params, nullptr, config, scratch);
+    Check(packCalls == 1U, "AIV1 repeated AIV0's packing work");
     Check(remote == expected, "payload completed early or metadata wrote beyond actual packet extent");
     Check(posts.size() == 3U && queued.size() == 1U && quiets == 2U && waits == 0U,
           "metadata completion or deferred payload sequence changed");

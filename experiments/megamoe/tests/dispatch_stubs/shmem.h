@@ -29,6 +29,7 @@ inline uint32_t txDone = 0U;
 inline uint32_t sequence = 0U;
 inline uint32_t waits = 0U;
 inline uint32_t quiets = 0U;
+inline uint32_t packCalls = 0U;
 constexpr uint32_t kScratchOffset = 4096U;
 
 inline void Check(bool condition, const char* message)
@@ -52,6 +53,7 @@ inline uint32_t ReadWord(const std::vector<uint8_t>& heap, uint32_t offset)
 
 inline void CheckResource(uint32_t actualPeer, uint32_t qp, uint8_t* ub, uint32_t event)
 {
+    Check(RoceTest::blockIndex == 1 && RoceTest::subBlockIndex == 1, "QP owner is not physical AIV1");
     Check(actualPeer == peer && qp == 1U && reinterpret_cast<uintptr_t>(ub) == kScratchOffset && event == 7U,
           "Dispatch used an unowned peer/QP/UB/event");
 }

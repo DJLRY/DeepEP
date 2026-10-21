@@ -429,6 +429,11 @@ python3 experiments/megamoe/scripts/trace_text.py restore part1.txt part2.txt \
 FP8 和内部量化的 BF16 输入均沿用原接口，容量可大于实际 B。B>32 及更多16卡主机暂不支持。
 A8W8 当前只运行路由专家，`num_shared_experts` 必须为0，不能传入 timer。
 
+两台机器的所有 rank 都固定由物理 AIV0 打包本地元数据，物理 AIV1 发送 RDMA。
+AIV1 在 Dispatch 和 Combine 全程独占 QP1，包括 Put、quiet 和 commit；AIV0 不推进 RDMA。
+此分工适用于 A8W4/A8W8；host_id 仍用于选择 rail 槽、gateway 和接收转发分工，
+打包使用 AIV0 自己的 epoch 计数槽，发送前仍等待 `LocalRailPacked`。
+
 跨机输入 payload 在本卡全部 token/scale 准备完成后，按实际 B 一次 Put 到配对 gateway，
 不再扫描路由并拆成多个连续 token 段；B 小于预分配容量时只发送实际 B 行。
 接收区保留原 token 编号，专家仍按路由元数据读取，多传的行不会增加计算。
@@ -450,25 +455,18 @@ gateway 检查调用由448次降为16次；这些是依赖检查调用数，未�
 [`DataSyncBarrier<DDR>`](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/basic_api/sync_control/intra_core_sync/DataSyncBarrier_ISASI.md)，
 消费者保留 scalar→MTE2 顺序保障。A8W4/A8W8 共用此协议。
 
-A8W4 的跨机 Combine 在计算间隙分批推进：AIV1 每次最多提交2个 Put、扫描64个
-`[token, top-k]` 槽位，AIV0 每次最多提交4个 Put、扫描48个槽位。扫描游标跨调用保留，
-已发送槽位不再读取 ready flag；全部发送后立即返回。AIV0 在 GMM2 专家 slice 完成后
-推进通信，GMM1 阶段连续供数，避免延迟下一 wave 的激活依赖。GMM2 中本核无计算 tile
-的非空专家 slice 仍保留推进机会，以免过度减少发送次数；最终 host barrier 后完整
-drain，再执行 payload quiet、commit、commit quiet 和对端 commit 等待。
+A8W4 的跨机 Combine 在 AIV1 的计算间隙分批推进：两台机器均每次最多提交2个 Put、
+扫描64个 `[token, top-k]` 槽位。扫描游标跨调用保留，已发送槽位不再读取 ready flag；
+全部发送后立即返回。推进穿插于 AIV1 的 activation、dispatch 和本地 Combine 工作，
+最终 host barrier 后完整 drain，再执行 payload quiet、commit、commit quiet 和对端 commit 等待。
 单次 Put 内部仍可能因队列回压等待，这些计数预算并非硬性时间上限。
 扫描在单次调用内缓存当前 token 的 pending mask，通过递增槽位推进，避免逐行除模；
 连续发送段在 Put 返回后按 token 清除对应位。扫描仍逐槽计数，保留洞、游标绕回、
 预算截断和相邻行合并的原有语义，不减少推进机会。
 
-AIV0 的48槽预算用于缩短单次推进对下一 GMM2 供数的占用；相对64槽仅调整扫描上限，
-Put 上限与调用位置不变。这是调度权衡，不能由预算减少25%推断耗时也减少25%。
-对比时同时检查 `rank-max-mean`、GMM2 供数等待、POST 数量及 drain 记录的 `pending_before`，
-确认收益没有被更碎的发送或尾部积压抵消。
-
 Combine 路由首次初始化使用 owner 专用256 B UB 分块 DMA 读取已接收的 rail 元数据；
 BS32、K8 时为5次256 B DMA，跳过每个512 B packet 的末尾 marker。
-该初始化优化也适用于 A8W8，其现有通信 owner 和每次完整扫描策略保持不变。
+该初始化优化也适用于 A8W8，其 Combine 仍由 AIV1 每次完整扫描。
 更新后两台均需重新构建安装；按上述 BS32 流程先执行 `run` 校验精度，再执行
 `perf` 比较 `rank-max-mean`，并固定 `trace --timer-ranks 0,14,16,30 --include-wait`
 检查输入 payload、计算尾部、Combine POST 分布和 quiet/commit 等待。CPU 回归不能替代这些设备检查。

@@ -522,8 +522,8 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
                     RunGmm1ActivationForExpert(gmm1State, gmm1AddrInfo, gmm1StartBlockIdx, gmm1TileReadySequence,
                                                sliceTokenStartIndexInExpert, sliceTokenCount, gmm1TilesPerMGroup);
                     // Keep GMM1 prologues contiguous: these tiles release the
-                    // next wave's activation/GMM2 dependency. The AIV0 QP owner
-                    // resumes bounded progress at GMM2 slice boundaries.
+                    // next wave's activation/GMM2 dependency. Communication
+                    // progresses independently on the fixed AIV1 owner.
                 }
                 waveEndPosition = gmm1Position;
                 currentWaveNeedsGmm1 = IsPositionWithinWave(gmm1Position, currentWaveMGroupCount);

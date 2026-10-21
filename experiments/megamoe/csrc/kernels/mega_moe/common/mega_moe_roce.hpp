@@ -10,8 +10,8 @@
 
 namespace MegaMoeImpl {
 
-// QP0 belongs to SHMEM's default collectives. One MegaMoE AIV owns QP1 for each peer;
-// ownership may move between stages only after the previous owner has drained it.
+// QP0 belongs to SHMEM's default collectives. Physical AIV1 owns QP1 for the
+// paired peer throughout hierarchical Dispatch and Combine on both hosts.
 constexpr uint32_t MEGAMOE_ROCE_QP_INDEX = 1U;
 constexpr uint32_t MEGAMOE_ROCE_EVENT_ID = 7U;
 constexpr uint32_t MEGAMOE_ROCE_SCRATCH_BYTES = 256U;

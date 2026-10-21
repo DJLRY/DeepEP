@@ -498,9 +498,9 @@ def test_a8w8_full_row_ready_counts_only_producers_after_every_n_tile(aic_count,
             model.notify(delayed_owner)
 
 
-def a8w8_qp_phase_dependencies(rank, *, combine_owner=1, handoff_barrier=True):
-    """Phase/resource model for Process, TryProgressRemoteCombine and final drain."""
-    dispatch_owner = 1 - host(rank)
+def a8w8_qp_phase_dependencies(*, combine_owner=1, input_barrier=True):
+    """Phase/resource model shared by every rank, with a fixed AIV1 Dispatch owner."""
+    dispatch_owner = 1
     graph = {
         "quantized-input": set(),
         "dispatch-put": {"quantized-input"},
@@ -513,7 +513,9 @@ def a8w8_qp_phase_dependencies(rank, *, combine_owner=1, handoff_barrier=True):
         "input-finish-aiv1": set(),
         "all-core-input-barrier": {"dispatch-receive", "input-finish-aiv0", "input-finish-aiv1"},
         "aic-fix-next-wave-aiv0": {"all-core-input-barrier"},
-        "combine-progress": {"all-core-input-barrier"} if handoff_barrier else set(),
+        # The same AIV finishes Dispatch before entering Combine, even without
+        # the barrier that additionally closes every other core's input work.
+        "combine-progress": {"all-core-input-barrier"} if input_barrier else {"dispatch-receive"},
         "local-producers-finished": {"combine-progress", "aic-fix-next-wave-aiv0"},
         "host-finish-barrier": {"local-producers-finished"},
         "combine-final-drain": {"host-finish-barrier"},
@@ -551,10 +553,9 @@ def unordered_resource_conflicts(graph, actions):
     }
 
 
-@pytest.mark.parametrize("rank", [0, 15, 16, 31])
-def test_a8w8_qp_handoff_and_aiv1_scratch_allow_next_wave_fix_overlap(rank):
-    graph, actions = a8w8_qp_phase_dependencies(rank)
-    assert actions["dispatch-put"][0] == 1 - host(rank)
+def test_a8w8_fixed_qp_owner_and_aiv1_scratch_allow_next_wave_fix_overlap():
+    graph, actions = a8w8_qp_phase_dependencies()
+    assert all(actions[event][0] == 1 for event in actions if event.startswith("dispatch-"))
     assert all(actions[event][0] == 1 for event in actions if event.startswith("combine-"))
     assert "dispatch-commit-quiet" in ancestors(graph, "combine-progress")
     assert "all-core-input-barrier" in ancestors(graph, "combine-progress")
@@ -567,8 +568,10 @@ def test_a8w8_qp_handoff_and_aiv1_scratch_allow_next_wave_fix_overlap(rank):
     assert "combine-progress" not in ancestors(graph, "aic-fix-next-wave-aiv0")
     assert actions["aic-fix-next-wave-aiv0"][1].isdisjoint(actions["combine-progress"][1])
 
-    missing_barrier = a8w8_qp_phase_dependencies(rank, handoff_barrier=False)
-    assert unordered_resource_conflicts(*missing_barrier)
-    if host(rank) == 1:
-        old_owner = a8w8_qp_phase_dependencies(rank, combine_owner=1 - host(rank))
-        assert ("combine-progress", "aic-fix-next-wave-aiv0") in unordered_resource_conflicts(*old_owner)
+    missing_barrier = a8w8_qp_phase_dependencies(input_barrier=False)
+    assert not unordered_resource_conflicts(*missing_barrier)
+    assert "dispatch-commit-quiet" in ancestors(missing_barrier[0], "combine-progress")
+    assert "input-finish-aiv0" not in ancestors(missing_barrier[0], "combine-progress")
+    assert "input-finish-aiv0" in ancestors(graph, "combine-progress")
+    aiv0_owner = a8w8_qp_phase_dependencies(combine_owner=0)
+    assert ("combine-progress", "aic-fix-next-wave-aiv0") in unordered_resource_conflicts(*aiv0_owner)

@@ -96,13 +96,10 @@ protected:
     __aicore__ inline bool TryProgressRemoteCombine()
     {
         if constexpr (g_coreType == AIV) {
-            if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob(rankId_)) {
+            if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
                 // Bound both posting and flag scans before returning to the
-                // next prologue/activation. AIV0 has fewer safe call sites but
-                // must not spend long batches delaying the next weight tile.
-                const HierarchicalCombineProgressBudget budget =
-                    GetSubBlockIdx() == 0U ? HierarchicalCombineProgressBudget{4U, 48U}
-                                          : HierarchicalCombineProgressBudget{2U, 64U};
+                // next activation/dispatch task on the fixed AIV1 owner.
+                const HierarchicalCombineProgressBudget budget{2U, 64U};
                 return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_,
                                                       HierarchicalRoceScratch(params_),
                                                       timer_.Enabled() ? &timer_ : nullptr, budget);
@@ -1033,10 +1030,10 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
             // commits then close the two-host buffer lifetime before reuse.
             {
                 AscendTimerFixedScope barrier(timer_.Enabled() ? &timer_ : nullptr,
-                                               AscendTimer::AIV_HOST_COMBINE_BARRIER_WAIT);
+                                              AscendTimer::AIV_HOST_COMBINE_BARRIER_WAIT);
                 CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
             }
-            if (aivJob_.jobIndex == HierarchicalSendJob(rankId_)) {
+            if (aivJob_.jobIndex == HierarchicalSendJob()) {
                 auto* scratch = HierarchicalRoceScratch(params_);
                 auto* rdmaTimer = timer_.Enabled() ? &timer_ : nullptr;
                 DrainHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch, rdmaTimer);

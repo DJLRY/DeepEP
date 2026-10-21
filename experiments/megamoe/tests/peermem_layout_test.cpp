@@ -230,6 +230,8 @@ int main(int argc, char** argv)
     for (uint32_t rank = 0; rank < 32; ++rank) {
         assert(HierarchicalGateway(HierarchicalGateway(rank)) == rank);
         assert(HierarchicalGateway(rank) % 16 == rank % 16);
-        assert(HierarchicalHost(HierarchicalGateway(rank)) == HierarchicalSendJob(rank));
+        assert(HierarchicalHost(HierarchicalGateway(rank)) == 1U - HierarchicalHost(rank));
     }
+    assert(HierarchicalPackJob() == 0U);
+    assert(HierarchicalSendJob() == 1U);
 }

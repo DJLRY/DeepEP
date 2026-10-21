@@ -290,7 +290,7 @@ __aicore__ inline void LoadRailTopkIdsBatch(const SendMaskConfig& config, SendMa
  */
 __aicore__ inline void SendTopkIdsToRailServer(const MoeStageCommonConfig& common, GM_ADDR* winRankAddr,
                                                const SendMaskConfig& config, const Params& params,
-                                               SendMaskScratch& scratch, uint32_t targetServerIdx)
+                                               SendMaskScratch& scratch, uint32_t targetServerIdx, uint32_t jobIdx)
 {
     const int32_t itemsPerBatch = RailItemsPerBatch(config.bufferConfig);
     const uint32_t railRank = targetServerIdx * config.ranksPerServer + common.rankId % config.ranksPerServer;
@@ -298,9 +298,10 @@ __aicore__ inline void SendTopkIdsToRailServer(const MoeStageCommonConfig& commo
     const uint64_t slotOffset =
         config.railTopkIdsWinOffset + static_cast<uint64_t>(srcServerIdx) * config.railTopkIdsSlotBytes;
     const int32_t totalItems = static_cast<int32_t>(static_cast<uint64_t>(common.tokenNum) * common.topK);
+    // The epoch belongs to the packing AIV, independently of the destination host.
     __gm__ int32_t* launchCountSlot =
         reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.rankSyncInWorldPtr + RANK_SYNC_COUNTER_OFFSET_BYTES +
-                                          static_cast<uint64_t>(targetServerIdx) * RANK_SYNC_COUNTER_SLOT_BYTES);
+                                          static_cast<uint64_t>(jobIdx) * RANK_SYNC_COUNTER_SLOT_BYTES);
     const uint32_t epoch = ((ReadGmByPassDCache(launchCountSlot) + 1) & 0x7F) | 0x80;
     const int32_t marker = static_cast<int32_t>((epoch << 24) | static_cast<uint32_t>(totalItems));
     GlobalTensor<int32_t> topkIdsGm;
@@ -675,7 +676,7 @@ __aicore__ inline void GatherAndSendExpertCompactRoutesRail(const AivJobContext&
     const uint32_t jobIdx = job.jobIndex;
 
     if (jobIdx < serverNum) {
-        SendTopkIdsToRailServer(common, winRankAddr, config, params, scratch, jobIdx);
+        SendTopkIdsToRailServer(common, winRankAddr, config, params, scratch, jobIdx, jobIdx);
         return;
     }
     if (job.totalJobs <= serverNum) {

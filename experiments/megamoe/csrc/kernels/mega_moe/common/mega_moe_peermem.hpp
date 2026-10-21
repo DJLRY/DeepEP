@@ -84,9 +84,15 @@ HOST_DEVICE uint32_t HierarchicalGateway(uint32_t source)
     return source ^ HIERARCHICAL_RANKS_PER_HOST;
 }
 
-HOST_DEVICE uint32_t HierarchicalSendJob(uint32_t rank)
+// Physical AIV roles are identical on both hosts, independent of host/gateway IDs.
+HOST_DEVICE uint32_t HierarchicalPackJob()
 {
-    return 1U - HierarchicalHost(rank);
+    return 0U;
+}
+
+HOST_DEVICE uint32_t HierarchicalSendJob()
+{
+    return 1U;
 }
 
 HOST_DEVICE uint64_t HierarchicalSignalOffset(HierarchicalSignal signal)
