@@ -534,7 +534,7 @@ void Fairness()
 }
 void Budgets()
 {
-    for (uint32_t scans : {0U, 1U, 2U, 3U, 63U, 64U, 127U, 128U, 1024U}) {
+    for (uint32_t scans : {0U, 1U, 2U, 3U, 47U, 48U, 49U, 63U, 64U, 127U, 128U, 1024U}) {
         for (uint32_t posts : {0U, 1U, 2U, 4U, 8U}) {
             Fixture f(32U, 8U);
             f.Routes("mixed");
@@ -810,7 +810,8 @@ void CursorOracle()
                             f.Publish(row, f.s.sequence);
                         }
                     }
-                    const std::array<uint32_t, 8> scans = {0U, 1U, 2U, topk, topk + 1U, 63U, 64U, 0xffffffffU};
+                    const std::array<uint32_t, 11> scans = {
+                        0U, 1U, 2U, topk, topk + 1U, 47U, 48U, 49U, 63U, 64U, 0xffffffffU};
                     OracleStep(f, random() % 6U, scans[random() % scans.size()]);
                 }
                 ReleaseAll();

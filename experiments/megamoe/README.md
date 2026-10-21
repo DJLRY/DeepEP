@@ -440,7 +440,7 @@ gateway 检查调用由448次降为16次；这些是依赖检查调用数，未�
 消费者保留 scalar→MTE2 顺序保障。A8W4/A8W8 共用此协议。
 
 A8W4 的跨机 Combine 在计算间隙分批推进：AIV1 每次最多提交2个 Put、扫描64个
-`[token, top-k]` 槽位，AIV0 每次最多提交4个 Put、扫描64个槽位。扫描游标跨调用保留，
+`[token, top-k]` 槽位，AIV0 每次最多提交4个 Put、扫描48个槽位。扫描游标跨调用保留，
 已发送槽位不再读取 ready flag；全部发送后立即返回。AIV0 在 GMM2 专家 slice 完成后
 推进通信，GMM1 阶段连续供数，避免延迟下一 wave 的激活依赖。GMM2 中本核无计算 tile
 的非空专家 slice 仍保留推进机会，以免过度减少发送次数；最终 host barrier 后完整
@@ -449,6 +449,11 @@ drain，再执行 payload quiet、commit、commit quiet 和对端 commit 等待�
 扫描在单次调用内缓存当前 token 的 pending mask，通过递增槽位推进，避免逐行除模；
 连续发送段在 Put 返回后按 token 清除对应位。扫描仍逐槽计数，保留洞、游标绕回、
 预算截断和相邻行合并的原有语义，不减少推进机会。
+
+AIV0 的48槽预算用于缩短单次推进对下一 GMM2 供数的占用；相对64槽仅调整扫描上限，
+Put 上限与调用位置不变。这是调度权衡，不能由预算减少25%推断耗时也减少25%。
+对比时同时检查 `rank-max-mean`、GMM2 供数等待、POST 数量及 drain 记录的 `pending_before`，
+确认收益没有被更碎的发送或尾部积压抵消。
 
 Combine 路由首次初始化使用 owner 专用256 B UB 分块 DMA 读取已接收的 rail 元数据；
 BS32、K8 时为5次256 B DMA，跳过每个512 B packet 的末尾 marker。

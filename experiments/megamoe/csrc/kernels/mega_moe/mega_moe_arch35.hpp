@@ -101,7 +101,7 @@ protected:
                 // next prologue/activation. AIV0 has fewer safe call sites but
                 // must not spend long batches delaying the next weight tile.
                 const HierarchicalCombineProgressBudget budget =
-                    GetSubBlockIdx() == 0U ? HierarchicalCombineProgressBudget{4U, 64U}
+                    GetSubBlockIdx() == 0U ? HierarchicalCombineProgressBudget{4U, 48U}
                                           : HierarchicalCombineProgressBudget{2U, 64U};
                 return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_,
                                                       HierarchicalRoceScratch(params_),
