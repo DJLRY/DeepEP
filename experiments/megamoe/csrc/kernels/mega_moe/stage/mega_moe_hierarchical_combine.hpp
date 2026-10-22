@@ -87,6 +87,49 @@ __aicore__ inline void InitializeHierarchicalCombineProgress(const MoeStageCommo
     progress.initialized = true;
 }
 
+// One small DMA gathers the first 32B of up to eight 512B flag slots. Keep only
+// the epoch matches in scalar state: Put can immediately overwrite the shared
+// 256B scratch. This snapshot lives for one progress call, so a negative result
+// never hides a later publication on the next sweep.
+struct HierarchicalCombineReadySnapshot {
+    uint32_t firstRow = 0U;
+    uint32_t rowCount = 0U;
+    uint32_t readyMask = 0U;
+
+    __aicore__ inline bool Ready(const Params& params, uint32_t row, uint32_t rowsLeft, uint32_t scansLeft)
+    {
+        if (row < firstRow || row - firstRow >= rowCount) {
+            constexpr uint32_t blockBytes = 32U;
+            constexpr uint32_t batchRows = MEGAMOE_ROCE_SCRATCH_BYTES / blockBytes;
+            static_assert(batchRows <= 32U && HIERARCHICAL_FLAG_BYTES % blockBytes == 0U);
+            rowCount = rowsLeft < batchRows ? rowsLeft : batchRows;
+            rowCount = scansLeft < rowCount ? scansLeft : rowCount;
+            firstRow = row;
+            GlobalTensor<int32_t> flags;
+            flags.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(
+                params.peermemInfo.gatewayCombineReadyPtr + static_cast<uint64_t>(row) * HIERARCHICAL_FLAG_BYTES));
+            flags.SetL2CacheHint(CacheMode::CACHE_MODE_DISABLE);
+            LocalTensor<int32_t> snapshot(TPosition::VECCALC, params.tilingData->roceScratchUbOffset,
+                                           MEGAMOE_ROCE_SCRATCH_BYTES / sizeof(int32_t));
+            SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
+            // blockLen/srcStride/dstStride are measured in 32B blocks.
+            DataCopy(snapshot, flags,
+                     DataCopyParams{static_cast<uint16_t>(rowCount), 1U,
+                                    static_cast<uint16_t>(HIERARCHICAL_FLAG_BYTES / blockBytes - 1U), 0U});
+            SyncFuncStatic<HardEvent::MTE2_S, MEGAMOE_ROCE_EVENT_ID>();
+            readyMask = 0U;
+            for (uint32_t i = 0U; i < rowCount; ++i) {
+                if (static_cast<uint32_t>(snapshot.GetValue(i * (blockBytes / sizeof(int32_t)))) ==
+                    params.tilingData->hierarchicalSequence) {
+                    readyMask |= uint32_t(1) << i;
+                }
+            }
+            SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
+        }
+        return (readyMask & (uint32_t(1) << (row - firstRow))) != 0U;
+    }
+};
+
 // Keep the current token's remaining bits in scalar state. Advancing still
 // visits every row for exact scan-budget accounting, including holes and sent
 // rows, but needs no per-row division or pending-mask reload.
@@ -104,14 +147,13 @@ struct HierarchicalCombineScanCursor {
     {
     }
 
-    __aicore__ inline bool Ready(const Params& params) const
+    __aicore__ inline bool Ready(const Params& params, HierarchicalCombineReadySnapshot& snapshot,
+                                 uint32_t rowsLeft, uint32_t scansLeft) const
     {
         if ((pending & 1U) == 0U) {
             return false;
         }
-        auto* ready = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.gatewayCombineReadyPtr +
-                                                        static_cast<uint64_t>(row) * HIERARCHICAL_FLAG_BYTES);
-        return static_cast<uint32_t>(ReadGmByPassDCache(ready)) == params.tilingData->hierarchicalSequence;
+        return snapshot.Ready(params, row, rowsLeft, scansLeft);
     }
 
     __aicore__ inline void Advance(const MoeStageCommonConfig& common, const HierarchicalCombineProgress& progress)
@@ -182,11 +224,12 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
     const uint32_t rowBytes = common.tokenHiddenDim * sizeof(bfloat16_t);
     const uint32_t destination = HierarchicalGateway(common.rankId);
     HierarchicalCombineScanCursor cursor(progress, common.topK);
+    HierarchicalCombineReadySnapshot snapshot;
     uint32_t scanned = 0U;
     uint32_t posts = 0U;
     while (scanned < scanLimit && posts < budget.maxPosts) {
         ++scanned;
-        if (!cursor.Ready(params)) {
+        if (!cursor.Ready(params, snapshot, rowCount - cursor.row, scanLimit - scanned + 1U)) {
             cursor.Advance(common, progress);
             if (cursor.row == rowCount) {
                 cursor.Wrap(progress);
@@ -202,7 +245,7 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
         bool skippedHole = false;
         while (cursor.row < rowCount && scanned < scanLimit) {
             ++scanned;
-            if (!cursor.Ready(params)) {
+            if (!cursor.Ready(params, snapshot, rowCount - cursor.row, scanLimit - scanned + 1U)) {
                 skippedHole = true;
                 break;
             }

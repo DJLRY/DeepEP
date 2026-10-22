@@ -8,10 +8,9 @@
 #include <cassert>
 #include <cstdint>
 #include <cstring>
-#include <iostream>
+#include <cstdio>
+#include <cstdlib>
 #include <random>
-#include <stdexcept>
-#include <string>
 #include <vector>
 
 #define __aicore__
@@ -69,7 +68,8 @@ public:
     {
         if (timer_ != nullptr) {
             if (timer_->scanActive) {
-                throw std::runtime_error("scan timer started twice");
+                std::fputs("scan timer started twice\n", stderr);
+                std::abort();
             }
             timer_->scanActive = true;
             ++timer_->scanStarts;
@@ -99,7 +99,9 @@ namespace ProgressTest {
 inline void Check(bool condition, const char* message)
 {
     if (!condition) {
-        throw std::runtime_error(message);
+        std::fputs(message, stderr);
+        std::fputc('\n', stderr);
+        std::abort();
     }
 }
 
@@ -141,6 +143,10 @@ struct State {
     bool overwriteOrdered = false;
     const int32_t* pendingDma = nullptr;
     uint32_t pendingDmaWords = 0U;
+    uint32_t pendingDmaStrideWords = 0U;
+    uint32_t pendingDmaBlocks = 0U;
+    uint32_t flagDmas = 0U;
+    uint32_t releaseAfterSnapshot = 0xffffffffU;
 };
 inline State* state = nullptr;
 constexpr uint32_t kUbOffset = 4096U;
@@ -159,6 +165,13 @@ inline void ReleaseAll()
 namespace AscendC {
 enum class TPosition { VECCALC };
 enum class HardEvent { S_MTE2, MTE2_S };
+enum class CacheMode { CACHE_MODE_DISABLE, CACHE_MODE_NORMAL };
+struct DataCopyParams {
+    uint16_t blockCount;
+    uint16_t blockLen;
+    uint16_t srcStride;
+    uint16_t dstStride;
+};
 
 template <typename T>
 class LocalTensor {
@@ -208,8 +221,12 @@ public:
         return data_;
     }
 
+    void SetL2CacheHint(CacheMode mode) { cacheMode_ = mode; }
+    CacheMode GetL2CacheHint() const { return cacheMode_; }
+
 private:
     T* data_ = nullptr;
+    CacheMode cacheMode_ = CacheMode::CACHE_MODE_NORMAL;
 };
 
 template <typename T>
@@ -230,6 +247,33 @@ void DataCopy(const LocalTensor<T>& destination, const GlobalTensor<T>& source, 
     s.copies.push_back({offset, count});
     s.pendingDma = source.Data();
     s.pendingDmaWords = count;
+    s.overwriteOrdered = false;
+}
+
+template <typename T>
+void DataCopy(const LocalTensor<T>& destination, const GlobalTensor<T>& source, DataCopyParams copy)
+{
+    using namespace ProgressTest;
+    auto& s = *state;
+    Check(s.overwriteOrdered && s.pendingDma == nullptr, "ready DMA reused live scratch");
+    Check(destination.Data() == reinterpret_cast<T*>(s.ub.data()), "ready DMA used unowned scratch");
+    Check(source.GetL2CacheHint() == CacheMode::CACHE_MODE_DISABLE, "ready DMA enabled L2 cache");
+    Check(copy.blockCount > 0U && copy.blockCount <= 8U && copy.blockLen == 1U &&
+              copy.srcStride == 15U && copy.dstStride == 0U, "invalid ready gather geometry");
+    const auto offset = source.Data() - s.flags.data();
+    Check(offset >= 0 && offset % kFlagWords == 0, "ready gather is not flag-aligned");
+    const auto first = static_cast<uint32_t>(offset / kFlagWords);
+    Check(first + copy.blockCount <= s.rows, "ready gather exceeded row tensor");
+    for (uint32_t row = first; row < first + copy.blockCount; ++row) {
+        ++s.flagReads;
+        ++s.probes[row];
+        s.probeOrder.push_back(row);
+    }
+    ++s.flagDmas;
+    s.pendingDma = source.Data();
+    s.pendingDmaWords = 8U;
+    s.pendingDmaStrideWords = kFlagWords;
+    s.pendingDmaBlocks = copy.blockCount;
     s.overwriteOrdered = false;
 }
 
@@ -306,9 +350,21 @@ void SyncFuncStatic()
     } else {
         static_assert(Event == HardEvent::MTE2_S);
         ProgressTest::Check(s.pendingDma != nullptr, "MTE2 completion without a metadata DMA");
-        std::memcpy(s.ub.data(), s.pendingDma, s.pendingDmaWords * sizeof(int32_t));
+        if (s.pendingDmaBlocks != 0U) {
+            for (uint32_t i = 0U; i < s.pendingDmaBlocks; ++i) {
+                std::memcpy(s.ub.data() + i * 32U, s.pendingDma + i * s.pendingDmaStrideWords, 32U);
+            }
+            // Publish only after the DMA image has been captured.
+            if (s.releaseAfterSnapshot < s.rows) {
+                s.flags[s.releaseAfterSnapshot * ProgressTest::kFlagWords] = static_cast<int32_t>(s.sequence);
+                s.releaseAfterSnapshot = 0xffffffffU;
+            }
+        } else {
+            std::memcpy(s.ub.data(), s.pendingDma, s.pendingDmaWords * sizeof(int32_t));
+        }
         s.pendingDma = nullptr;
         s.pendingDmaWords = 0U;
+        s.pendingDmaBlocks = 0U;
     }
 }
 inline int32_t ReadGmByPassDCache(const int32_t* address)
@@ -320,7 +376,7 @@ inline int32_t ReadGmByPassDCache(const int32_t* address)
     const auto size = static_cast<uintptr_t>(s.flags.size()) * sizeof(int32_t);
     if (raw < begin || raw >= begin + size) {
         ++s.metadataScalarReads;
-        throw std::runtime_error("progress made a scalar GM load outside the ready flags");
+        Check(false, "progress made a scalar GM load outside the ready flags");
     }
     const auto offset = raw - begin;
     Check(offset % HIERARCHICAL_FLAG_BYTES == 0U, "flag probe did not target a row epoch");
@@ -408,7 +464,7 @@ public:
             s.source[index] = static_cast<uint8_t>((index * 37U + index / s.rowBytes) % 251U);
         }
     }
-    void Routes(const std::string& pattern)
+    void Routes(const char* pattern)
     {
         const uint32_t expertsPerHost = 16U * common.moeExpertPerRank;
         const uint32_t localBase = HierarchicalHost(common.rankId) * expertsPerHost;
@@ -418,17 +474,17 @@ public:
         std::fill(s.rail.begin(), s.rail.end(), static_cast<int32_t>(localBase + 1U));
         auto* paired = const_cast<int32_t*>(s.pairedRail);
         for (uint32_t row = 0U; row < s.rows; ++row) {
-            bool remoteContribution = pattern == "all" || pattern == "duplicate";
-            if (pattern == "mixed") {
+            bool remoteContribution = std::strcmp(pattern, "all") == 0 || std::strcmp(pattern, "duplicate") == 0;
+            if (std::strcmp(pattern, "mixed") == 0) {
                 remoteContribution = row % 5U == 0U || row % 7U == 2U;
             }
-            if (pattern == "last") {
+            if (std::strcmp(pattern, "last") == 0) {
                 remoteContribution = row + 1U == s.rows;
             }
             const uint32_t expert =
-                remoteContribution ? localBase + (pattern == "duplicate" ? 7U : row % 511U) : otherBase + row % 511U;
+                remoteContribution ? localBase + (std::strcmp(pattern, "duplicate") == 0 ? 7U : row % 511U) : otherBase + row % 511U;
             ids[row] =
-                pattern == "holes" || (pattern == "mixed" && row % 11U == 3U) ? -1 : static_cast<int32_t>(expert);
+                std::strcmp(pattern, "holes") == 0 || (std::strcmp(pattern, "mixed") == 0 && row % 11U == 3U) ? -1 : static_cast<int32_t>(expert);
             s.expected[row] =
                 ids[row] >= 0 && static_cast<uint32_t>(ids[row]) / expertsPerHost == HierarchicalHost(common.rankId);
             paired[row / 127U * 128U + row % 127U] = ids[row];
@@ -477,7 +533,8 @@ public:
             const uint32_t advanced = (progress.nextRow + s.rows - beforeRow) % s.rows;
             Check(advanced <= scans, "cursor exceeded the row scan budget");
         }
-        Check(progress.sentRows == std::count(s.sent.begin(), s.sent.end(), 1U), "sentRows accounting mismatch");
+        Check(progress.sentRows == static_cast<uint32_t>(std::count(s.sent.begin(), s.sent.end(), 1U)),
+              "sentRows accounting mismatch");
         return made;
     }
     void Finish(uint32_t posts = 2U, uint32_t scans = 7U)
@@ -807,9 +864,17 @@ void OracleStep(Fixture& f, uint32_t maxPosts, uint32_t maxScans)
         Check(actual.firstRow == runs[i].first && actual.rowCount == runs[i].count,
               "POST order/coalescing differs from contiguous-coordinate oracle");
     }
-    Check(f.s.probeOrder.size() - beforeProbes == probes.size() &&
-              std::equal(probes.begin(), probes.end(), f.s.probeOrder.begin() + beforeProbes),
-          "flag probe order differs from pending-coordinate oracle");
+    // DMA may prefetch holes, sent slots, and up to seven future slots. Every
+    // logical pending probe must be covered, and every physical load must stay
+    // in the bounded visit set without loading any row twice in one call.
+    std::vector<uint32_t> loaded(f.s.probeOrder.begin() + beforeProbes, f.s.probeOrder.end());
+    for (uint32_t row : probes) {
+        Check(std::count(loaded.begin(), loaded.end(), row) == 1, "snapshot missed a logical pending probe");
+    }
+    for (uint32_t row : loaded) {
+        Check(std::count(loaded.begin(), loaded.end(), row) == 1 &&
+                  std::find(visits.begin(), visits.end(), row) != visits.end(), "snapshot exceeded scan bounds");
+    }
     const uint32_t nextRow = scanned == 0U ? beforeRow : (beforeRow + scanned) % f.s.rows;
     Check(f.progress.nextRow == nextRow, "resumed cursor differs from bounded circular row sequence");
     Check(f.progress.sentRows == f.Expected() - pendingBefore + sent, "oracle sentRows count mismatch");
@@ -867,14 +932,15 @@ void CompleteInCall()
         Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {2U, 64U}),
               "sparse completion failed to submit ready routes");
         Check(f.progress.sentRows == c.rows.size() && f.progress.sentRows == f.progress.expectedRows &&
-                  f.progress.nextRow == c.next && f.s.posts.size() == c.posts && f.s.probeOrder == c.rows,
+                  f.progress.nextRow == c.next && f.s.posts.size() == c.posts,
               "sparse completion lost routes, cursor position, or probe order");
         Check(timer.records.size() == 1U && timer.records[0].before == c.rows.size() && timer.records[0].after == 0U &&
                   timer.records[0].posts == c.posts && timer.records[0].scanned == c.scanned &&
                   timer.scanStarts == c.posts + 1U && timer.scanStops == timer.scanStarts && !timer.scanActive,
               "completion did not preserve the baseline scan budget and cursor");
+        const auto reads = f.s.flagReads;
         Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {2U, 64U}) &&
-                  timer.records.size() == 1U && f.s.probeOrder == c.rows,
+                  timer.records.size() == 1U && f.s.flagReads == reads,
               "completed sparse routes were scanned again");
         f.CheckPayload();
     }
@@ -904,6 +970,41 @@ void CompleteInCall()
     Check(capped.progress.sentRows == 3U && capped.progress.nextRow == 68U && capped.s.posts.size() == 3U,
           "resumed final run did not preserve the baseline scan budget");
     capped.CheckPayload();
+}
+
+void ReadySnapshot()
+{
+    Fixture dense(32U, 8U);
+    dense.Routes("all");
+    dense.Init();
+    ReleaseAll();
+    dense.Step(2U, 64U);
+    Check(dense.s.flagDmas == 8U && dense.s.flagReads == 64U && dense.progress.sentRows == 64U,
+          "dense scan did not batch eight flags per DMA");
+    dense.Finish();
+    dense.CheckPayload();
+
+    Fixture late(1U, 8U);
+    late.Routes("all");
+    late.Init();
+    late.Publish(0U, late.s.sequence);
+    late.s.releaseAfterSnapshot = 3U;
+    Check(TryProgressHierarchicalCombine(late.common, late.params, late.progress, late.s.ub.data(), nullptr, {2U, 8U}),
+          "initial ready row was not submitted");
+    Check(late.s.sent[0U] == 1U && late.s.sent[3U] == 0U, "snapshot read a post-DMA publication");
+    late.Step(2U, 8U);
+    Check(late.s.sent[3U] == 1U, "negative snapshot survived across progress calls");
+    ReleaseAll();
+    late.Finish();
+    late.CheckPayload();
+
+    Fixture reuse(1U, 8U);
+    reuse.RouteRows({0U, 2U, 4U, 6U});
+    reuse.Init();
+    ReleaseAll();
+    reuse.Step(4U, 8U);
+    Check(reuse.s.posts.size() == 4U && reuse.s.flagDmas == 1U, "Put scratch overwrite destroyed cached ready bits");
+    reuse.CheckPayload();
 }
 
 void CursorOracle()
@@ -957,38 +1058,35 @@ void CursorOracle()
 int main(int argc, char** argv)
 {
     using namespace ProgressTest;
-    try {
-        Check(argc == 2, "expected one test scenario");
-        const std::string scenario = argv[1];
-        if (scenario == "routing")
-            Routing();
-        else if (scenario == "late-ready")
-            LateReady();
-        else if (scenario == "fairness")
-            Fairness();
-        else if (scenario == "budgets")
-            Budgets();
-        else if (scenario == "epochs")
-            Epochs();
-        else if (scenario == "completed")
-            Completed();
-        else if (scenario == "complete-in-call")
-            CompleteInCall();
-        else if (scenario == "metadata")
-            Metadata();
-        else if (scenario == "drain")
-            Drain();
-        else if (scenario == "topology")
-            Topology();
-        else if (scenario == "telemetry")
-            Telemetry();
-        else if (scenario == "cursor-oracle")
-            CursorOracle();
-        else
-            throw std::runtime_error("unknown test scenario");
-    } catch (const std::exception& error) {
-        std::cerr << error.what() << '\n';
-        return 1;
-    }
+    Check(argc == 2, "expected one test scenario");
+    const char* scenario = argv[1];
+    if (std::strcmp(scenario, "routing") == 0)
+        Routing();
+    else if (std::strcmp(scenario, "late-ready") == 0)
+        LateReady();
+    else if (std::strcmp(scenario, "fairness") == 0)
+        Fairness();
+    else if (std::strcmp(scenario, "budgets") == 0)
+        Budgets();
+    else if (std::strcmp(scenario, "epochs") == 0)
+        Epochs();
+    else if (std::strcmp(scenario, "completed") == 0)
+        Completed();
+    else if (std::strcmp(scenario, "complete-in-call") == 0)
+        CompleteInCall();
+    else if (std::strcmp(scenario, "metadata") == 0)
+        Metadata();
+    else if (std::strcmp(scenario, "drain") == 0)
+        Drain();
+    else if (std::strcmp(scenario, "topology") == 0)
+        Topology();
+    else if (std::strcmp(scenario, "telemetry") == 0)
+        Telemetry();
+    else if (std::strcmp(scenario, "cursor-oracle") == 0)
+        CursorOracle();
+    else if (std::strcmp(scenario, "ready-snapshot") == 0)
+        ReadySnapshot();
+    else
+        Check(false, "unknown test scenario");
     return 0;
 }

@@ -566,7 +566,7 @@ gateway 检查调用由448次降为16次；这些是依赖检查调用数，未�
 消费者保留 scalar→MTE2 顺序保障。A8W4/A8W8 共用此协议。
 
 A8W4 的跨机 Combine 在 AIV1 的计算间隙分批推进：两台机器均每次最多提交2个 Put、
-扫描64个 `[token, top-k]` 槽位。扫描游标跨调用保留，已发送槽位不再读取 ready flag；
+扫描64个 `[token, top-k]` 槽位。扫描游标跨调用保留，已发送槽位不再参与就绪判定；
 全部发送后立即返回。固定物理 AIV1 保留 activation、dispatch 和远端推进，
 本地 Combine 搬运交给其余 AIV1：28个 AIC 时由剩余27个 AIV1 均衡分配完整行，
 在27个 consumer 的空间内按 Combine wave 和全局行前缀轮换，确保每行只搬运一次。
@@ -582,13 +582,21 @@ owner 对每个 Combine slice 保留非阻塞生产完成检查，就绪后推�
 预算截断和相邻行合并的原有语义；恢复 A 的扫描行为，完成当次扫描或达到 Put 预算后返回，
 后续调用在全部行已提交时直接返回。提交完成不代表传输完成，后者仍由后续 quiet 保证。
 
+ready 探测通过一次跨步 DMA，将最多8个512 B flag 槽的首32 B收集到 owner 专用256 B UB。
+读取使用 `CACHE_MODE_DISABLE`，DMA 完成后仅将匹配当前完整 sequence 的结果保留为标量位图，
+并完成 scalar→MTE2 顺序保障，再允许 Put 复用 scratch。普通 Put 的后端在返回前完成其 UB 搬运，
+因此下一批快照可以复用同一空间；这里不使用需要保留 workspace 的 aggregate Put。
+预取可以包含洞和已发送槽位，但实际发送仍受 pending mask 约束；每批不越过物理行末尾或剩余扫描预算。
+位图只在当前 progress 调用内有效，晚于快照发布的行在后续扫描重新读取，不缓存跨调用的未就绪结果。
+静态全待发场景下64行由8次 DMA读取，逻辑扫描计数仍为64；这不是设备耗时的八倍加速承诺。
+
 Combine 路由首次初始化使用 owner 专用256 B UB 分块 DMA 读取已接收的 rail 元数据；
 BS32、K8 时为5次256 B DMA，跳过每个512 B packet 的末尾 marker。
 该初始化优化也适用于 A8W8，其 Combine 仍由 AIV1 每次完整扫描。
 更新后两台均需重新构建安装 timer OFF 版本；按上述 BS32 流程先执行 `run` 校验精度，
 再执行一次 `perf`（默认20次 warmup、100次采样，统计后50次），将两个指标与前一版本比较。
-本轮通信 owner 搬运卸载的比较基线为单 Dispatch commit 版本的279.211/297.744 μs
-（rank-min mean / rank-max mean），不将随后恢复 A 的299.133/316.127 μs重复计入收益。
+本轮 ready 批量探测的比较基线为 owner 搬运卸载版本的241.830/281.499 μs
+（rank-min mean / rank-max mean）；全体 rank、全部选中轮次的均值为262.111 μs，可作补充观察。
 常规迭代不自动运行 A/B 或重复确认；需要定位阶段时，再单独采集
 `trace --timer-ranks 0,14,16,30 --include-wait`，检查输入 payload、计算尾部、
 Combine POST 分布和 quiet/commit 等待。CPU 回归不能替代设备精度与性能检查。

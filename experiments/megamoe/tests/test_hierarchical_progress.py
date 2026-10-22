@@ -51,6 +51,7 @@ def hierarchical_progress_binary(tmp_path_factory):
         "topology",
         "telemetry",
         "cursor-oracle",
+        "ready-snapshot",
     ],
 )
 def test_hierarchical_progress_contract(hierarchical_progress_binary, scenario):
