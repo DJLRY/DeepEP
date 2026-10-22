@@ -277,10 +277,25 @@ bash experiments/megamoe/scripts/run_bs32_ab.sh --config /absolute/path/node.jso
 | `plan.json`、`build_settings.json`、`builds/` | 提交、两文件哈希、编译选项、wheel 信息和构建日志 |
 | `runs/` | 精度/性能日志、32 rank 汇总和本机16 rank 的原始样本及 profiler |
 | `status.json` | 完成/失败原因、最终安装状态 |
-| **`results.zip`** | 可回传的结果包，含上述统计、配置、日志和样本；不含大体积源码/wheel/原始 profiler |
+| **`copy_text_*/part_001.txt` 等** | 默认回传方式：可读精简文本，每块最多60000字节（包含头尾标记及 CRLF 换行） |
+| `results.zip` | 服务器本地完整存档，含统计、配置、日志和样本；不含大体积源码/wheel/原始 profiler |
 
-完成后发送**两台服务器各自的 `results.zip`** 即可分析。两台的32 rank汇总是同一份采样，
-统计时不会将它们当作两次独立实验。脚本保留逐次数据，失败也打包已有结果；
+完成后，按终端最后打印的 `cat /.../copy_text_.../part_001.txt` 命令，
+复制 **BEGIN 到 END 的完整文本块**发送即可。两台各复制自己的结果；每次只复制一个块，
+不要一次 `cat` 所有分块。默认24次测量通常各一块；增加轮数超出容量时会自动分块，不丢弃测量记录。
+每块按 UTF-8 字节计算，预留 Windows 换行扩展，严格小于65535字节，并包含块编号、整份报告及本块 SHA-256。
+
+精简文本保留场景/轮数、节点和版本指纹、恢复状态、每次两种耗时和32个 rank 的平均耗时、
+分组统计及成对差值；发生失败时保留受限长度的错误及日志摘要。逐次耗时/各 rank 均值精简到0.001微秒，
+全精度数据和完整日志留在服务器。两台的32 rank汇总是同一份采样，统计时不会将其当作两次独立实验。
+
+已经运行过旧脚本的结果可以离线导出，不需要重跑、编译或连接另一台机器：
+
+```bash
+bash experiments/megamoe/scripts/run_bs32_ab.sh --export-text /absolute/path/ab_node_0_xxxxxxxx
+```
+
+每次导出创建新的 `copy_text_*` 子目录，保留之前的结果。脚本保留逐次数据，失败也导出/存档已有结果；
 只有完整跑完并恢复成功才标记完成。它不自动把一次慢测或差值为正判定为稳定回退。
 若进程被 `SIGKILL` 或机器掉电，无法执行恢复与打包；已落盘数据保留，可先运行普通 `run_bs32.sh build` 恢复环境。
 

@@ -197,6 +197,127 @@ def test_dirty_tracked_sources_stop_before_snapshot(monkeypatch):
         ab.source_plan(ROOT)
 
 
+def unpack_text(parts):
+    bodies, report_hash = [], None
+    for index, raw in enumerate(parts, 1):
+        # Clipboard conversion must not change the payload identity.
+        text = raw.replace("\r\n", "\n")
+        header, body = text.split("\n\n", 1)
+        assert header.startswith("-----BEGIN BS32 AB TEXT v1-----\n")
+        fields = dict(line.split("=", 1) for line in header.splitlines()[1:])
+        assert fields["part"] == f"{index:06d}/{len(parts):06d}"
+        assert body.endswith("-----END BS32 AB TEXT-----\n")
+        body = body.removesuffix("-----END BS32 AB TEXT-----\n")
+        assert ab.digest(body.encode("utf-8")) == fields["payload_sha256"]
+        if report_hash is not None:
+            assert report_hash == fields["report_sha256"]
+        report_hash = fields["report_sha256"]
+        bodies.append(body)
+    payload = "".join(bodies)
+    assert ab.digest(payload.encode("utf-8")) == report_hash
+    return payload
+
+
+def test_text_limit_includes_headers_unicode_crlf_and_exact_boundary():
+    payload = "结果检查 αβγ\n" * 3000
+    parts = ab.text_parts(payload, 0, max_bytes=1024)
+    assert len(parts) > 1
+    assert all(len(part.replace("\n", "\r\n").encode("utf-8")) <= 1024 for part in parts)
+    assert unpack_text([part.replace("\n", "\r\n") for part in parts]) == payload
+    overhead = len(ab.text_parts("", 0, max_bytes=1024)[0].replace("\n", "\r\n").encode("utf-8"))
+    exact = "a" * (1024 - overhead - 2) + "\n"
+    assert len(ab.text_parts(exact, 0, max_bytes=1024)[0].replace("\n", "\r\n").encode()) == 1024
+    with pytest.raises(ValueError, match="record exceeds"):
+        ab.text_parts("a" + exact, 0, max_bytes=1024)
+    with pytest.raises(ValueError, match="60000"):
+        ab.text_parts("test\n", 0, max_bytes=65535)
+
+
+@pytest.fixture
+def completed_ab_results(tmp_path):
+    directory = tmp_path / "ab_node_0_existing"
+    directory.mkdir()
+    ab.write_json(
+        directory / "plan.json",
+        dict(
+            source=dict(head="a" * 40, baseline="b" * 40, changed="c" * 40),
+            case=dict(ab.load_launcher().CASE, warmup=20, iters=100),
+            order="ABCDDCBA" * 3,
+            backend="HNS_1825",
+            controller="d" * 64,
+            launcher="e" * 64,
+        ),
+    )
+    ab.write_json(directory / "host.json", dict(node_rank=0, hostname="test-node-0"))
+    ab.write_json(
+        directory / "status.json",
+        dict(complete=True, error=None, restore_error=None, installed_after_run="D (timer OFF)"),
+    )
+    records = []
+    for index, label in enumerate("ABCDDCBA" * 3):
+        report = report_for(label, iters=100)
+        path = directory / f"run_{index}"
+        path.mkdir()
+        ab.write_json(path / "profiling.json", report)
+        records.append(
+            dict(
+                step=index + 1,
+                block=index // 4,
+                variant=label,
+                source_sha256=label.lower() * 64,
+                mean_us=report["mean_us"],
+                rank_max_mean_us=report["rank_max_mean_us"],
+                report=f"run_{index}/profiling.json",
+            )
+        )
+    ab.save_results(directory, records, 3)
+    return directory
+
+
+def test_default_24_runs_fit_one_readable_text_block_and_reexport_is_offline(completed_ab_results, capsys):
+    directory = completed_ab_results
+    originals = {path: path.read_bytes() for path in directory.rglob("*.json")}
+    paths = ab.export_text(directory)
+    assert len(paths) == 1
+    text = paths[0].read_text(encoding="utf-8")
+    assert len(text.replace("\n", "\r\n").encode("utf-8")) <= 60000 < 65535
+    payload = unpack_text([text])
+    records = [(line.split(" ", 1)[0], json.loads(line.split(" ", 1)[1])) for line in payload.splitlines()]
+    runs = [row for kind, row in records if kind == "RUN"]
+    assert "".join(row["variant"] for row in runs) == "ABCDDCBA" * 3
+    assert all(len(row["rank_mean_us"]) == 32 for row in runs)
+    assert all(row["slowest_mean_rank"] == 31 for row in runs)
+    assert len([row for kind, row in records if kind == "DELTA"]) == 8
+    assert "cat " in capsys.readouterr().out
+    result = subprocess.run([sys.executable, "-I", SCRIPT, "--export-text", directory], capture_output=True, text=True)
+    assert result.returncode == 0, result.stderr
+    assert "Copy this block: cat " in result.stdout
+    assert len(list(directory.glob("copy_text_*/part_001.txt"))) == 2
+    assert all(path.read_bytes() == data for path, data in originals.items())
+
+
+def test_failed_text_is_bounded_and_keeps_status_log_excerpt_and_missing_evidence(completed_ab_results):
+    directory = completed_ab_results
+    error = "错误\n" * 20000
+    ab.write_json(directory / "status.json", dict(complete=False, error=error, restore_error=None))
+    log = directory / "builds/A/build.log"
+    log.parent.mkdir(parents=True)
+    log.write_text("lots of output\n" * 5000 + "[ERROR] compiler failed to build kernel\n", encoding="utf-8")
+    (directory / "run_0/profiling.json").unlink()
+    paths = ab.export_text(directory)
+    assert len(paths) == 1
+    payload = unpack_text([path.read_text(encoding="utf-8") for path in paths])
+    entries = [(line.split(" ", 1)[0], json.loads(line.split(" ", 1)[1])) for line in payload.splitlines()]
+    status = next(value for kind, value in entries if kind == "STATUS")
+    assert status["complete"] is False
+    assert "truncated" in status["error"]
+    assert ab.digest(error.encode("utf-8")) in status["error"]
+    assert any("compiler failed" in row["excerpt"] for kind, row in entries if kind == "ERROR_LOG")
+    first = next(row for kind, row in entries if kind == "RUN")
+    assert first["step"] == 1 and "rank_detail_error" in first
+    assert all(len(path.read_bytes().replace(b"\n", b"\r\n")) < 65535 for path in paths)
+
+
 @pytest.mark.parametrize("fail_at", [None, "perf-B", "build-C", "restore-1"])
 def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
     calls = []
@@ -326,6 +447,10 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
             assert "plan.json" in archive.namelist()
             assert "summary.txt" in archive.namelist()
             assert not any(name.startswith("sources/") for name in archive.namelist())
+        parts = sorted(directory.glob("copy_text_*/part_*.txt"))
+        assert len(parts) == 1
+        payload = unpack_text([path.read_text(encoding="utf-8") for path in parts])
+        assert '"complete":' + ("true" if fail_at is None else "false") in payload
         if fail_at is None:
             records = json.loads((directory / "results.json").read_text())
             assert "".join(row["variant"] for row in records) == "ABCDDCBA"

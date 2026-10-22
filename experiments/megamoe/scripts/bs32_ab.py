@@ -12,6 +12,7 @@ import math
 import os
 from pathlib import Path
 import queue
+import shlex
 import signal
 import socket
 import statistics
@@ -30,6 +31,7 @@ KERNEL = "experiments/megamoe/csrc/kernels/mega_moe/"
 HEADERS = (KERNEL + "mega_moe_wave_a8w4.hpp", KERNEL + "stage/mega_moe_hierarchical_combine.hpp")
 VARIANTS = {"A": (BASE, BASE), "B": (CHANGED, BASE), "C": (BASE, CHANGED), "D": (CHANGED, CHANGED)}
 ORDER = "ABCDDCBA"
+TEXT_MAX_BYTES = 60000  # Includes framing and worst-case clipboard LF -> CRLF expansion.
 
 
 def load_launcher():
@@ -417,6 +419,223 @@ def package_results(directory):
     return output
 
 
+def clipped_text(value, limit=1024):
+    raw = str(value).encode("utf-8")
+    if len(raw) <= limit:
+        return str(value)
+    return (
+        raw[:limit].decode("utf-8", errors="ignore")
+        + f"... [truncated; full UTF-8 bytes={len(raw)} sha256={digest(raw)}]"
+    )
+
+
+def compact_report(directory):
+    """Keep independent observations and provenance; omit redundant rank reports and raw profiles."""
+
+    def read(relative, default):
+        path = directory / relative
+        return json.loads(path.read_text(encoding="utf-8")) if path.is_file() else default
+
+    lines = []
+
+    def emit(kind, value):
+        # ASCII JSON escapes make Unicode errors portable and keep every record
+        # on one physical line, including errors containing embedded newlines.
+        lines.append(kind + " " + json.dumps(value, ensure_ascii=True, separators=(",", ":"), allow_nan=False) + "\n")
+
+    plan, host = read("plan.json", {}), read("host.json", {})
+    status, records = read("status.json", {}), read("results.json", [])
+    comparison = read("comparison.json", {})
+    case, source = plan.get("case", {}), plan.get("source", {})
+    emit(
+        "META",
+        dict(
+            schema="bs32_ab_compact_v1",
+            run=clipped_text(directory.name, 256),
+            node=host.get("node_rank"),
+            host=clipped_text(host.get("hostname", "unknown"), 256),
+            plan_sha256=json_digest(plan),
+            head=source.get("head"),
+            baseline=source.get("baseline"),
+            changed=source.get("changed"),
+            controller=plan.get("controller"),
+            launcher=plan.get("launcher"),
+            build_settings_sha256=json_digest(read("build_settings.json", {})),
+            backend=plan.get("backend"),
+            model=case.get("model"),
+            ep=32,
+            bs=32,
+            input="FP8",
+            weights="FP4",
+            routing="balanced",
+            timer=False,
+            warmup=case.get("warmup"),
+            iters=case.get("iters"),
+            seed=case.get("seed"),
+            selection="tail_half_ceil",
+            order_per_cycle=ORDER,
+            planned_runs=len(plan.get("order", "")),
+            completed_runs=len(records),
+            units="us",
+            metric="rank-local kernel Duration; rank-min mean and rank-max mean",
+            rounding="RUN timings and rank means rounded to 0.001 us; full precision retained on server",
+            duplicate_notice="Both nodes contain the same all-32-rank observations; do not count twice",
+        ),
+    )
+    emit(
+        "STATUS",
+        dict(
+            complete=status.get("complete", False),
+            installed_after_run=status.get("installed_after_run", "unknown"),
+            error=clipped_text(status["error"]) if status.get("error") else None,
+            restore_error=clipped_text(status["restore_error"]) if status.get("restore_error") else None,
+            status_sha256=json_digest(status),
+            accuracy_confirmed_by_completed_perf=sorted({row["variant"] for row in records}),
+        ),
+    )
+    for label in VARIANTS:
+        wheel = read(f"builds/{label}/wheel.json", {})
+        info = wheel.get("build", {})
+        headers = source.get("variants", {}).get(label, {})
+        emit(
+            "VARIANT",
+            dict(
+                label=label,
+                activation_priority=label in "BD",
+                scan_early_stop=label in "CD",
+                scheduler_sha256=headers.get(HEADERS[0]),
+                scan_sha256=headers.get(HEADERS[1]),
+                source_sha256=info.get("source_sha256"),
+                wheel_sha256=wheel.get("sha256"),
+                build_metadata_sha256=json_digest(info),
+                megamoe=info.get("megamoe"),
+                cann=info.get("cann"),
+                compiler=info.get("compiler"),
+            ),
+        )
+    for row in records:
+        entry = {key: row[key] for key in ("step", "block", "variant", "source_sha256")}
+        entry.update({key: round(row[key], 3) for key in ("mean_us", "rank_max_mean_us")})
+        try:
+            path = (directory / row["report"]).resolve()
+            if not path.is_relative_to(directory.resolve()):
+                raise ValueError("Report path escapes this experiment directory")
+            report = read_performance(path, case["iters"])
+            means = [statistics.mean(values) for values in report["per_rank_rounds_us"]]
+            entry.update(
+                rank_mean_us=[round(value, 3) for value in means],
+                slowest_mean_rank=max(range(32), key=means.__getitem__),
+                profiling_sha256=json_digest(report),
+            )
+        except (OSError, ValueError, RuntimeError, KeyError) as error:
+            entry["rank_detail_error"] = clipped_text(error)
+        emit("RUN", entry)
+    for label, data in comparison.get("variants", {}).items():
+        emit("GROUP", dict(variant=label, statistics=data))
+    for name, data in comparison.get("paired_deltas", {}).items():
+        for metric, values in data.items():
+            emit(
+                "DELTA",
+                dict(
+                    contrast=name,
+                    metric=metric,
+                    n=values["n"],
+                    positive=values["positive"],
+                    median_us=values["median"],
+                    min_us=min(values["values"]),
+                    max_us=max(values["values"]),
+                ),
+            )
+    if status.get("error"):
+        # Only bounded tails, never full build logs. Read errors are reported in
+        # place so a damaged log cannot suppress the measurements already saved.
+        logs = [path for root in ("builds", "runs", "restore_D") for path in (directory / root).rglob("*.log")]
+        emitted = 0
+        pattern = load_launcher().ErrorOutput.error
+        for path in sorted(logs, key=lambda p: p.stat().st_mtime, reverse=True):
+            try:
+                with path.open("rb") as stream:
+                    stream.seek(max(0, path.stat().st_size - 32768))
+                    tail = stream.read().decode("utf-8", errors="replace").splitlines()
+                relevant = [line for line in tail if pattern.search(line)]
+                if not relevant:
+                    continue
+                emit(
+                    "ERROR_LOG",
+                    dict(
+                        path=path.relative_to(directory).as_posix(),
+                        excerpt=clipped_text("\n".join(relevant[-8:]), 1536),
+                    ),
+                )
+                emitted += 1
+                if emitted == 3:
+                    break
+            except OSError as error:
+                emit("ERROR_LOG", dict(path=path.name, read_error=clipped_text(error)))
+                break
+    return "".join(lines), host.get("node_rank", "unknown")
+
+
+def text_parts(payload, node, max_bytes=TEXT_MAX_BYTES):
+    """Split at record boundaries; the byte cap counts headers, footer and CRLF."""
+    if not 1024 <= max_bytes <= TEXT_MAX_BYTES:
+        raise ValueError("Text block cap must be between 1024 and 60000 bytes")
+    if node not in (0, 1):
+        node = "unknown"
+    report_hash = digest(payload.encode("utf-8"))
+
+    def frame(body, index, total):
+        return (
+            "-----BEGIN BS32 AB TEXT v1-----\n"
+            f"report_sha256={report_hash}\nnode={node}\npart={index:06d}/{total:06d}\n"
+            f"payload_sha256={digest(body.encode('utf-8'))}\n\n" + body + "-----END BS32 AB TEXT-----\n"
+        )
+
+    def size(value):
+        return len(value.replace("\n", "\r\n").encode("utf-8"))
+
+    overhead = size(frame("", 0, 0))
+    chunks, current, used = [], [], overhead
+    for line in payload.splitlines(keepends=True):
+        length = size(line)
+        if overhead + length > max_bytes:
+            raise ValueError("One compact record exceeds the text block cap")
+        if used + length > max_bytes:
+            chunks.append("".join(current))
+            current, used = [], overhead
+        current.append(line)
+        used += length
+    if current or not chunks:
+        chunks.append("".join(current))
+    if len(chunks) > 999999:
+        raise ValueError("Too many text blocks")
+    parts = [frame(chunk, index, len(chunks)) for index, chunk in enumerate(chunks, 1)]
+    if any(size(part) > max_bytes for part in parts):
+        raise RuntimeError("Text block exceeded its byte budget")
+    return parts
+
+
+def export_text(directory):
+    directory = Path(directory).resolve()
+    if not (directory / "results.json").is_file() or not (directory / "status.json").is_file():
+        raise ValueError("Choose an A/B output directory containing results.json and status.json")
+    payload, node = compact_report(directory)
+    parts = text_parts(payload, node)
+    output = Path(tempfile.mkdtemp(prefix="copy_text_", dir=directory))
+    paths = []
+    for index, part in enumerate(parts, 1):
+        path = output / f"part_{index:03d}.txt"
+        path.write_bytes(part.encode("utf-8"))
+        paths.append(path)
+        size = len(part.replace("\n", "\r\n").encode("utf-8"))
+        print(f"[AB TEXT] Node {node}; part {index}/{len(parts)}; {size} bytes including CRLF (cap 60000)", flush=True)
+        print(f"[AB TEXT] Copy this block: cat {shlex.quote(str(path))}", flush=True)
+    print(
+        "[AB TEXT] Send BEGIN through END from each file, one block per paste; keep blocks from both nodes.", flush=True
+    )
+    return paths
+
+
 def experiment(args, config, launcher, peer, directory):
     records = []
     wheels = {}
@@ -600,8 +819,9 @@ def experiment(args, config, launcher, peer, directory):
             ),
         )
         print(save_results(directory, records, args.cycles, error=str(error) if error else None), flush=True)
+        export_text(directory)
         bundle = package_results(directory)
-        print(f"[AB] Results: {directory / 'summary.txt'}\n[AB] Send this bundle: {bundle}", flush=True)
+        print(f"[AB] Results: {directory / 'summary.txt'}\n[AB] Full local archive: {bundle}", flush=True)
     if error:
         raise error
 
@@ -610,6 +830,12 @@ def main(argv=None):
     launcher = load_launcher()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", type=Path, default=launcher.DEFAULT_CONFIG)
+    parser.add_argument(
+        "--export-text",
+        type=Path,
+        metavar="RUN_DIR",
+        help="Export existing A/B results as small text blocks; no devices or rebuild",
+    )
     parser.add_argument("--cycles", type=int, default=3, help="ABCDDCBA cycles; default 3 = six runs per variant")
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
@@ -617,6 +843,9 @@ def main(argv=None):
     parser.add_argument("--connect-timeout", type=int, default=600)
     parser.add_argument("--stage-timeout", type=int, default=7200, help="Maximum seconds per build/test/barrier")
     args = parser.parse_args(argv)
+    if args.export_text is not None:
+        export_text(args.export_text)
+        return
     if args.cycles < 1 or args.warmup < 0 or args.iters < 2 or min(args.connect_timeout, args.stage_timeout) < 1:
         parser.error("cycles/timeouts must be positive, warmup >= 0, iters >= 2")
     if sys.platform != "linux":
