@@ -229,6 +229,61 @@ bash experiments/megamoe/scripts/run_bs32.sh perf --warmup 20 --iters 100
 也不代表经过跨设备时钟校准的全局起止跨度。`perf` 不传入设备 timer；安装了支持 timer 的 wheel 也不会打点，
 wheel 的编译配置可在每个 rank 的 `manifest.json` 中核对。需要恢复不支持 timer 的构建时执行普通 `build`。
 
+#### BS32：双机自动拆分上一轮改动，交错 A/B
+
+用于定位 `732bb3f` → `bfb6fe8` 两项改动的影响。两台服务器保留现有 BS32 配置、
+已构建的 SHMEM SDK 和 CATLASS，在相同提交、没有已跟踪文件修改的 checkout 中分别执行同一条命令：
+
+```bash
+bash experiments/megamoe/scripts/run_bs32_ab.sh
+```
+
+不用手动切换 Git 分支、修改内核或配置 SSH。脚本从当前提交导出独立源码副本，
+只替换以下两项改动涉及的文件；当前 checkout 的内核须仍与 `bfb6fe8` 一致。
+
+| 版本 | 激活优先调度 | Combine 发完后提前结束扫描 |
+| --- | --- | --- |
+| A | 关闭 | 关闭 |
+| B | 开启 | 关闭 |
+| C | 关闭 | 开启 |
+| D | 开启 | 开启 |
+
+两台分别构建四份 timer-OFF wheel 后缓存，在 `A B C D D C B A` 顺序上重复三遍，
+每个版本测六次，每次预热20轮、采样100轮、统计后50轮；各版本首次运行前执行全 token 精度检查。
+Golden 复用原配置的 `case_dir/golden/`。两端在构建、安装、精度和性能阶段同步，
+核对源码、编译配置、实际安装的包以及各 rank 的构建信息；发生错误、断连或超时后终止当前子进程。
+脚本会安装测试 wheel，因此运行期间应独占这套 Python 环境和32张卡。结束时重新安装 D 组 timer-OFF wheel，
+若中途失败则在 D 已构建成功的情况下尝试恢复；恢复状态写入 `status.json`。
+
+协调端口默认是保存的 `master_port + 1`（默认 **29655/TCP**），需允许节点1连接节点0。
+原有 torchrun/SHMEM 端口保持不变。两端应在10分钟内启动；每个阶段最多等待两小时。
+需要修改时，在两台使用相同参数，例如：
+
+```bash
+bash experiments/megamoe/scripts/run_bs32_ab.sh --control-port 29656 --stage-timeout 14400
+# 仅检查流程能否跑通：每组两次，不作为最终回退结论。
+bash experiments/megamoe/scripts/run_bs32_ab.sh --cycles 1
+# 若使用自定义机器配置，两台分别指定各自的文件。
+bash experiments/megamoe/scripts/run_bs32_ab.sh --config /absolute/path/node.json
+```
+
+输出在 `<case_dir>/ab_node_<本机编号>_<随机字符>/`，不覆盖历史结果：
+
+| 文件 | 内容 |
+| --- | --- |
+| `summary.txt` | 各组两种耗时的中位数/范围；B−A、C−A、D−A及交互项的成对差值 |
+| `results.csv`、`results.json` | 每次独立测试的版本、源码指纹、耗时与结果位置 |
+| `comparison.json` | 各组统计和每个正序/倒序块的差值；正值表示变慢 |
+| `plan.json`、`build_settings.json`、`builds/` | 提交、两文件哈希、编译选项、wheel 信息和构建日志 |
+| `runs/` | 精度/性能日志、32 rank 汇总和本机16 rank 的原始样本及 profiler |
+| `status.json` | 完成/失败原因、最终安装状态 |
+| **`results.zip`** | 可回传的结果包，含上述统计、配置、日志和样本；不含大体积源码/wheel/原始 profiler |
+
+完成后发送**两台服务器各自的 `results.zip`** 即可分析。两台的32 rank汇总是同一份采样，
+统计时不会将它们当作两次独立实验。脚本保留逐次数据，失败也打包已有结果；
+只有完整跑完并恢复成功才标记完成。它不自动把一次慢测或差值为正判定为稳定回退。
+若进程被 `SIGKILL` 或机器掉电，无法执行恢复与打包；已落盘数据保留，可先运行普通 `run_bs32.sh build` 恢复环境。
+
 采集内部流水时，先在两台机器分别构建安装支持 timer 的 wheel，再在两台机器启动 `trace`：
 
 ```bash
