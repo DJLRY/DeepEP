@@ -16,7 +16,8 @@ from deep_ep_experimental.megamoe.timer import breakdown
 
 @pytest.mark.parametrize("rank", [0, 1, 16])
 @pytest.mark.parametrize("warmup,iters", [(2, 1), (0, 5)])
-def test_trace_only_runs_one_warmup_and_batch(tmp_path, monkeypatch, rank, warmup, iters):
+@pytest.mark.parametrize("mode", ["trace", "perf"])
+def test_profile_and_trace_run_one_warmup_and_synchronized_batch(tmp_path, monkeypatch, rank, warmup, iters, mode):
     output = tmp_path / "output"
     config = dict(
         schema_version=1,
@@ -39,7 +40,7 @@ def test_trace_only_runs_one_warmup_and_batch(tmp_path, monkeypatch, rank, warmu
         [
             "benchmark",
             "--mode",
-            "trace",
+            mode,
             "--config",
             str(config_path),
             "--output-dir",
@@ -56,12 +57,14 @@ def test_trace_only_runs_one_warmup_and_batch(tmp_path, monkeypatch, rank, warmu
     group = SimpleNamespace(
         rank=lambda: rank,
         size=lambda: 32,
-        all_gather=lambda value, stage: [value],
+        all_gather=lambda value, stage: [value] * 32 if stage.startswith("profiling BS=") else [value],
         barrier=MagicMock(),
         close=MagicMock(),
         abort=MagicMock(),
     )
     monkeypatch.setattr(api.StoreGroup, "from_env", lambda: group)
+    round_barrier = MagicMock()
+    monkeypatch.setattr(benchmark, "DeviceRoundBarrier", lambda torch, group: round_barrier)
 
     def check(group, stage, error, signature=None):
         assert error is None, f"{stage}: {error}"
@@ -75,7 +78,13 @@ def test_trace_only_runs_one_warmup_and_batch(tmp_path, monkeypatch, rank, warmu
     monkeypatch.setattr(api, "transform_weights_for_mega_moe", lambda *a, **kw: (object(), object()))
     calls = []
     monkeypatch.setattr(api, "fp8_fp4_mega_moe", lambda *a, **kw: calls.append(kw["timer"]))
-    monkeypatch.setattr(benchmark, "collect_profile", lambda *a: pytest.fail("trace started performance profiler"))
+
+    def collect(call, group, torch, config, prefix, directory, bs, *, barrier):
+        assert mode == "perf", "trace started performance profiler"
+        benchmark.enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], barrier=barrier)
+        return [dict(duration_us=i + 1) for i in range(iters)]
+
+    monkeypatch.setattr(benchmark, "collect_profile", collect)
     monkeypatch.setattr(benchmark, "accuracy", lambda *a, **kw: pytest.fail("trace started accuracy check"))
     monkeypatch.setattr(breakdown, "compact_events", lambda *a: [])
     monkeypatch.setattr(breakdown, "rank_breakdown", lambda events, rank: dict(rank=rank))
@@ -84,7 +93,7 @@ def test_trace_only_runs_one_warmup_and_batch(tmp_path, monkeypatch, rank, warmu
     # --mode trace must enable timers itself; no --timer flag is passed.
     benchmark.main()
 
-    selected = rank in (0, 16)
+    selected = mode == "trace" and rank in (0, 16)
     assert len(calls) == warmup + iters
     assert all(value is None for value in calls[:-1])
     assert calls[-1] is (timer if selected else None)
@@ -93,10 +102,24 @@ def test_trace_only_runs_one_warmup_and_batch(tmp_path, monkeypatch, rank, warmu
     assert timer_path.exists() is selected
     if selected:
         assert timer_path.read_bytes() == raw.tobytes()
-    for name in ("profiling.json", "kernel_samples.json", "profiler", "accuracy.json"):
+    for name in (
+        ("profiling.json", "kernel_samples.json", "profiler", "accuracy.json")
+        if mode == "trace"
+        else ("accuracy.json",)
+    ):
         assert not list(output.rglob(name))
+    if mode == "perf":
+        report = json.loads((output / f"rank_{rank}" / "bs_2" / "profiling.json").read_text())
+        assert report["iteration_sync"] == "hccl_all_reduce_before_each_iteration"
+        assert report["alignment_scope"] == "each_iteration_before_device_barrier"
+        assert report["recorded_rounds"] == iters
+        assert len(report["per_rank_rounds_us"]) == 32
+        assert report["timer_pass"] is False
     manifest = json.loads((output / f"rank_{rank}" / "manifest.json").read_text())
-    assert manifest["mode"] == "trace"
+    assert manifest["mode"] == mode
+    assert manifest["iteration_sync"] == "hccl_all_reduce_before_each_iteration"
+    assert round_barrier.call_count == iters  # Includes rank 1, which has no timer.
+    round_barrier.close.assert_called_once()
     buffer.destroy.assert_called_once()
     group.close.assert_called_once()
     group.abort.assert_not_called()

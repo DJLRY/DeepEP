@@ -212,7 +212,15 @@ bash experiments/megamoe/scripts/run_bs32.sh perf --warmup 20 --iters 100
 
 `perf` 不生成或读取 Golden，不重新编译。默认预热20轮、采集100轮，并统计后50轮；
 模型、BS32、FP8输入、FP4权重、balanced路由均与精度用例一致。
-沿用 benchmark 的前置对齐计算，临时占用约12 GB显存/卡；对齐计算不计入 MegaMoE kernel Duration。
+每轮按 `Exp 前置计算 → 全 EP HCCL AllReduce → MegaMoE` 排入设备队列，避免上一轮快慢差直接传入下一轮。
+测试单独建立覆盖全部 EP rank 的 HCCL 进程组，初始化和预热在采集之前完成；算子内部仍使用 SHMEM MTE/RoCE。
+前置计算每轮重复 `alignment.repeats` 次，复用约12 GB显存/卡；前置计算和 AllReduce 均不计入 MegaMoE kernel Duration。
+逐轮对齐会增加整个测试的耗时，并改变轮间缓存状态；与旧连续批次数据比较时须区分测试方式。
+`manifest.json` / `profiling.json` 的 `iteration_sync` 标记为 `hccl_all_reduce_before_each_iteration`。
+这与 [DeepGEMM-Ascend bench_msprof](https://github.com/deepseek-ai/DeepGEMM-Ascend/blob/main/deep_gemm/testing/bench.py)
+及 [DeepEP-Ascend dispatch 测试](https://github.com/deepseek-ai/DeepEP-Ascend/blob/main/tests/ep/test_ep.py)
+的逐轮设备 barrier 思路一致；不在轮间执行 Host barrier 或 `torch.npu.synchronize()`。
+设备 barrier 减少进入偏差，不能保证所有卡在同一时刻执行，也不消除卡间实际计算/通信速度差异。
 结果保存到 `<case_dir>/perf_node_<rank>_<随机字符>/`，终端会打印完整路径和汇总：
 
 | 文件 | 内容 |
@@ -349,7 +357,8 @@ bash experiments/megamoe/scripts/run_bs32.sh trace --timer-ranks 0-31 --warmup 2
 
 `trace` 独立采集设备流水，不执行性能 Profiler 或 Golden 校验。默认预热2轮、运行1轮，
 每个 rank 共调用3次 MegaMoE；仅在采集批次的最后一轮、选中的 rank 上设备打点。
-可用 `--warmup`、`--iters` 覆盖次数；采样前仍保留原有的 Exp 对齐计算，临时占用约12 GB显存/卡。
+可用 `--warmup`、`--iters` 覆盖次数；每轮与 `perf` 一样先执行 Exp 对齐计算及全 EP HCCL barrier，
+临时占用约12 GB显存/卡。未选中 timer 的 rank 也必须参加每轮 barrier。
 正式性能测试使用 `perf`，其默认预热20轮、采集100轮不变。
 `trace` 不会自动构建；未安装支持 timer 的 wheel 时会在启动 worker 前提示执行 `build --timer`。
 更新后需在两台机器重新执行上述 `build --timer` 安装新版 Python 包，才能使用独立的 trace 模式；SHMEM 可复用。

@@ -1,16 +1,54 @@
 # Copyright (c) 2026, Lu Lu
 # Modified by SimpleBright_Man 2026
 
-"""Aligned eager batches and device-kernel measurements."""
+"""Per-round device rendezvous and device-kernel measurements."""
 
 import csv
+from datetime import timedelta
 import math
 from pathlib import Path
 import statistics
 
 
-# 用于对齐各 rank 测试排队的默认前置计算，不在算子/计时区间内。
+# 每轮设备 barrier 前的计算，让 Host 有时间排入后续算子；不计入 kernel Duration。
 DEFAULT_ALIGNMENT = dict(rows=100000, cols=30000, repeats=20)
+ROUND_SYNC = "hccl_all_reduce_before_each_iteration"
+
+
+class DeviceRoundBarrier:
+    """Benchmark-only HCCL rendezvous, ordered on the caller's current stream.
+
+    MegaMoE waits for this stream before launching on its runtime stream and
+    makes this stream wait for completion afterwards. Thus the next collective
+    cannot overtake the previous MegaMoE. Do not host-synchronize between them.
+    """
+
+    def __init__(self, torch, group):
+        import torch.distributed as dist
+
+        if dist.is_initialized():
+            raise RuntimeError("MegaMoE benchmark requires its own HCCL profiling process group")
+        dist.init_process_group(
+            backend="hccl",
+            init_method="env://",
+            rank=group.rank(),
+            world_size=group.size(),
+            timeout=timedelta(seconds=300),
+        )
+        self.dist, self.torch = dist, torch
+        # Zero stays finite across arbitrarily many SUM reductions.
+        self.dummy = torch.zeros(1, dtype=torch.float32, device="npu")
+        self()
+        torch.npu.synchronize()  # Communicator creation stays outside profiling.
+        group.barrier("profiling device barrier ready")
+
+    def __call__(self):
+        # async_op=False inserts the completion dependency on the current stream.
+        self.dist.all_reduce(self.dummy, op=self.dist.ReduceOp.SUM, async_op=False)
+
+    def close(self):
+        self.torch.npu.synchronize()
+        self.dist.destroy_process_group()
 
 
 def alignment_config(config):
@@ -20,11 +58,12 @@ def alignment_config(config):
     return value
 
 
-def enqueue_batch(call, torch, prefix, alignment, iterations, timer=None):
-    """No host barriers, synchronize, or D2H between collective launches."""
-    for _ in range(alignment["repeats"]):
-        torch.exp(prefix, out=prefix)
+def enqueue_batch(call, torch, prefix, alignment, iterations, timer=None, *, barrier):
+    """Queue busy work -> global device rendezvous -> MegaMoE every round."""
     for iteration in range(iterations):
+        for _ in range(alignment["repeats"]):
+            torch.exp(prefix, out=prefix)
+        barrier()
         # 所有 rank 排入同样次数；只在最后一轮、选中的 rank 上打点。
         call(timer if iteration + 1 == iterations else None)
 
@@ -115,7 +154,7 @@ def summarize_rounds(per_rank, ranks_per_node=None):
     return report
 
 
-def collect_profile(call, group, torch, config, prefix, directory, bs):
+def collect_profile(call, group, torch, config, prefix, directory, bs, *, barrier):
     import torch_npu
 
     profiler = torch_npu.profiler
@@ -136,10 +175,10 @@ def collect_profile(call, group, torch, config, prefix, directory, bs):
         with_modules=False,
         experimental_config=experimental,
     ) as prof:
-        # profiler 本身可能初始化很慢，必须在进入后对齐；不能逐轮打断设备队列。
+        # profiler 初始化后先 Host 会合，再逐轮排入设备 barrier，不打断设备队列。
         torch.npu.synchronize()
         group.barrier(f"profiler ready BS={bs}")
-        enqueue_batch(call, torch, prefix, config["alignment"], config["iters"])
+        enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], barrier=barrier)
         torch.npu.synchronize()
         print(f"[PROFILE] BS={bs} batch complete; exporting {directory}", flush=True)
         prof.step()
