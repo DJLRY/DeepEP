@@ -53,6 +53,17 @@ def json_digest(value):
     return digest(json.dumps(value, sort_keys=True, allow_nan=False).encode())
 
 
+def normalize_cmake_prefix_path(value):
+    """Remove repeated Linux search prefixes without reordering or resolving paths."""
+    seen, prefixes = set(), []
+    for prefix in value.split(":"):
+        # Keep empty entries unchanged; only exact, nonempty repeats are redundant.
+        if not prefix or prefix not in seen:
+            prefixes.append(prefix)
+            seen.add(prefix)
+    return ":".join(prefixes)
+
+
 def git(root, *args):
     env = dict(os.environ)
     for key in ("LD_LIBRARY_PATH", "LD_PRELOAD"):
@@ -683,6 +694,11 @@ def experiment(args, config, launcher, peer, directory):
                 "DEEPEP_LINEINFO",
             )
         }
+        write_json(directory / "build_settings_raw.json", flags)
+        flags["CMAKE_PREFIX_PATH"] = normalize_cmake_prefix_path(flags["CMAKE_PREFIX_PATH"])
+        # Apply the same normalized value to the actual compiler environment, not
+        # just the comparison. Re-sourcing CANN commonly prepends duplicate paths.
+        env["CMAKE_PREFIX_PATH"] = flags["CMAKE_PREFIX_PATH"]
         write_json(directory / "build_settings.json", flags)
         peer.exchange("build-settings", flags, same=True)
         # Existing validated SDKs are reused via the supported external SDK build

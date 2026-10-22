@@ -28,6 +28,24 @@ def load():
 
 
 ab = load()
+CANN_PREFIX = "/home/z00880305/CANN_9_2_B100/cann-9.2.0"
+CMAKE_PREFIX = f"{CANN_PREFIX}/toolkit/tools/tikicpulib/lib/cmake:{CANN_PREFIX}/lib64/cmake"
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (f"{CMAKE_PREFIX}:{CMAKE_PREFIX}", CMAKE_PREFIX),
+        ("/second:/first:/second", "/second:/first"),
+        ("/path with spaces:/other:/path with spaces", "/path with spaces:/other"),
+        ("/sdk:/sdk/", "/sdk:/sdk/"),
+        (":/sdk::/sdk:", ":/sdk::"),
+        ("", ""),
+    ],
+)
+def test_cmake_prefix_dedup_preserves_search_order_and_other_spelling(value, expected):
+    assert ab.normalize_cmake_prefix_path(value) == expected
+    assert ab.normalize_cmake_prefix_path(expected) == expected
 
 
 @pytest.fixture
@@ -318,7 +336,7 @@ def test_failed_text_is_bounded_and_keeps_status_log_excerpt_and_missing_evidenc
     assert all(len(path.read_bytes().replace(b"\n", b"\r\n")) < 65535 for path in paths)
 
 
-@pytest.mark.parametrize("fail_at", [None, "perf-B", "build-C", "restore-1"])
+@pytest.mark.parametrize("fail_at", [None, "perf-B", "build-C", "restore-1", "settings-order", "settings-flag"])
 def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
     calls = []
     modules = []
@@ -374,6 +392,7 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
             if peer:
                 peer.check()
             if command[1].endswith("build.py"):
+                assert env["CMAKE_PREFIX_PATH"] == CMAKE_PREFIX
                 label = Path(cwd).name
                 assert (Path(cwd) / ab.HEADERS[0]).read_bytes().startswith(ab.VARIANTS[label][0].encode())
                 assert (Path(cwd) / ab.HEADERS[1]).read_bytes().startswith(ab.VARIANTS[label][1].encode())
@@ -416,11 +435,18 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
         monkeypatch.setattr(module, "run_process", run)
         modules.append(module)
         configurations.append(config)
+        build_env = dict(
+            PYTHON=sys.executable, CMAKE_PREFIX_PATH=f"{CMAKE_PREFIX}:{CMAKE_PREFIX}" if node == 0 else CMAKE_PREFIX
+        )
+        if node == 1 and fail_at == "settings-order":
+            build_env["CMAKE_PREFIX_PATH"] = ":".join(reversed(CMAKE_PREFIX.split(":")))
+        if node == 1 and fail_at == "settings-flag":
+            build_env["CXXFLAGS"] = "-O0"
         launchers.append(
             SimpleNamespace(
                 __file__=str(launcher_path),
                 CASE=ab.load_launcher().CASE,
-                environment=lambda _: {"PYTHON": sys.executable},
+                environment=lambda _, env=build_env: dict(env),
             )
         )
         directories.append(directory)
@@ -440,8 +466,15 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
         status = json.loads((directory / "status.json").read_text())
         assert status["complete"] is (fail_at is None)
         assert json.loads((directory / "comparison.json").read_text())["complete"] is (fail_at is None)
+        raw_settings = json.loads((directory / "build_settings_raw.json").read_text())
+        settings = json.loads((directory / "build_settings.json").read_text())
+        if node == 0:
+            assert raw_settings["CMAKE_PREFIX_PATH"] == f"{CMAKE_PREFIX}:{CMAKE_PREFIX}"
+            assert settings["CMAKE_PREFIX_PATH"] == CMAKE_PREFIX
         assert status["installed_after_run"] == (
-            "not verified" if fail_at == "restore-1" and node == 1 else "D (timer OFF)"
+            "not verified"
+            if (fail_at == "restore-1" and node == 1) or fail_at in {"settings-order", "settings-flag"}
+            else "D (timer OFF)"
         )
         with zipfile.ZipFile(directory / "results.zip") as archive:
             assert "plan.json" in archive.namelist()
@@ -463,6 +496,8 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
             for node in range(2):
                 assert (node, f"accuracy-{label}") in calls[:first_perf]
                 assert (node, f"install-{label}") in calls[:first_perf]
+    if fail_at in {"settings-order", "settings-flag"}:
+        assert calls == []  # Real configuration mismatches still stop before building.
 
 
 def test_cli_help_isolated():
