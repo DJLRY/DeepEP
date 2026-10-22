@@ -139,7 +139,13 @@ void RunTokenCombineSlice(const MoeStageCommonConfig&, const AivJobContext& job,
     params.lastConsumer = job;
 }
 
-struct Fixture
+// Keep this member in a dependent base, as in the production kernel. Declaring
+// it directly in the fixture would hide missing this-> qualification errors.
+template <typename Tag> struct FixtureBase
+{
+    AivJobContext aivJob_{1U, 56U};
+};
+template <typename Tag> struct FixtureImpl : FixtureBase<Tag>
 {
     struct ExpertTokenPosition
     {
@@ -163,7 +169,6 @@ struct Fixture
     TilingData tiling{};
     Params params_{&tiling};
     AivJobContext waveCombineJob_{};
-    AivJobContext aivJob_{1U, 56U};
     struct
     {
         AivJobContext blockJob{};
@@ -176,12 +181,12 @@ struct Fixture
     bool activationReady = false, activationDone = false;
     uint32_t currentSlice = 0U, retired = 0U, remoteCalls = 0U;
 
-    explicit Fixture(uint32_t block = 0U, uint32_t blocks = 28U, bool hierarchical = true)
+    explicit FixtureImpl(uint32_t block = 0U, uint32_t blocks = 28U, bool hierarchical = true)
     {
         tiling.hierarchical = hierarchical;
         waveCombineJob_ = {block, blocks};
         gmmExecutionConfig_.blockJob = waveCombineJob_;
-        aivJob_ = {2U * block + 1U, 2U * blocks};
+        this->aivJob_ = {2U * block + 1U, 2U * blocks};
     }
     static AivTaskCursor Slice(uint32_t rows, uint64_t prefix, uint64_t wave, uint32_t expert = 0U,
                                uint32_t rowStart = 0U)
@@ -258,7 +263,7 @@ struct Fixture
     }
     bool TryProgressRemoteCombine()
     {
-        assert(aivJob_.jobIndex == HierarchicalSendJob() && tiling.hierarchical);
+        assert(this->aivJob_.jobIndex == HierarchicalSendJob() && tiling.hierarchical);
         assert(++remoteCalls < 100U);
         if (remoteCalls == 1U)
         {
@@ -276,6 +281,8 @@ struct Fixture
         return remoteCalls % 2U != 0U;
     }
 };
+
+using Fixture = FixtureImpl<void>;
 
 void Coverage()
 {
