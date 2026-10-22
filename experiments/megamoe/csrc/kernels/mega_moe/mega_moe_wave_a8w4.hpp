@@ -276,23 +276,37 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
 {
     const auto& begin = cursor.slice.begin;
     uint32_t rows = static_cast<uint32_t>(cursor.slice.end.globalTokenIndex - begin.globalTokenIndex);
-    // 只轮换当前 AIV1 的通信任务，不修改成员中的物理核编号。
+    // RoCE owner 保留 SwiGLU 和远端 progress，把本地 Combine 搬运交给其余 AIV1。
+    // 只修改局部 consumer job；成员 waveCombineJob_ 仍描述原来的 GMM2 生产核。
+    auto combineJob = waveCombineJob_;
+    const bool offloadRoceCombine = UseHierarchicalRoce(params_.tilingData) && combineJob.totalJobs > 1U;
+    const bool roceOwner = offloadRoceCombine && aivJob_.jobIndex == HierarchicalSendJob();
+    if (offloadRoceCombine) {
+        constexpr uint32_t AIV_CORE_COUNT_PER_AIC = 2U;
+        const uint32_t ownerBlock = HierarchicalSendJob() / AIV_CORE_COUNT_PER_AIC;
+        --combineJob.totalJobs;
+        if (combineJob.jobIndex == ownerBlock) {
+            combineJob.jobIndex = combineJob.totalJobs;  // 空任务，仍需探测当前 slice 的生产完成状态。
+        } else if (combineJob.jobIndex > ownerBlock) {
+            --combineJob.jobIndex;
+        }
+    }
+    // 在剩余 consumer 空间轮换完整行任务，不修改成员中的物理核编号。
     // 输入是 Combine 自己的逻辑 wave（cursor.wave），不是当前 Dispatch/GMM1 的进度；
     // BS>=4096 时 GMM2 滞后一轮，使用其他阶段的 wave 会把同一批输出分给错误的 owner。
-    // GMM2 反向分核、通信 owner 轮换都不改变 slice 的身份和实际生产核数量。
-    auto combineJob = waveCombineJob_;
+    // GMM2 反向分核、Combine consumer 轮换都不改变 slice 的身份和实际生产核数量。
     if (combineJob.totalJobs != 0U && combineJob.jobIndex < combineJob.totalJobs) {
         uint32_t shift = static_cast<uint32_t>(cursor.wave % combineJob.totalJobs);
-        // 与 Dispatch 相同：物理核 c 在 wave w 执行逻辑核 (c-w) mod 核数 的连续行任务。
+        // consumer c 在 wave w 执行逻辑任务 (c-w) mod consumer 数的连续行任务。
         // 条件减法避免无符号下溢；先取模再转换，保证较大的 wave 编号也能正确轮换。
         combineJob.jobIndex = combineJob.jobIndex >= shift ? combineJob.jobIndex - shift
                                                            : combineJob.jobIndex + combineJob.totalJobs - shift;
     }
-    // 本次只重映射完整任务，不新增 peer 分段。结合原有全局行前缀，等价首 owner 为
-    // (sliceGlobalRowStart + cursor.wave) mod 核数；同 wave 跨专家的 slice 使用同一偏移。
+    // 结合原有全局行前缀，等价首 consumer 为 (sliceGlobalRowStart + cursor.wave)
+    // mod consumer 数；同 wave 跨专家的 slice 使用同一偏移。
     // 空任务判断必须使用轮换后的 owner，否则小 batch/尾片可能被错误跳过而漏发。
     WorkRange owned = GetWaveCombineOwnedRange(combineJob, rows, begin.globalTokenIndex);
-    if (owned.count == 0U) {
+    if (owned.count == 0U && !roceOwner) {
         return true;
     }
     // 只读取当前 expert/slice 的计数；不同 slice 不共用槽，快核后续通知不能代偿慢核。
@@ -302,10 +316,15 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
         static_cast<int32_t>(GetTokenCombineProducerCount(commonConfig_, waveCombineJob_, rows))) {
         return false;
     }
+    timer_.SetWave(static_cast<int64_t>(cursor.wave));
+    // owner 不搬行，但必须随 GMM2 就绪推进 slice；不能一次跳过全部 slice 后提前
+    // 进入 SyncAll，停止 RDMA progress。未就绪时仍由调度器推进其他工作，绝不阻塞。
+    if (owned.count == 0U) {
+        return true;
+    }
     ExpertLoopState state = CreateExpertLoopState(commonConfig_);
     state.expertIdx = begin.expertIdx;
     state.globalTokenStartIndex = begin.globalTokenIndex - begin.tokenIndexInExpert;
-    timer_.SetWave(static_cast<int64_t>(cursor.wave));
     // 将就绪检查使用的同一份 job 传给实际发送，保证判定和发送的行范围一致。
     // 当前 slice 已检查就绪，模板 true 跳过发送入口内的重复等待。计数只增不减，
     // 到本次算子结束前不会重置，因此检查与发送之间无需再次轮询。

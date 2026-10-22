@@ -229,10 +229,11 @@ bash experiments/megamoe/scripts/run_bs32.sh perf --warmup 20 --iters 100
 也不代表经过跨设备时钟校准的全局起止跨度。`perf` 不传入设备 timer；安装了支持 timer 的 wheel 也不会打点，
 wheel 的编译配置可在每个 rank 的 `manifest.json` 中核对。需要恢复不支持 timer 的构建时执行普通 `build`。
 
-#### BS32：Dispatch 单次完成通知，双机 A/B
+#### BS32：Dispatch 单次完成通知，双机 A/B（历史实验）
 
-本轮以已测量的 A 调度为基线，关闭上一轮新增的 activation 重查和扫描末尾提前退出。
-两台服务器保留现有 BS32 配置及已构建的依赖，在更新到同一提交后分别执行：
+此实验已完成，保留用于复现 `546182b`；后续优化使用 `build`、`run`、一次 `perf` 的流程，
+将结果与前一版本比较。当前 Combine owner 分工已变化，不满足此历史实验的单文件差异约束。
+复现时使用相同的 `546182b` checkout，保留现有 BS32 配置及已构建的依赖，再分别执行：
 
 ```bash
 bash experiments/megamoe/scripts/run_bs32_dispatch_ab.sh
@@ -248,7 +249,7 @@ B 使用当前提交的 Dispatch（两次数据 Put 共用一次完成通知）�
 两台分别沿用自己的环境，不比较 CMake、SDK 指纹或编译选项是否相同。
 
 A 首先构建，结束后恢复 **A（timer OFF）**；中途失败也在 A 已构建成功时尝试恢复。
-普通 `run_bs32.sh build` 构建的是当前源码的 B，因此应先看 A/B 实测结果再决定采用哪版。
+在该历史提交上，普通 `run_bs32.sh build` 构建的是 B；结束后的已安装版本应以恢复状态为准。
 结果目录仍是 `<case_dir>/ab_node_<本机编号>_<随机字符>/`；终端会打印可直接复制的 `cat` 命令，
 两台各回传 BEGIN 到 END 的完整文本块，每块最多60000字节。摘要中 `B-A` 为负表示优化变快。
 `META.experiment=dispatch`、版本的 `dispatch_commits` 和源码哈希用于区别上一轮实验。
@@ -263,7 +264,7 @@ bash experiments/megamoe/scripts/run_bs32_dispatch_ab.sh --export-text /absolute
 #### BS32：上一轮调度改动的四组 A/B（历史实验）
 
 此入口保留用于复现 `732bb3f` → `bfb6fe8`，要求内核仍为 `bfb6fe8`（例如 checkout `e888921`）；
-当前 Dispatch 优化请使用上节的新入口。两台服务器保留现有 BS32 配置、
+Dispatch 的历史实验见上节。两台服务器保留现有 BS32 配置、
 已构建的 SHMEM SDK 和 CATLASS，在相同提交、没有已跟踪文件修改的 checkout 中分别执行同一条命令：
 
 ```bash
@@ -548,7 +549,7 @@ AIV1 在 Dispatch 和 Combine 全程独占 QP1，包括 Put、quiet 和 commit�
 一次 quiet 覆盖两份数据，再发布共用的 `NetPayloadCommit` 并 quiet 该通知。四次 quiet 减为两次，
 接收 leader 获取这个标记后才发布 `MetaReady` 并转发 metadata；发送 owner 仍在完成本地发送后
 获取对端同一标记、发布 `RelayPayloadReady`。公共输入 barrier 保留，统一 commit 必须在它之前发布。
-这会放弃 metadata 提前到达时的 relay 重叠机会，收益须由本轮 A/B 验证。
+这会放弃 metadata 提前到达时的 relay 重叠机会，整体收益以关闭打点的 perf 为准。
 H=3584、B=32 时 payload 为118784 B；相较已测 EP32/K8 balanced 样本的8次7424 B提交，
 该策略以每 rank 额外59392 B流量换取一次提交和更少的发送端扫描工作。
 性能验证应同时检查 payload POST 次数、quiet、输入准备结束及首 GMM 时间，
@@ -566,9 +567,14 @@ gateway 检查调用由448次降为16次；这些是依赖检查调用数，未�
 
 A8W4 的跨机 Combine 在 AIV1 的计算间隙分批推进：两台机器均每次最多提交2个 Put、
 扫描64个 `[token, top-k]` 槽位。扫描游标跨调用保留，已发送槽位不再读取 ready flag；
-全部发送后立即返回。推进穿插于 AIV1 的 activation、dispatch 和本地 Combine 工作，
-本地 Combine 完成后立即尝试远端推进，再回到循环入口检查 activation。
-这是四组 A/B 中较快的 A 调度；激活的 ready sequence 和 tile/slice 游标仍由同一入口推进。
+全部发送后立即返回。固定物理 AIV1 保留 activation、dispatch 和远端推进，
+本地 Combine 搬运交给其余 AIV1：28个 AIC 时由剩余27个 AIV1 均衡分配完整行，
+在27个 consumer 的空间内按 Combine wave 和全局行前缀轮换，确保每行只搬运一次。
+GMM2 仍使用原28个生产核及其实际完成计数，不能用27个搬运核代替生产核数。
+owner 对每个 Combine slice 保留非阻塞生产完成检查，就绪后推进 slice 并尝试远端发送，
+再回到循环入口检查 activation；尚未就绪时继续其他任务和有预算的远端推进。
+这避免 owner 因无本地行而立即跳完所有 slice、提前进入 SyncAll。非 RoCE、A8W8 路径
+及仅一个 AIC 的回退路径沿用原本地 Combine 分工；QP1 始终由固定物理 AIV1 独占。
 最终 host barrier 后完整 drain，再执行 payload quiet、commit、commit quiet 和对端 commit 等待。
 单次 Put 内部仍可能因队列回压等待，这些计数预算并非硬性时间上限。
 扫描在单次调用内缓存当前 token 的 pending mask，通过递增槽位推进，避免逐行除模；
@@ -579,9 +585,13 @@ A8W4 的跨机 Combine 在 AIV1 的计算间隙分批推进：两台机器均每
 Combine 路由首次初始化使用 owner 专用256 B UB 分块 DMA 读取已接收的 rail 元数据；
 BS32、K8 时为5次256 B DMA，跳过每个512 B packet 的末尾 marker。
 该初始化优化也适用于 A8W8，其 Combine 仍由 AIV1 每次完整扫描。
-更新后两台均需重新构建安装；按上述 BS32 流程先执行 `run` 校验精度，再执行
-`perf` 比较 `rank-max-mean`，并固定 `trace --timer-ranks 0,14,16,30 --include-wait`
-检查输入 payload、计算尾部、Combine POST 分布和 quiet/commit 等待。CPU 回归不能替代这些设备检查。
+更新后两台均需重新构建安装 timer OFF 版本；按上述 BS32 流程先执行 `run` 校验精度，
+再执行一次 `perf`（默认20次 warmup、100次采样，统计后50次），将两个指标与前一版本比较。
+本轮通信 owner 搬运卸载的比较基线为单 Dispatch commit 版本的279.211/297.744 μs
+（rank-min mean / rank-max mean），不将随后恢复 A 的299.133/316.127 μs重复计入收益。
+常规迭代不自动运行 A/B 或重复确认；需要定位阶段时，再单独采集
+`trace --timer-ranks 0,14,16,30 --include-wait`，检查输入 payload、计算尾部、
+Combine POST 分布和 quiet/commit 等待。CPU 回归不能替代设备精度与性能检查。
 
 两机 RoCE runtime 的 `barrier()` 和 `destroy()` 先同步本卡全部 stream，再通过现有
 StoreGroup（TCPStore）或 ProcessGroup 交换完成状态；全部 rank 成功后才允许清理 SHMEM。
