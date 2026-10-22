@@ -260,7 +260,7 @@ void DataCopy(const LocalTensor<T>& destination, const GlobalTensor<T>& source, 
     auto& s = *state;
     Check(s.overwriteOrdered && s.pendingDma == nullptr, "ready DMA reused live scratch");
     Check(destination.Data() == reinterpret_cast<T*>(s.ub.data()), "ready DMA used unowned scratch");
-    Check(source.GetL2CacheHint() == CacheMode::CACHE_MODE_DISABLE, "ready DMA enabled L2 cache");
+    Check(source.GetL2CacheHint() == CacheMode::CACHE_MODE_NORMAL, "ready DMA disabled the default L2 cache");
     Check(copy.blockCount > 0U && copy.blockCount <= 8U && copy.blockLen == 1U &&
               copy.srcStride == 15U && copy.dstStride == 0U, "invalid ready gather geometry");
     const auto offset = source.Data() - s.flags.data();

@@ -583,7 +583,7 @@ owner 对每个 Combine slice 保留非阻塞生产完成检查，就绪后推�
 后续调用在全部行已提交时直接返回。提交完成不代表传输完成，后者仍由后续 quiet 保证。
 
 ready 探测通过一次跨步 DMA，将最多8个512 B flag 槽的首32 B收集到 owner 专用256 B UB。
-读取使用 `CACHE_MODE_DISABLE`，DMA 完成后仅将匹配当前完整 sequence 的结果保留为标量位图，
+读取沿用默认 L2 缓存策略 `CACHE_MODE_NORMAL`，DMA 完成后仅将匹配当前完整 sequence 的结果保留为标量位图，
 并完成 scalar→MTE2 顺序保障，再允许 Put 复用 scratch。普通 Put 的后端在返回前完成其 UB 搬运，
 因此下一批快照可以复用同一空间；这里不使用需要保留 workspace 的 aggregate Put。
 预取可以包含洞和已发送槽位，但实际发送仍受 pending mask 约束；每批不越过物理行末尾或剩余扫描预算。

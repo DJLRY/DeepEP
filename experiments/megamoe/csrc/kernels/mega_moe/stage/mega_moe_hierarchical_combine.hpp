@@ -108,7 +108,6 @@ struct HierarchicalCombineReadySnapshot {
             GlobalTensor<int32_t> flags;
             flags.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(
                 params.peermemInfo.gatewayCombineReadyPtr + static_cast<uint64_t>(row) * HIERARCHICAL_FLAG_BYTES));
-            flags.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
             LocalTensor<int32_t> snapshot(TPosition::VECCALC, params.tilingData->roceScratchUbOffset,
                                            MEGAMOE_ROCE_SCRATCH_BYTES / sizeof(int32_t));
             SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
