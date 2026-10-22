@@ -1,6 +1,6 @@
 # Copyright (c) 2026, Lu Lu
 
-"""Run the four BS32 regression variants; launch this command once on each host."""
+"""Run a synchronized BS32 comparison; launch this command once on each host."""
 
 import argparse
 from contextlib import contextmanager
@@ -31,6 +31,36 @@ KERNEL = "experiments/megamoe/csrc/kernels/mega_moe/"
 HEADERS = (KERNEL + "mega_moe_wave_a8w4.hpp", KERNEL + "stage/mega_moe_hierarchical_combine.hpp")
 VARIANTS = {"A": (BASE, BASE), "B": (CHANGED, BASE), "C": (BASE, CHANGED), "D": (CHANGED, CHANGED)}
 ORDER = "ABCDDCBA"
+DISPATCH_HEADER = KERNEL + "stage/mega_moe_hierarchical_dispatch.hpp"
+EXPERIMENTS = {
+    "scheduling": dict(
+        baseline=BASE,
+        changed=CHANGED,
+        headers=HEADERS,
+        variants=VARIANTS,
+        order=ORDER,
+        build_order="DABC",
+        restore="D",
+        description="A=baseline; B=activation priority; C=scan early stop; D=both",
+        contrasts={
+            "B-A": {"B": 1, "A": -1},
+            "C-A": {"C": 1, "A": -1},
+            "D-A": {"D": 1, "A": -1},
+            "D-B-C+A": {"D": 1, "B": -1, "C": -1, "A": 1},
+        },
+    ),
+    "dispatch": dict(
+        baseline=BASE,
+        changed="HEAD",
+        headers=(DISPATCH_HEADER,),
+        variants={"A": (BASE,), "B": ("HEAD",)},
+        order="ABBA",
+        build_order="AB",
+        restore="A",
+        description="A=separate Dispatch commits; B=one Dispatch commit; both use the A scheduling baseline",
+        contrasts={"B-A": {"B": 1, "A": -1}},
+    ),
+}
 TEXT_MAX_BYTES = 60000  # Includes framing and worst-case clipboard LF -> CRLF expansion.
 
 
@@ -71,26 +101,32 @@ def git(root, *args):
     return subprocess.check_output(["git", "-C", str(root), *args], env=env, stderr=subprocess.PIPE)
 
 
-def source_plan(root):
+def source_plan(root, *, experiment="scheduling"):
+    spec = EXPERIMENTS[experiment]
+    baseline, changed, headers = (spec[key] for key in ("baseline", "changed", "headers"))
     # Ignore unrelated untracked reports, but never silently omit tracked edits.
     if git(root, "status", "--porcelain", "--untracked-files=no", "--ignore-submodules=all").strip():
         raise RuntimeError("Tracked files have local edits; commit them before the A/B source snapshot")
     head = git(root, "rev-parse", "HEAD").decode().strip()
     changed_paths = set(
-        git(root, "diff", "--name-only", BASE, CHANGED, "--", "csrc", "experiments/megamoe/csrc").decode().splitlines()
+        git(root, "diff", "--name-only", baseline, changed, "--", "csrc", "experiments/megamoe/csrc")
+        .decode()
+        .splitlines()
     )
-    if changed_paths != set(HEADERS):
-        raise RuntimeError("The reference commits no longer identify exactly the two expected kernel changes")
-    if git(root, "diff", CHANGED, head, "--", "csrc", "experiments/megamoe/csrc").strip():
-        raise RuntimeError("Current native sources differ from bfb6fe8; this experiment requires its kernel baseline")
-    blobs = {ref: {path: git(root, "show", f"{ref}:{path}") for path in HEADERS} for ref in (BASE, CHANGED)}
+    if changed_paths != set(headers):
+        raise RuntimeError(f"Reference sources do not identify exactly the expected {experiment} kernel changes")
+    if git(root, "diff", changed, head, "--", "csrc", "experiments/megamoe/csrc").strip():
+        raise RuntimeError(f"Current native sources differ from {changed}; use the matching {experiment} baseline")
+    refs = {ref: git(root, "rev-parse", ref).decode().strip() for ref in (baseline, changed)}
+    blobs = {ref: {path: git(root, "show", f"{revision}:{path}") for path in headers} for ref, revision in refs.items()}
     variants = {
-        label: {path: digest(blobs[ref][path]) for path, ref in zip(HEADERS, refs)} for label, refs in VARIANTS.items()
+        label: {path: digest(blobs[ref][path]) for path, ref in zip(headers, variant)}
+        for label, variant in spec["variants"].items()
     }
     return dict(
         head=head,
-        baseline=git(root, "rev-parse", BASE).decode().strip(),
-        changed=git(root, "rev-parse", CHANGED).decode().strip(),
+        baseline=refs[baseline],
+        changed=refs[changed],
         variants=variants,
     ), blobs
 
@@ -341,10 +377,11 @@ def read_performance(path, iters):
     return report
 
 
-def summarize(records, cycles):
+def summarize(records, cycles, *, experiment="scheduling"):
+    spec = EXPERIMENTS[experiment]
     metrics = ("mean_us", "rank_max_mean_us")
-    summary = {"complete": len(records) == 8 * cycles, "variants": {}, "paired_deltas": {}}
-    for label in VARIANTS:
+    summary = {"complete": len(records) == len(spec["order"]) * cycles, "variants": {}, "paired_deltas": {}}
+    for label in spec["variants"]:
         rows = [row for row in records if row["variant"] == label]
         if rows:
             summary["variants"][label] = {
@@ -356,18 +393,13 @@ def summarize(records, cycles):
                 )
                 for key in metrics
             }
-    # Each forward/reverse half is one block containing exactly A/B/C/D.
+    # Each forward/reverse half is one block containing every variant once.
     # Never pair the two hosts' duplicate all-rank reports as independent runs.
-    for name, coefficients in {
-        "B-A": {"B": 1, "A": -1},
-        "C-A": {"C": 1, "A": -1},
-        "D-A": {"D": 1, "A": -1},
-        "D-B-C+A": {"D": 1, "B": -1, "C": -1, "A": 1},
-    }.items():
+    for name, coefficients in spec["contrasts"].items():
         deltas = {key: [] for key in metrics}
         for block in sorted({row["block"] for row in records}):
             group = {row["variant"]: row for row in records if row["block"] == block}
-            if set(group) == set(VARIANTS):
+            if set(group) == set(spec["variants"]):
                 for key in metrics:
                     deltas[key].append(sum(group[label][key] * factor for label, factor in coefficients.items()))
         if deltas[metrics[0]]:
@@ -380,31 +412,30 @@ def summarize(records, cycles):
     return summary
 
 
-def save_results(directory, records, cycles, *, error=None):
+def save_results(directory, records, cycles, *, error=None, experiment="scheduling"):
+    spec = EXPERIMENTS[experiment]
     write_json(directory / "results.json", records)
     with (directory / "results.csv").open("w", newline="", encoding="utf-8") as stream:
         fields = ["step", "block", "variant", "mean_us", "rank_max_mean_us", "source_sha256", "report"]
         writer = csv.DictWriter(stream, fieldnames=fields)
         writer.writeheader()
         writer.writerows({key: row[key] for key in fields} for row in records)
-    summary = summarize(records, cycles)
+    summary = summarize(records, cycles, experiment=experiment)
     summary["error"] = error
     if error is not None:
         summary["complete"] = False
     write_json(directory / "comparison.json", summary)
     lines = [
-        f"BS32 A/B: {'COMPLETE' if summary['complete'] else 'PARTIAL'}; {len(records)}/{cycles * 8} perf runs",
+        f"BS32 A/B: {'COMPLETE' if summary['complete'] else 'PARTIAL'}; {len(records)}/{cycles * len(spec['order'])} perf runs",
         "EP32 BS32 H3584 I1280 E384 K8 S0; FP8/FP4; balanced; timer OFF",
-        "A=baseline; B=activation priority; C=scan early stop; D=both",
+        spec["description"],
         "Kernel Duration only; rank-local clocks; each perf run uses the tail half of its samples.",
         "Variant | runs | rank-min mean median [min,max] us | rank-max mean median [min,max] us",
     ]
     for label, data in summary["variants"].items():
         cells = [f"{v['median']:.3f} [{v['min']:.3f},{v['max']:.3f}]" for v in data.values()]
         lines.append(f"{label} | {data['mean_us']['n']} | " + " | ".join(cells))
-    lines.append(
-        "Paired block deltas: positive = slower; interaction = D-B-C+A (descriptive, not a significance test)."
-    )
+    lines.append("Paired block deltas: positive = slower (descriptive, not a significance test).")
     for name, data in summary["paired_deltas"].items():
         cells = [f"{key}: {v['median']:+.3f} us, positive {v['positive']}/{v['n']}" for key, v in data.items()]
         lines.append(name + " | " + " | ".join(cells))
@@ -458,10 +489,13 @@ def compact_report(directory):
     status, records = read("status.json", {}), read("results.json", [])
     comparison = read("comparison.json", {})
     case, source = plan.get("case", {}), plan.get("source", {})
+    experiment = plan.get("experiment", "scheduling")
+    spec = EXPERIMENTS[experiment]
     emit(
         "META",
         dict(
             schema="bs32_ab_compact_v1",
+            experiment=experiment,
             run=clipped_text(directory.name, 256),
             node=host.get("node_rank"),
             host=clipped_text(host.get("hostname", "unknown"), 256),
@@ -484,7 +518,7 @@ def compact_report(directory):
             iters=case.get("iters"),
             seed=case.get("seed"),
             selection="tail_half_ceil",
-            order_per_cycle=ORDER,
+            order_per_cycle=spec["order"],
             planned_runs=len(plan.get("order", "")),
             completed_runs=len(records),
             units="us",
@@ -504,18 +538,30 @@ def compact_report(directory):
             accuracy_confirmed_by_completed_perf=sorted({row["variant"] for row in records}),
         ),
     )
-    for label in VARIANTS:
+    for label in spec["variants"]:
         wheel = read(f"builds/{label}/wheel.json", {})
         info = wheel.get("build", {})
         headers = source.get("variants", {}).get(label, {})
-        emit(
-            "VARIANT",
+        features = (
             dict(
-                label=label,
                 activation_priority=label in "BD",
                 scan_early_stop=label in "CD",
                 scheduler_sha256=headers.get(HEADERS[0]),
                 scan_sha256=headers.get(HEADERS[1]),
+            )
+            if experiment == "scheduling"
+            else dict(
+                activation_priority=False,
+                scan_early_stop=False,
+                dispatch_commits=2 if label == "A" else 1,
+                dispatch_sha256=headers.get(DISPATCH_HEADER),
+            )
+        )
+        emit(
+            "VARIANT",
+            dict(
+                label=label,
+                **features,
                 source_sha256=info.get("source_sha256"),
                 wheel_sha256=wheel.get("sha256"),
                 build_metadata_sha256=json_digest(info),
@@ -560,7 +606,11 @@ def compact_report(directory):
     if status.get("error"):
         # Only bounded tails, never full build logs. Read errors are reported in
         # place so a damaged log cannot suppress the measurements already saved.
-        logs = [path for root in ("builds", "runs", "restore_D") for path in (directory / root).rglob("*.log")]
+        logs = [
+            path
+            for root in ("builds", "runs", f"restore_{spec['restore']}")
+            for path in (directory / root).rglob("*.log")
+        ]
         emitted = 0
         pattern = load_launcher().ErrorOutput.error
         for path in sorted(logs, key=lambda p: p.stat().st_mtime, reverse=True):
@@ -648,16 +698,23 @@ def export_text(directory):
 
 
 def experiment(args, config, launcher, peer, directory):
+    name = getattr(args, "experiment", "scheduling")
+    spec = EXPERIMENTS[name]
+    restore_label = spec["restore"]
     records = []
     wheels = {}
     env = None
     error = None
     try:
-        source, blobs = source_plan(ROOT)
+        # Preserve experiment/node identity even if source preparation fails.
+        write_json(directory / "plan.json", dict(schema_version=1, experiment=name))
+        write_json(directory / "host.json", dict(config, hostname=socket.gethostname(), root=str(ROOT)))
+        source, blobs = source_plan(ROOT, experiment=name)
         plan = dict(
             schema_version=1,
+            experiment=name,
             source=source,
-            order=ORDER * args.cycles,
+            order=spec["order"] * args.cycles,
             case=dict(launcher.CASE, warmup=args.warmup, iters=args.iters),
             backend=config["rdma_backend"],
             master_addr=config["master_addr"],
@@ -667,7 +724,6 @@ def experiment(args, config, launcher, peer, directory):
             launcher=digest(Path(launcher.__file__).read_bytes()),
         )
         write_json(directory / "plan.json", plan)
-        write_json(directory / "host.json", dict(config, hostname=socket.gethostname(), root=str(ROOT)))
         peer.exchange("plan", plan, same=True)
         env = launcher.environment(config)
         env.update(
@@ -704,11 +760,11 @@ def experiment(args, config, launcher, peer, directory):
         # peer; the ordinary build reports any unusable local dependencies.
         sources = directory / "sources"
         sources.mkdir()
-        for label in "DABC":
+        for label in spec["build_order"]:
             peer.exchange(f"build-start-{label}")
             tree = sources / label
             snapshot(ROOT, tree, source["head"])
-            for path, ref in zip(HEADERS, VARIANTS[label]):
+            for path, ref in zip(spec["headers"], spec["variants"][label]):
                 (tree / path).write_bytes(blobs[ref][path])
             build_dir = directory / "builds" / label
             build_dir.mkdir(parents=True)
@@ -736,8 +792,8 @@ def experiment(args, config, launcher, peer, directory):
             wheels[label] = (wheel, info)
             write_json(build_dir / "wheel.json", dict(path=str(wheel), sha256=digest(wheel.read_bytes()), build=info))
             peer.exchange(f"build-done-{label}", info["source_sha256"], same=True)
-        if len({info["source_sha256"] for _, info in wheels.values()}) != 4:
-            raise RuntimeError("Four variants did not produce four distinct source fingerprints")
+        if len({info["source_sha256"] for _, info in wheels.values()}) != len(spec["variants"]):
+            raise RuntimeError("Variants did not produce distinct source fingerprints")
         checked = set()
         installed = None
         for index, label in enumerate(plan["order"]):
@@ -786,7 +842,7 @@ def experiment(args, config, launcher, peer, directory):
             records.append(
                 dict(
                     step=index + 1,
-                    block=index // 4,
+                    block=index // len(spec["variants"]),
                     variant=label,
                     mean_us=report["mean_us"],
                     rank_max_mean_us=report["rank_max_mean_us"],
@@ -794,19 +850,19 @@ def experiment(args, config, launcher, peer, directory):
                     source_sha256=info["source_sha256"],
                 )
             )
-            save_results(directory, records, args.cycles)
+            save_results(directory, records, args.cycles, experiment=name)
     except BaseException as failure:
         error = failure
         peer.abort(failure)
     finally:
-        # D is built first so failure in later stages can still leave the host on
-        # the original native implementation, with timer support disabled.
+        # The restore version is built first, so a later failure can still leave
+        # the host on that implementation with timer support disabled.
         restore_error = None
-        if "D" in wheels:
+        if restore_label in wheels:
             try:
-                restore = directory / "restore_D"
+                restore = directory / f"restore_{restore_label}"
                 restore.mkdir()
-                install_wheel(*wheels["D"], env, restore, None, args.stage_timeout)
+                install_wheel(*wheels[restore_label], env, restore, None, args.stage_timeout)
             except BaseException as failure:
                 restore_error = str(failure)
                 if error is None:
@@ -814,7 +870,7 @@ def experiment(args, config, launcher, peer, directory):
                     peer.abort(failure)
         if error is None:
             try:
-                peer.exchange("restored-D")
+                peer.exchange(f"restored-{restore_label}")
             except BaseException as failure:
                 error = failure
                 peer.abort(failure)
@@ -823,11 +879,18 @@ def experiment(args, config, launcher, peer, directory):
             dict(
                 complete=error is None,
                 error=str(error) if error else None,
-                installed_after_run="D (timer OFF)" if "D" in wheels and restore_error is None else "not verified",
+                installed_after_run=(
+                    f"{restore_label} (timer OFF)"
+                    if restore_label in wheels and restore_error is None
+                    else "not verified"
+                ),
                 restore_error=restore_error,
             ),
         )
-        print(save_results(directory, records, args.cycles, error=str(error) if error else None), flush=True)
+        print(
+            save_results(directory, records, args.cycles, error=str(error) if error else None, experiment=name),
+            flush=True,
+        )
         export_text(directory)
         bundle = package_results(directory)
         print(f"[AB] Results: {directory / 'summary.txt'}\n[AB] Full local archive: {bundle}", flush=True)
@@ -838,6 +901,7 @@ def experiment(args, config, launcher, peer, directory):
 def main(argv=None):
     launcher = load_launcher()
     parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--experiment", choices=EXPERIMENTS, default="scheduling")
     parser.add_argument("--config", type=Path, default=launcher.DEFAULT_CONFIG)
     parser.add_argument(
         "--export-text",
@@ -845,7 +909,9 @@ def main(argv=None):
         metavar="RUN_DIR",
         help="Export existing A/B results as small text blocks; no devices or rebuild",
     )
-    parser.add_argument("--cycles", type=int, default=3, help="ABCDDCBA cycles; default 3 = six runs per variant")
+    parser.add_argument(
+        "--cycles", type=int, default=3, help="Forward/reverse cycles; default 3 = six runs per variant"
+    )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
     parser.add_argument("--control-port", type=int, help="Peer coordination TCP port; default master_port + 1")

@@ -40,12 +40,9 @@ __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& comm
     GM_ADDR packedRail = params.peermemInfo.railTopkIdsRecvPtr + myHost * config.railTopkIdsSlotBytes;
     const uint32_t railBytes = static_cast<uint32_t>(CalcRailTopkIdsSlotDataBytes(common.tokenNum, common.topK));
     RocePutBytes(packedRail, packedRail, railBytes, gateway, roceScratch, timer, AscendTimer::RdmaPhase::DispatchMeta);
-    // Finish metadata before posting payload, so the independent receive leader
-    // can release route/count work while the payload is still in flight.
-    RocePublishCommit(
-        reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetMetaCommit)),
-        reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence)), gateway,
-        roceScratch, timer, AscendTimer::RdmaPhase::DispatchMeta);
+    // Both data Puts use the same owned QP. FinishHierarchicalDispatch quiets
+    // them together before publishing NetPayloadCommit, which now certifies
+    // both metadata and payload. No receiver may consume metadata before it.
 
     // All local token/scale rows are ready before this stage. Decode is bounded
     // to 32 tokens and both regions reserve the full batch, so one contiguous
@@ -83,10 +80,12 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
         return;
     }
 
-    // A different core receives metadata; it neither posts WQEs nor consumes the
-    // sender's CQ. Its progress cannot depend on the sender reaching payload quiet.
+    // The receive leader observes the unified metadata+payload commit; it never
+    // touches the sender's CQ. The sender returns above and reaches Finish
+    // through only local reset/shared work, before the public input barrier.
+    // Keep the commit before that barrier or this relay wait would form a cycle.
     if (job.jobIndex == 2U + otherHost) {
-        RoceWaitCommit(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetMetaCommit),
+        RoceWaitCommit(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit),
                        params.tilingData->hierarchicalSequence, timer, AscendTimer::RdmaPhase::DispatchMeta,
                        HierarchicalGateway(common.rankId));
         PublishHierarchicalLocalSignal(params, HierarchicalSignal::MetaReady);
@@ -118,6 +117,9 @@ __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, cons
         return;
     }
     const uint32_t gateway = HierarchicalGateway(common.rankId);
+    // Complete both earlier data Puts before the single remote notification.
+    // The trailing quiet still protects Sequence until the notification source
+    // has been consumed, including calls with no cross-host expert routes.
     RocePublishCommit(
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit)),
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence)), gateway,

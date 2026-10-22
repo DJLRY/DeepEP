@@ -201,7 +201,7 @@ struct Fixture {
             return false;
         }
         events.push_back(remoteCalls == 1 ? "R:init" : "R:scan");
-        // A pending opportunity must be consumed even when no payload is ready.
+        // Every completed local Combine offers progress, even with no ready payload.
         return remoteProgress ? remoteProgress(*this) : false;
     }
 
@@ -249,11 +249,11 @@ void CombineReleasesMultipleTilesAndSlices()
         }
     };
     f.Run(5);
-    f.Expect({"C0", "A0:1", "A0:3", "A0:5", "A1:0", "A1:2", "R:init", "C1", "R:scan"});
+    f.Expect({"C0", "R:init", "A0:1", "A0:3", "A0:5", "A1:0", "A1:2", "C1", "R:scan"});
     assert(f.clock == 0);
 }
 
-void PendingRunsBeforeTheNextCombineAndAfterTheLastCombine()
+void RemoteProgressRunsAfterEveryCombine()
 {
     for (uint32_t slices : {1U, 3U}) {
         Fixture f;
@@ -270,7 +270,7 @@ void PendingRunsBeforeTheNextCombineAndAfterTheLastCombine()
     }
 }
 
-void SharedActivationReleasedByCombinePrecedesRemoteInitialization()
+void SharedActivationReleasedByCombineFollowsRemoteProgress()
 {
     Fixture f;
     f.sharedExpertNum_ = 1;
@@ -278,7 +278,7 @@ void SharedActivationReleasedByCombinePrecedesRemoteInitialization()
     f.ReadyAllCombines();
     f.afterCombine = [](Fixture& fixture, uint32_t) { fixture.sharedReady = true; };
     f.Run(0);
-    f.Expect({"C0", "S0", "S1", "R:init", "C1", "R:scan"});
+    f.Expect({"C0", "R:init", "S0", "S1", "C1", "R:scan"});
 }
 
 void ExistingActivationDispatchSharedPriorityIsPreserved()
@@ -295,7 +295,7 @@ void ExistingActivationDispatchSharedPriorityIsPreserved()
     f.Expect({"A0:1", "A0:3", "D0:0", "D1:0", "D2:1", "S0", "S1", "C0", "R:init"});
 }
 
-void UnreadyActivationAllowsPendingProgressThenResumes()
+void UnreadyActivationAllowsRemoteProgressThenResumes()
 {
     Fixture f;
     f.activationPlans = {{0, 3}};
@@ -311,7 +311,7 @@ void UnreadyActivationAllowsPendingProgressThenResumes()
         return true;
     };
     f.Run(2);
-    f.Expect({"C0", "A0:0", "R:init", "A0:2", "C1", "R:scan"});
+    f.Expect({"C0", "R:init", "A0:0", "A0:2", "C1", "R:scan"});
 }
 
 void FallbackRemoteProgressCanReleaseActivation()
@@ -348,7 +348,7 @@ void BackoffCanReleaseActivationAndCombine()
     assert(f.clock >= GM_FLAG_POLL_BACKOFF_CYCLES);
 }
 
-void NonOwnersDoNotCreatePendingNoopIterations()
+void NonOwnersLeaveRemoteProgressToTheOwner()
 {
     for (auto setting : {std::make_pair(true, 3U), std::make_pair(false, 1U), std::make_pair(false, 3U)}) {
         Fixture f;
@@ -357,8 +357,8 @@ void NonOwnersDoNotCreatePendingNoopIterations()
         f.combineSlices = 2;
         f.ReadyAllCombines();
         f.Run(0);
-        f.Expect({"C0", "C1"});
-        assert(f.remoteCalls == 0);
+        f.Expect({"C0", "R:noop", "C1", "R:noop"});
+        assert(f.remoteCalls == 2);
         assert(f.clock == 0);
     }
 }
@@ -366,11 +366,11 @@ void NonOwnersDoNotCreatePendingNoopIterations()
 int main()
 {
     CombineReleasesMultipleTilesAndSlices();
-    PendingRunsBeforeTheNextCombineAndAfterTheLastCombine();
-    SharedActivationReleasedByCombinePrecedesRemoteInitialization();
+    RemoteProgressRunsAfterEveryCombine();
+    SharedActivationReleasedByCombineFollowsRemoteProgress();
     ExistingActivationDispatchSharedPriorityIsPreserved();
-    UnreadyActivationAllowsPendingProgressThenResumes();
+    UnreadyActivationAllowsRemoteProgressThenResumes();
     FallbackRemoteProgressCanReleaseActivation();
     BackoffCanReleaseActivationAndCombine();
-    NonOwnersDoNotCreatePendingNoopIterations();
+    NonOwnersLeaveRemoteProgressToTheOwner();
 }

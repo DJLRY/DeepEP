@@ -782,7 +782,7 @@ void OracleStep(Fixture& f, uint32_t maxPosts, uint32_t maxScans)
     uint32_t scanned = static_cast<uint32_t>(visits.size());
     // Stop at the last accepted run if the POST budget or all outstanding
     // route coordinates are covered. Otherwise every bounded visit is needed.
-    if (!runs.empty() && (runs.size() == maxPosts || sent == pendingBefore)) {
+    if (!runs.empty() && runs.size() == maxPosts) {
         const auto& last = runs.back();
         scanned = last.visitEnd;
         // A false slot that terminates a run is consumed once. The physical
@@ -841,13 +841,13 @@ void CompleteInCall()
         uint32_t next;
     };
     const std::vector<Case> cases = {
-        {32U, 8U, 0U, {0U}, 1U, 2U, 2U},
-        {32U, 8U, 252U, {0U, 1U}, 1U, 7U, 3U},
-        {32U, 8U, 250U, {255U}, 1U, 6U, 0U},
-        {32U, 8U, 6U, {6U, 7U, 8U}, 1U, 4U, 10U},
+        {32U, 8U, 0U, {0U}, 1U, 64U, 64U},
+        {32U, 8U, 252U, {0U, 1U}, 1U, 64U, 60U},
+        {32U, 8U, 250U, {255U}, 1U, 64U, 58U},
+        {32U, 8U, 6U, {6U, 7U, 8U}, 1U, 64U, 70U},
         {32U, 8U, 254U, {255U, 0U, 1U}, 2U, 5U, 3U},
-        {32U, 31U, 30U, {30U, 31U}, 1U, 3U, 33U},
-        {4U, 32U, 31U, {31U, 32U, 33U}, 1U, 4U, 35U},
+        {32U, 31U, 30U, {30U, 31U}, 1U, 64U, 94U},
+        {4U, 32U, 31U, {31U, 32U, 33U}, 1U, 64U, 95U},
         {1U, 1U, 0U, {0U}, 1U, 1U, 0U},
     };
     for (const auto& c : cases) {
@@ -872,7 +872,7 @@ void CompleteInCall()
         Check(timer.records.size() == 1U && timer.records[0].before == c.rows.size() && timer.records[0].after == 0U &&
                   timer.records[0].posts == c.posts && timer.records[0].scanned == c.scanned &&
                   timer.scanStarts == c.posts + 1U && timer.scanStops == timer.scanStarts && !timer.scanActive,
-              "last Put did not stop scans at its terminating hole or tensor end");
+              "completion did not preserve the baseline scan budget and cursor");
         Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {2U, 64U}) &&
                   timer.records.size() == 1U && f.s.probeOrder == c.rows,
               "completed sparse routes were scanned again");
@@ -899,10 +899,10 @@ void CompleteInCall()
     ReleaseAll();
     OracleStep(capped, 2U, 64U);
     Check(capped.progress.sentRows == 2U && capped.progress.nextRow == 4U && capped.s.posts.size() == 2U,
-          "completion optimization exceeded the two-Post budget");
+          "completion exceeded the two-Post budget");
     OracleStep(capped, 2U, 64U);
-    Check(capped.progress.sentRows == 3U && capped.progress.nextRow == 6U && capped.s.posts.size() == 3U,
-          "resumed final run did not stop after its terminating hole");
+    Check(capped.progress.sentRows == 3U && capped.progress.nextRow == 68U && capped.s.posts.size() == 3U,
+          "resumed final run did not preserve the baseline scan budget");
     capped.CheckPayload();
 }
 

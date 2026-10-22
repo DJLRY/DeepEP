@@ -24,12 +24,14 @@ inline std::vector<Write> queued;
 inline uint32_t peer = 0U;
 inline uint32_t metaCommit = 0U;
 inline uint32_t payloadCommit = 0U;
+inline uint32_t metaReady = 0U;
 inline uint32_t relayReady = 0U;
 inline uint32_t txDone = 0U;
 inline uint32_t sequence = 0U;
 inline uint32_t waits = 0U;
 inline uint32_t quiets = 0U;
 inline uint32_t packCalls = 0U;
+inline uint32_t relayCalls = 0U;
 constexpr uint32_t kScratchOffset = 4096U;
 
 inline void Check(bool condition, const char* message)
@@ -99,12 +101,14 @@ inline int32_t aclshmem_signal_wait_until(int32_t* address, int comparison, int3
 {
     using namespace DispatchTest;
     Check(Offset(reinterpret_cast<uint8_t*>(address), sizeof(int32_t)) == payloadCommit,
-          "Finish waited on another incoming signal");
+          "receiver did not wait on the unified Dispatch commit");
     Check(comparison == ACLSHMEM_CMP_EQ && static_cast<uint32_t>(value) == sequence &&
               ReadWord(local, payloadCommit) == sequence,
           "receiver accepted a stale invocation");
-    Check(queued.empty() && ReadWord(remote, payloadCommit) == sequence && ReadWord(local, txDone) == sequence,
-          "incoming wait preceded outgoing completion and TxDone");
+    if (RoceTest::blockIndex == 1) {
+        Check(queued.empty() && ReadWord(remote, payloadCommit) == sequence && ReadWord(local, txDone) == sequence,
+              "sender's incoming wait preceded outgoing completion and TxDone");
+    }
     ++waits;
     RoceTest::signalObserved = true;
     return value;

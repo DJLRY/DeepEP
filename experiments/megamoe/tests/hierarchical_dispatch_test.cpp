@@ -50,8 +50,9 @@ inline void WriteGmByPassDCache(int32_t* address, int32_t value)
 {
     using namespace DispatchTest;
     const auto offset = Offset(reinterpret_cast<uint8_t*>(address), sizeof(value));
-    if (offset == relayReady) {
-        Check(waits == 1U && RoceTest::mteCanRead, "payload readiness preceded the receive acquire");
+    if (offset == relayReady || offset == metaReady) {
+        Check(waits >= 1U && RoceTest::mteCanRead && ReadWord(local, payloadCommit) == sequence,
+              "metadata/payload readiness preceded the unified receive acquire");
     }
     if (offset == txDone) {
         Check(queued.empty() && ReadWord(remote, payloadCommit) == sequence,
@@ -93,14 +94,20 @@ inline void SendTopkIdsToRailServer(const MoeStageCommonConfig& common, GM_ADDR*
           "rail readiness was published before packing finished");
     ++packCalls;
 }
-inline void CalcRailRelayExpertRange(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t&, uint32_t&)
+inline void CalcRailRelayExpertRange(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t& first,
+                                      uint32_t& count)
 {
-    throw std::runtime_error("sender unexpectedly assigned relay work");
+    DispatchTest::Check(RoceTest::blockIndex != 1, "sender unexpectedly assigned relay work");
+    first = 0U;
+    count = 1U;
 }
 inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig&, GM_ADDR*, const SendMaskConfig&, const Params&,
                                       SendMaskScratch&, uint32_t, uint32_t, int32_t, int32_t)
 {
-    throw std::runtime_error("sender unexpectedly relayed metadata");
+    using namespace DispatchTest;
+    Check(RoceTest::blockIndex != 1 && ReadWord(local, metaReady) == sequence && RoceTest::mteCanRead,
+          "metadata relay preceded the unified receive acquire");
+    ++relayCalls;
 }
 inline void GmSignalWaitBarrier(int32_t*, int32_t)
 {
@@ -142,7 +149,7 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     remote.assign(heapBytes, 0xA5U);
     posts.clear();
     queued.clear();
-    quiets = waits = packCalls = 0U;
+    quiets = waits = packCalls = relayCalls = 0U;
     peer = HierarchicalGateway(rank);
     sequence = t.hierarchicalSequence;
     RoceTest::operations.clear();
@@ -156,11 +163,12 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     };
     metaCommit = flagOffset(HierarchicalSignal::NetMetaCommit);
     payloadCommit = flagOffset(HierarchicalSignal::NetPayloadCommit);
+    metaReady = flagOffset(HierarchicalSignal::MetaReady);
     relayReady = flagOffset(HierarchicalSignal::RelayPayloadReady);
     txDone = flagOffset(HierarchicalSignal::TxDone);
-    // Model the opposite sender's completed incoming notification. Finish must
-    // still close its own outgoing source lifetime before observing this flag.
-    WriteGmByPassDCache(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit), sequence);
+    // A stale unified commit must not be satisfied by an old split notification.
+    WriteGmByPassDCache(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit), sequence - 1U);
+    WriteGmByPassDCache(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetMetaCommit), sequence);
 
     const uint32_t rowBytes = static_cast<uint32_t>(CalcQuantTokenScaleBytes(hidden, 1U, topk, false));
     const uint32_t activeBytes = bs * rowBytes;
@@ -191,8 +199,6 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
         }
     }
     auto expected = remote;
-    std::copy_n(local.data() + rail, railBytes, expected.data() + rail);
-    std::memcpy(expected.data() + metaCommit, &sequence, sizeof(sequence));
     RoceTest::blockIndex = RoceTest::subBlockIndex = 0;
     GatherAndPostHierarchicalDispatch({0U, 56U}, common, params, nullptr, config, scratch);
     Check(packCalls == 1U && ReadWord(local, flagOffset(HierarchicalSignal::LocalRailPacked)) == sequence,
@@ -208,29 +214,50 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     const AivJobContext owner{1U, 56U};
     GatherAndPostHierarchicalDispatch(owner, common, params, nullptr, config, scratch);
     Check(packCalls == 1U, "AIV1 repeated AIV0's packing work");
-    Check(remote == expected, "payload completed early or metadata wrote beyond actual packet extent");
-    Check(posts.size() == 3U && queued.size() == 1U && quiets == 2U && waits == 0U,
-          "metadata completion or deferred payload sequence changed");
-    Check(queued[0].source == source && queued[0].destination == destination && queued[0].bytes == activeBytes,
+    Check(remote == expected, "Dispatch data completed before the shared quiet");
+    Check(posts.size() == 2U && queued.size() == 2U && quiets == 0U && waits == 0U,
+          "Dispatch did not defer both data Puts to one completion");
+    Check(queued[1].source == source && queued[1].destination == destination && queued[1].bytes == activeBytes,
           "Dispatch did not submit the actual batch in one contiguous GM transfer");
-    Check((RoceTest::operations == std::vector<int>{1, 2, 1, 2, 1}), "metadata was not completed before payload post");
+    Check((RoceTest::operations == std::vector<int>{1, 1}), "Dispatch inserted completion between the two data Puts");
+    const AivJobContext receiver{2U + (1U - HierarchicalHost(rank)), 56U};
+    RoceTest::blockIndex = static_cast<int>(receiver.jobIndex);
+    RoceTest::subBlockIndex = static_cast<int>(receiver.jobIndex % 2U);
+    RoceTest::signalObserved = RoceTest::scalarEventSet = RoceTest::mteCanRead = false;
+    bool staleRejected = false;
+    try {
+        GatherAndPostHierarchicalDispatch(receiver, common, params, nullptr, config, scratch);
+    } catch (const std::runtime_error&) {
+        staleRejected = true;
+    }
+    Check(staleRejected && relayCalls == 0U && ReadWord(local, metaReady) != sequence,
+          "split metadata flag incorrectly released the unified receiver");
+    // Incoming completion can arrive while our outgoing data is still in flight.
+    // The independent receive leader must not touch the sender's QP/CQ or wait
+    // for its local TxDone; this permits the sender to reach Finish independently.
+    WriteGmByPassDCache(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit), sequence);
+    GatherAndPostHierarchicalDispatch(receiver, common, params, nullptr, config, scratch);
+    Check(relayCalls == 1U && waits == 1U && quiets == 0U && posts.size() == 2U && queued.size() == 2U,
+          "receive leader did not relay independently of outgoing completion");
+    RoceTest::blockIndex = RoceTest::subBlockIndex = 1;
     // The rail acquire must not satisfy the separate receive acquire in Finish.
     RoceTest::signalObserved = RoceTest::scalarEventSet = RoceTest::mteCanRead = false;
-    // Completed metadata may now be reused, but the queued GM input cannot.
-    std::fill_n(local.data() + rail, railBytes, uint8_t{0xCCU});
+    // Both GM sources must remain stable until the unified completion.
     Check(payload == std::vector<uint8_t>(local.begin() + source, local.begin() + source + activeBytes),
           "posting changed the quantized source");
     FinishHierarchicalDispatch(owner, common, params);
+    std::copy_n(local.data() + rail, railBytes, expected.data() + rail);
     std::copy(payload.begin(), payload.end(), expected.begin() + destination);
     std::memcpy(expected.data() + payloadCommit, &sequence, sizeof(sequence));
     Check(remote == expected, "whole-batch payload changed active data, capacity tail, or neighboring regions");
-    Check(queued.empty() && posts.size() == 4U && quiets == 4U && waits == 1U,
+    Check(queued.empty() && posts.size() == 3U && quiets == 2U && waits == 2U,
           "Finish omitted completion/commit or zero-remote notification");
-    Check((RoceTest::operations == std::vector<int>{1, 2, 1, 2, 1, 2, 1, 2}), "payload/commit quiet ordering changed");
+    Check((RoceTest::operations == std::vector<int>{1, 1, 2, 1, 2}), "unified payload/commit quiet ordering changed");
     Check(ReadWord(local, txDone) == sequence &&
               ReadWord(local, flagOffset(HierarchicalSignal::RelayPayloadReady)) == sequence && RoceTest::mteCanRead,
           "local completion/readiness publication preceded the receive acquire");
     std::fill_n(local.data() + source, activeBytes, uint8_t{0xDDU});
+    std::fill_n(local.data() + rail, railBytes, uint8_t{0xCCU});
     Check(remote == expected, "completed receive still referenced the reusable source");
 }
 

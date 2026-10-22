@@ -209,6 +209,32 @@ def test_archive_uses_committed_tree_and_does_not_copy_local_outputs(tmp_path):
     assert (destination / "build_support.py").is_file()
 
 
+def test_dispatch_summary_pairs_forward_and_reverse_runs(tmp_path):
+    records = []
+    for index, label in enumerate("ABBA" * 3):
+        value = {"A": 300, "B": 280}[label] + (index // 2) * 5
+        records.append(
+            dict(
+                step=index + 1,
+                block=index // 2,
+                variant=label,
+                mean_us=value,
+                rank_max_mean_us=value + 15,
+                source_sha256=f"sha-{label}",
+                report=f"run_{index}/profiling.json",
+            )
+        )
+    summary = ab.summarize(records, 3, experiment="dispatch")
+    assert summary["complete"] and set(summary["variants"]) == {"A", "B"}
+    assert summary["variants"]["B"]["mean_us"]["n"] == 6
+    assert set(summary["paired_deltas"]) == {"B-A"}
+    assert summary["paired_deltas"]["B-A"]["mean_us"]["values"] == [-20] * 6
+    assert not ab.summarize(records[:-1], 3, experiment="dispatch")["complete"]
+    text = ab.save_results(tmp_path, records, 3, experiment="dispatch")
+    assert "12/12 perf runs" in text and "one Dispatch commit" in text
+    assert "scan early stop" not in text and "D-B-C+A" not in text
+
+
 def test_dirty_tracked_sources_stop_before_snapshot(monkeypatch):
     monkeypatch.setattr(ab, "git", lambda *args: b" M kernel.hpp\n")
     with pytest.raises(RuntimeError, match="local edits"):
@@ -337,9 +363,11 @@ def test_failed_text_is_bounded_and_keeps_status_log_excerpt_and_missing_evidenc
 
 
 @pytest.mark.parametrize(
-    "fail_at", [None, "perf-B", "build-C", "restore-1", "settings-order", "settings-flag", "source-mismatch"]
+    "fail_at", [None, "perf-B", "build-last", "restore-1", "settings-order", "settings-flag", "source-mismatch"]
 )
-def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
+@pytest.mark.parametrize("experiment", ["scheduling", "dispatch"])
+def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at, experiment):
+    spec = ab.EXPERIMENTS[experiment]
     succeeds = fail_at in {None, "settings-order", "settings-flag"}
     calls = []
     modules = []
@@ -369,21 +397,23 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
         directory = Path(config["case_dir"]) / "ab"
         directory.mkdir(parents=True)
         blobs = {
-            ref: {path: f"{ref}:{path}".encode() for path in module.HEADERS} for ref in (module.BASE, module.CHANGED)
+            ref: {path: f"{ref}:{path}".encode() for path in spec["headers"]}
+            for ref in (spec["baseline"], spec["changed"])
         }
         plan = dict(
             head="same-head",
             variants={
-                label: {path: module.digest(blobs[ref][path]) for ref, path in zip(refs, module.HEADERS)}
-                for label, refs in module.VARIANTS.items()
+                label: {path: module.digest(blobs[ref][path]) for ref, path in zip(refs, spec["headers"])}
+                for label, refs in spec["variants"].items()
             },
         )
         monkeypatch.setattr(module, "ROOT", root)
-        monkeypatch.setattr(module, "source_plan", lambda root, p=plan, b=blobs: (p, b))
+        monkeypatch.setattr(module, "source_plan", lambda root, p=plan, b=blobs, **kw: (p, b))
         monkeypatch.setattr(module, "git", lambda *args: b"")
 
         def snapshot(root, tree, head):
-            (tree / module.HEADERS[1]).parent.mkdir(parents=True)
+            for header in spec["headers"]:
+                (tree / header).parent.mkdir(parents=True, exist_ok=True)
 
         monkeypatch.setattr(module, "snapshot", snapshot)
         installed = {}
@@ -404,9 +434,9 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
                 if n == 1 and fail_at == "settings-flag":
                     assert env["CXXFLAGS"] == "-O0"
                 label = Path(cwd).name
-                assert (Path(cwd) / ab.HEADERS[0]).read_bytes().startswith(ab.VARIANTS[label][0].encode())
-                assert (Path(cwd) / ab.HEADERS[1]).read_bytes().startswith(ab.VARIANTS[label][1].encode())
-                if n == 1 and fail_at == f"build-{label}":
+                for header, ref in zip(spec["headers"], spec["variants"][label]):
+                    assert (Path(cwd) / header).read_bytes() == f"{ref}:{header}".encode()
+                if n == 1 and fail_at == "build-last" and label == spec["build_order"][-1]:
                     raise RuntimeError("simulated build failure")
                 info = dict(
                     source_sha256=f"sha-{label}",
@@ -424,7 +454,7 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
                 state["info"] = info
                 kind = f"build-{label}"
             elif "pip" in command:
-                if n == 1 and fail_at == "restore-1" and log.parent.name == "restore_D":
+                if n == 1 and fail_at == "restore-1" and log.parent.name == f"restore_{spec['restore']}":
                     raise RuntimeError("simulated restore failure")
                 state["info"] = ab.wheel_metadata(command[-1])
                 kind = "install-" + state["info"]["source_sha256"][-1]
@@ -468,7 +498,7 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
             )
         )
         directories.append(directory)
-    args = SimpleNamespace(cycles=1, warmup=2, iters=4, stage_timeout=3)
+    args = SimpleNamespace(cycles=1, warmup=2, iters=4, stage_timeout=3, experiment=experiment)
     with ThreadPoolExecutor(2) as pool:
         tasks = [
             pool.submit(modules[n].experiment, args, configurations[n], launchers[n], peers[n], directories[n])
@@ -490,9 +520,7 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
             assert raw_settings["CMAKE_PREFIX_PATH"] == f"{CMAKE_PREFIX}:{CMAKE_PREFIX}"
             assert settings["CMAKE_PREFIX_PATH"] == CMAKE_PREFIX
         assert status["installed_after_run"] == (
-            "not verified"
-            if fail_at == "restore-1" and node == 1
-            else "D (timer OFF)"
+            "not verified" if fail_at == "restore-1" and node == 1 else f"{spec['restore']} (timer OFF)"
         )
         with zipfile.ZipFile(directory / "results.zip") as archive:
             assert "plan.json" in archive.namelist()
@@ -502,16 +530,27 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
         assert len(parts) == 1
         payload = unpack_text([path.read_text(encoding="utf-8") for path in parts])
         assert '"complete":' + ("true" if succeeds else "false") in payload
+        entries = [(line.split(" ", 1)[0], json.loads(line.split(" ", 1)[1])) for line in payload.splitlines()]
+        meta = next(value for kind, value in entries if kind == "META")
+        assert meta["experiment"] == experiment
+        assert meta["order_per_cycle"] == spec["order"]
+        variants = [value for kind, value in entries if kind == "VARIANT"]
+        assert [value["label"] for value in variants] == list(spec["variants"])
+        if experiment == "dispatch":
+            assert [value["dispatch_commits"] for value in variants] == [2, 1]
+            assert all(not value["activation_priority"] and not value["scan_early_stop"] for value in variants)
         if succeeds:
-            build_info = json.loads((directory / "builds/D/wheel.json").read_text())["build"]
+            build_info = json.loads((directory / f"builds/{spec['restore']}/wheel.json").read_text())["build"]
             assert build_info["cmake_version"] == ["cmake version 3.25.1", "cmake version 3.31.6"][node]
             records = json.loads((directory / "results.json").read_text())
-            assert "".join(row["variant"] for row in records) == "ABCDDCBA"
+            assert "".join(row["variant"] for row in records) == spec["order"]
             local_calls = [name for n, name in calls if n == node]
-            assert [name for name in local_calls if name.startswith("accuracy-")] == [f"accuracy-{v}" for v in "ABCD"]
-            assert local_calls[-1] == "install-D"
+            assert [name for name in local_calls if name.startswith("accuracy-")] == [
+                f"accuracy-{v}" for v in spec["variants"]
+            ]
+            assert local_calls[-1] == f"install-{spec['restore']}"
     if succeeds:
-        for label in "ABCD":
+        for label in spec["variants"]:
             first_perf = next(i for i, (_, name) in enumerate(calls) if name == f"perf-{label}")
             for node in range(2):
                 assert (node, f"accuracy-{label}") in calls[:first_perf]
@@ -524,4 +563,5 @@ def test_cli_help_isolated():
     result = subprocess.run([sys.executable, "-I", SCRIPT, "--help"], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert "--control-port" in result.stdout
-    assert "six runs per variant" in result.stdout
+    assert "six runs per variant" in " ".join(result.stdout.split())
+    assert "--experiment {scheduling,dispatch}" in result.stdout

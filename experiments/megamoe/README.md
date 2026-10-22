@@ -229,9 +229,39 @@ bash experiments/megamoe/scripts/run_bs32.sh perf --warmup 20 --iters 100
 也不代表经过跨设备时钟校准的全局起止跨度。`perf` 不传入设备 timer；安装了支持 timer 的 wheel 也不会打点，
 wheel 的编译配置可在每个 rank 的 `manifest.json` 中核对。需要恢复不支持 timer 的构建时执行普通 `build`。
 
-#### BS32：双机自动拆分上一轮改动，交错 A/B
+#### BS32：Dispatch 单次完成通知，双机 A/B
 
-用于定位 `732bb3f` → `bfb6fe8` 两项改动的影响。两台服务器保留现有 BS32 配置、
+本轮以已测量的 A 调度为基线，关闭上一轮新增的 activation 重查和扫描末尾提前退出。
+两台服务器保留现有 BS32 配置及已构建的依赖，在更新到同一提交后分别执行：
+
+```bash
+bash experiments/megamoe/scripts/run_bs32_dispatch_ab.sh
+```
+
+脚本只构建两版 timer-OFF wheel：A 使用 `732bb3f` 的 Dispatch（metadata/payload 分别通知），
+B 使用当前提交的 Dispatch（两次数据 Put 共用一次完成通知）。两版其他原生源码完全相同，
+且须与 `732bb3f` 相同；当前实验仅允许 Dispatch 头文件存在差异，避免混入其他优化。
+每个版本首次运行前执行全 token 精度检查，随后按 `A B B A` 顺序重复三遍，
+共12次性能测试、每版6次；每次预热20轮、采样100轮、统计后50轮。
+两台分别沿用自己的环境，不比较 CMake、SDK 指纹或编译选项是否相同。
+
+A 首先构建，结束后恢复 **A（timer OFF）**；中途失败也在 A 已构建成功时尝试恢复。
+普通 `run_bs32.sh build` 构建的是当前源码的 B，因此应先看 A/B 实测结果再决定采用哪版。
+结果目录仍是 `<case_dir>/ab_node_<本机编号>_<随机字符>/`；终端会打印可直接复制的 `cat` 命令，
+两台各回传 BEGIN 到 END 的完整文本块，每块最多60000字节。摘要中 `B-A` 为负表示优化变快。
+`META.experiment=dispatch`、版本的 `dispatch_commits` 和源码哈希用于区别上一轮实验。
+
+支持原有 `--config`、`--cycles`、`--warmup`、`--iters`、`--control-port` 和 `--stage-timeout`。
+已有两轮实验的结果都可用以下命令重新导出；脚本从结果内的计划识别实验类型，不会重新构建或运行：
+
+```bash
+bash experiments/megamoe/scripts/run_bs32_dispatch_ab.sh --export-text /absolute/path/ab_node_0_xxxxxxxx
+```
+
+#### BS32：上一轮调度改动的四组 A/B（历史实验）
+
+此入口保留用于复现 `732bb3f` → `bfb6fe8`，要求内核仍为 `bfb6fe8`（例如 checkout `e888921`）；
+当前 Dispatch 优化请使用上节的新入口。两台服务器保留现有 BS32 配置、
 已构建的 SHMEM SDK 和 CATLASS，在相同提交、没有已跟踪文件修改的 checkout 中分别执行同一条命令：
 
 ```bash
@@ -512,8 +542,11 @@ AIV1 在 Dispatch 和 Combine 全程独占 QP1，包括 Put、quiet 和 commit�
 不再扫描路由并拆成多个连续 token 段；B 小于预分配容量时只发送实际 B 行。
 接收区保留原 token 编号，专家仍按路由元数据读取，多传的行不会增加计算。
 该策略用于上述 B≤32 的 A8W4/A8W8 路径，包括没有远端路由的批次。
-元数据仍先完成并发布通知；payload 完成等待仍延后到 owner 的 reset/shared-input 工作之后，
-保留 quiet、commit、commit quiet 和对端 commit 等待顺序。
+元数据和 payload 先在同一 QP 提交，完成等待延后到 owner 的 reset/shared-input 工作之后；
+一次 quiet 覆盖两份数据，再发布共用的 `NetPayloadCommit` 并 quiet 该通知。四次 quiet 减为两次，
+接收 leader 获取这个标记后才发布 `MetaReady` 并转发 metadata；发送 owner 仍在完成本地发送后
+获取对端同一标记、发布 `RelayPayloadReady`。公共输入 barrier 保留，统一 commit 必须在它之前发布。
+这会放弃 metadata 提前到达时的 relay 重叠机会，收益须由本轮 A/B 验证。
 H=3584、B=32 时 payload 为118784 B；相较已测 EP32/K8 balanced 样本的8次7424 B提交，
 该策略以每 rank 额外59392 B流量换取一次提交和更少的发送端扫描工作。
 性能验证应同时检查 payload POST 次数、quiet、输入准备结束及首 GMM 时间，
@@ -532,16 +565,14 @@ gateway 检查调用由448次降为16次；这些是依赖检查调用数，未�
 A8W4 的跨机 Combine 在 AIV1 的计算间隙分批推进：两台机器均每次最多提交2个 Put、
 扫描64个 `[token, top-k]` 槽位。扫描游标跨调用保留，已发送槽位不再读取 ready flag；
 全部发送后立即返回。推进穿插于 AIV1 的 activation、dispatch 和本地 Combine 工作，
-本地 Combine 完成后先回到激活优先入口，消费此时已经就绪的 routed/shared activation；
-保留一次待执行的远端推进，在下一次本地 Combine 前执行，最后一个 slice 也不会漏掉。
-仅 RoCE 发送 owner 保留此待办；激活的 ready sequence 和 tile/slice 游标仍由同一入口推进。
-连续就绪的激活可以推迟这次推进，计数预算和优先级均不提供固定时间上限。
+本地 Combine 完成后立即尝试远端推进，再回到循环入口检查 activation。
+这是四组 A/B 中较快的 A 调度；激活的 ready sequence 和 tile/slice 游标仍由同一入口推进。
 最终 host barrier 后完整 drain，再执行 payload quiet、commit、commit quiet 和对端 commit 等待。
 单次 Put 内部仍可能因队列回压等待，这些计数预算并非硬性时间上限。
 扫描在单次调用内缓存当前 token 的 pending mask，通过递增槽位推进，避免逐行除模；
 连续发送段在 Put 返回后按 token 清除对应位。扫描仍逐槽计数，保留洞、游标绕回、
-预算截断和相邻行合并的原有语义；最后一次 Put 提交完全部待发行后立即结束本次扫描，
-不再为用满预算遍历剩余空槽。完成判定只表示全部行已提交，传输完成仍由后续 quiet 保证。
+预算截断和相邻行合并的原有语义；恢复 A 的扫描行为，完成当次扫描或达到 Put 预算后返回，
+后续调用在全部行已提交时直接返回。提交完成不代表传输完成，后者仍由后续 quiet 保证。
 
 Combine 路由首次初始化使用 owner 专用256 B UB 分块 DMA 读取已接收的 rail 元数据；
 BS32、K8 时为5次256 B DMA，跳过每个512 B packet 的末尾 marker。
