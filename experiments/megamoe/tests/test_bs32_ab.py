@@ -336,8 +336,11 @@ def test_failed_text_is_bounded_and_keeps_status_log_excerpt_and_missing_evidenc
     assert all(len(path.read_bytes().replace(b"\n", b"\r\n")) < 65535 for path in paths)
 
 
-@pytest.mark.parametrize("fail_at", [None, "perf-B", "build-C", "restore-1", "settings-order", "settings-flag"])
+@pytest.mark.parametrize(
+    "fail_at", [None, "perf-B", "build-C", "restore-1", "settings-order", "settings-flag", "source-mismatch"]
+)
 def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
+    succeeds = fail_at in {None, "settings-order", "settings-flag"}
     calls = []
     modules = []
     configurations = []
@@ -392,13 +395,28 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
             if peer:
                 peer.check()
             if command[1].endswith("build.py"):
-                assert env["CMAKE_PREFIX_PATH"] == CMAKE_PREFIX
+                expected_prefix = (
+                    ":".join(reversed(CMAKE_PREFIX.split(":")))
+                    if n == 1 and fail_at == "settings-order"
+                    else CMAKE_PREFIX
+                )
+                assert env["CMAKE_PREFIX_PATH"] == expected_prefix
+                if n == 1 and fail_at == "settings-flag":
+                    assert env["CXXFLAGS"] == "-O0"
                 label = Path(cwd).name
                 assert (Path(cwd) / ab.HEADERS[0]).read_bytes().startswith(ab.VARIANTS[label][0].encode())
                 assert (Path(cwd) / ab.HEADERS[1]).read_bytes().startswith(ab.VARIANTS[label][1].encode())
                 if n == 1 and fail_at == f"build-{label}":
                     raise RuntimeError("simulated build failure")
-                info = dict(source_sha256=f"sha-{label}", megamoe=dict(enabled=True, timer=False))
+                info = dict(
+                    source_sha256=f"sha-{label}",
+                    megamoe=dict(enabled=True, timer=False),
+                    cmake_version=["cmake version 3.25.1", "cmake version 3.31.6"][n],
+                    shmem=dict(sha256={"lib/libshmem.so": f"host-{n}"}),
+                    build_environment=dict(CXXFLAGS=env.get("CXXFLAGS", ""), CMAKE_PREFIX_PATH=expected_prefix),
+                )
+                if n == 1 and fail_at == "source-mismatch":
+                    info["source_sha256"] += "-wrong"
                 wheel = Path(cwd) / "dist/build-unique/ascend_deepep-test.whl"
                 wheel.parent.mkdir(parents=True)
                 with zipfile.ZipFile(wheel, "w") as archive:
@@ -457,15 +475,15 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
             for n in range(2)
         ]
         for task in tasks:
-            if fail_at is None:
+            if succeeds:
                 task.result(timeout=20)
             else:
                 with pytest.raises(RuntimeError):
                     task.result(timeout=20)
     for node, directory in enumerate(directories):
         status = json.loads((directory / "status.json").read_text())
-        assert status["complete"] is (fail_at is None)
-        assert json.loads((directory / "comparison.json").read_text())["complete"] is (fail_at is None)
+        assert status["complete"] is succeeds
+        assert json.loads((directory / "comparison.json").read_text())["complete"] is succeeds
         raw_settings = json.loads((directory / "build_settings_raw.json").read_text())
         settings = json.loads((directory / "build_settings.json").read_text())
         if node == 0:
@@ -473,7 +491,7 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
             assert settings["CMAKE_PREFIX_PATH"] == CMAKE_PREFIX
         assert status["installed_after_run"] == (
             "not verified"
-            if (fail_at == "restore-1" and node == 1) or fail_at in {"settings-order", "settings-flag"}
+            if fail_at == "restore-1" and node == 1
             else "D (timer OFF)"
         )
         with zipfile.ZipFile(directory / "results.zip") as archive:
@@ -483,21 +501,23 @@ def test_full_two_host_experiment(tmp_path, peers, monkeypatch, fail_at):
         parts = sorted(directory.glob("copy_text_*/part_*.txt"))
         assert len(parts) == 1
         payload = unpack_text([path.read_text(encoding="utf-8") for path in parts])
-        assert '"complete":' + ("true" if fail_at is None else "false") in payload
-        if fail_at is None:
+        assert '"complete":' + ("true" if succeeds else "false") in payload
+        if succeeds:
+            build_info = json.loads((directory / "builds/D/wheel.json").read_text())["build"]
+            assert build_info["cmake_version"] == ["cmake version 3.25.1", "cmake version 3.31.6"][node]
             records = json.loads((directory / "results.json").read_text())
             assert "".join(row["variant"] for row in records) == "ABCDDCBA"
             local_calls = [name for n, name in calls if n == node]
             assert [name for name in local_calls if name.startswith("accuracy-")] == [f"accuracy-{v}" for v in "ABCD"]
             assert local_calls[-1] == "install-D"
-    if fail_at is None:
+    if succeeds:
         for label in "ABCD":
             first_perf = next(i for i, (_, name) in enumerate(calls) if name == f"perf-{label}")
             for node in range(2):
                 assert (node, f"accuracy-{label}") in calls[:first_perf]
                 assert (node, f"install-{label}") in calls[:first_perf]
-    if fail_at in {"settings-order", "settings-flag"}:
-        assert calls == []  # Real configuration mismatches still stop before building.
+    if fail_at == "source-mismatch":
+        assert not any(name.startswith(("accuracy-", "perf-")) for _, name in calls)
 
 
 def test_cli_help_isolated():

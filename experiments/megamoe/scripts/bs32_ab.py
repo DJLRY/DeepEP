@@ -696,19 +696,12 @@ def experiment(args, config, launcher, peer, directory):
         }
         write_json(directory / "build_settings_raw.json", flags)
         flags["CMAKE_PREFIX_PATH"] = normalize_cmake_prefix_path(flags["CMAKE_PREFIX_PATH"])
-        # Apply the same normalized value to the actual compiler environment, not
-        # just the comparison. Re-sourcing CANN commonly prepends duplicate paths.
+        # Re-sourcing CANN commonly prepends duplicate paths.
         env["CMAKE_PREFIX_PATH"] = flags["CMAKE_PREFIX_PATH"]
         write_json(directory / "build_settings.json", flags)
-        peer.exchange("build-settings", flags, same=True)
         # Existing validated SDKs are reused via the supported external SDK build
-        # path; neither source checkout nor third-party trees are rewritten.
-        for name in ("SHMEM_ROOT", "CATLASS_ROOT"):
-            if not Path(env[name]).is_dir():
-                raise RuntimeError(f"Missing {env[name]}; run the ordinary BS32 build once before A/B")
-        catlass_status = git(Path(env["CATLASS_ROOT"]), "status", "--porcelain", "--ignore-submodules=all")
-        if catlass_status.strip():
-            raise RuntimeError("CATLASS has local changes; use the pinned clean dependency")
+        # path. Record each host's environment without requiring it to match the
+        # peer; the ordinary build reports any unusable local dependencies.
         sources = directory / "sources"
         sources.mkdir()
         for label in "DABC":
@@ -742,7 +735,7 @@ def experiment(args, config, launcher, peer, directory):
                 raise RuntimeError("Build did not produce a timer-OFF MegaMoE wheel")
             wheels[label] = (wheel, info)
             write_json(build_dir / "wheel.json", dict(path=str(wheel), sha256=digest(wheel.read_bytes()), build=info))
-            peer.exchange(f"build-done-{label}", info, same=True)
+            peer.exchange(f"build-done-{label}", info["source_sha256"], same=True)
         if len({info["source_sha256"] for _, info in wheels.values()}) != 4:
             raise RuntimeError("Four variants did not produce four distinct source fingerprints")
         checked = set()

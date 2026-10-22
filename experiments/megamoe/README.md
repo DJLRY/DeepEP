@@ -251,9 +251,10 @@ bash experiments/megamoe/scripts/run_bs32_ab.sh
 两台分别构建四份 timer-OFF wheel 后缓存，在 `A B C D D C B A` 顺序上重复三遍，
 每个版本测六次，每次预热20轮、采样100轮、统计后50轮；各版本首次运行前执行全 token 精度检查。
 Golden 复用原配置的 `case_dir/golden/`。两端在构建、安装、精度和性能阶段同步，
-核对源码、编译配置、实际安装的包以及各 rank 的构建信息；发生错误、断连或超时后终止当前子进程。
-`CMAKE_PREFIX_PATH` 中完全相同的重复目录会按首次出现顺序去重后用于比较和构建，
-允许重复加载 CANN 环境产生的冗余项；目录顺序、不同目录和编译选项的差异仍会阻止测试。
+核对测试源码和顺序、各机实际安装的包以及本机各 rank 的构建信息；发生错误、断连或超时后终止当前子进程。
+直接沿用两台机器各自的构建环境，CMake 版本、SDK 指纹、搜索路径及编译选项不做跨机一致性检查，
+各机完整构建信息保存在对应的 `builds/*/wheel.json` 中。
+`CMAKE_PREFIX_PATH` 中完全相同的重复目录会按首次出现顺序去重后用于构建。
 原始设置保存在 `build_settings_raw.json`，实际使用的设置保存在 `build_settings.json`。
 脚本会安装测试 wheel，因此运行期间应独占这套 Python 环境和32张卡。结束时重新安装 D 组 timer-OFF wheel，
 若中途失败则在 D 已构建成功的情况下尝试恢复；恢复状态写入 `status.json`。
