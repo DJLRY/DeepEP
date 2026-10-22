@@ -24,6 +24,9 @@ constexpr int AIC = 0;
 constexpr int AIV = 1;
 constexpr int g_coreType = AIV;
 using bfloat16_t = uint16_t;
+// CATLASS also declares a global CacheMode. Keep that name collision visible
+// when compiling the real progress header, even without the heavy dependency.
+enum class CacheMode { CATLASS_TEST_VALUE };
 namespace AscendTimer {
 enum class RdmaPhase { Combine };
 enum FixedTiming { AIV_COMBINE_INIT };
