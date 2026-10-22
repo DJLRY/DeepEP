@@ -39,6 +39,7 @@ EXPERIMENTS = {
         headers=HEADERS,
         variants=VARIANTS,
         order=ORDER,
+        default_cycles=3,
         build_order="DABC",
         restore="D",
         description="A=baseline; B=activation priority; C=scan early stop; D=both",
@@ -54,7 +55,9 @@ EXPERIMENTS = {
         changed="HEAD",
         headers=(DISPATCH_HEADER,),
         variants={"A": (BASE,), "B": ("HEAD",)},
-        order="ABBA",
+        order="AB",
+        default_cycles=1,
+        alternate_direction=True,
         build_order="AB",
         restore="A",
         description="A=separate Dispatch commits; B=one Dispatch commit; both use the A scheduling baseline",
@@ -62,6 +65,14 @@ EXPERIMENTS = {
     ),
 }
 TEXT_MAX_BYTES = 60000  # Includes framing and worst-case clipboard LF -> CRLF expansion.
+
+
+def measurement_order(experiment, cycles):
+    spec = EXPERIMENTS[experiment]
+    return "".join(
+        spec["order"][::-1] if spec.get("alternate_direction") and cycle % 2 else spec["order"]
+        for cycle in range(cycles)
+    )
 
 
 def load_launcher():
@@ -439,7 +450,10 @@ def save_results(directory, records, cycles, *, error=None, experiment="scheduli
     for name, data in summary["paired_deltas"].items():
         cells = [f"{key}: {v['median']:+.3f} us, positive {v['positive']}/{v['n']}" for key, v in data.items()]
         lines.append(name + " | " + " | ".join(cells))
-    lines.append("Repeat variation and both metrics must be inspected before attributing a regression.")
+    if cycles == 1 and experiment == "dispatch":
+        lines.append("Screening: one run per variant; run-to-run variation is not measured.")
+    else:
+        lines.append("Repeat variation and both metrics must be inspected before attributing a regression.")
     if error is not None:
         lines.append(f"Experiment failed: {error}; inspect status.json and logs.")
     text = "\n".join(lines) + "\n"
@@ -518,7 +532,9 @@ def compact_report(directory):
             iters=case.get("iters"),
             seed=case.get("seed"),
             selection="tail_half_ceil",
-            order_per_cycle=spec["order"],
+            # Older dispatch plans used ABBA per cycle and did not store this field.
+            order_per_cycle=plan.get("order_per_cycle", "ABBA" if experiment == "dispatch" else ORDER),
+            alternate_direction=plan.get("alternate_direction", False),
             planned_runs=len(plan.get("order", "")),
             completed_runs=len(records),
             units="us",
@@ -707,14 +723,24 @@ def experiment(args, config, launcher, peer, directory):
     error = None
     try:
         # Preserve experiment/node identity even if source preparation fails.
-        write_json(directory / "plan.json", dict(schema_version=1, experiment=name))
+        write_json(
+            directory / "plan.json",
+            dict(
+                schema_version=1,
+                experiment=name,
+                order_per_cycle=spec["order"],
+                alternate_direction=spec.get("alternate_direction", False),
+            ),
+        )
         write_json(directory / "host.json", dict(config, hostname=socket.gethostname(), root=str(ROOT)))
         source, blobs = source_plan(ROOT, experiment=name)
         plan = dict(
             schema_version=1,
             experiment=name,
             source=source,
-            order=spec["order"] * args.cycles,
+            order=measurement_order(name, args.cycles),
+            order_per_cycle=spec["order"],
+            alternate_direction=spec.get("alternate_direction", False),
             case=dict(launcher.CASE, warmup=args.warmup, iters=args.iters),
             backend=config["rdma_backend"],
             master_addr=config["master_addr"],
@@ -910,7 +936,9 @@ def main(argv=None):
         help="Export existing A/B results as small text blocks; no devices or rebuild",
     )
     parser.add_argument(
-        "--cycles", type=int, default=3, help="Forward/reverse cycles; default 3 = six runs per variant"
+        "--cycles",
+        type=int,
+        help="Dispatch: AB pairs, alternating direction (default 1); scheduling: ABCDDCBA cycles (default 3)",
     )
     parser.add_argument("--warmup", type=int, default=20)
     parser.add_argument("--iters", type=int, default=100)
@@ -918,6 +946,8 @@ def main(argv=None):
     parser.add_argument("--connect-timeout", type=int, default=600)
     parser.add_argument("--stage-timeout", type=int, default=7200, help="Maximum seconds per build/test/barrier")
     args = parser.parse_args(argv)
+    if args.cycles is None:
+        args.cycles = EXPERIMENTS[args.experiment]["default_cycles"]
     if args.export_text is not None:
         export_text(args.export_text)
         return

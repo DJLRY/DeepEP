@@ -209,9 +209,11 @@ def test_archive_uses_committed_tree_and_does_not_copy_local_outputs(tmp_path):
     assert (destination / "build_support.py").is_file()
 
 
-def test_dispatch_summary_pairs_forward_and_reverse_runs(tmp_path):
+@pytest.mark.parametrize("cycles,order", [(1, "AB"), (2, "ABBA"), (6, "ABBA" * 3)])
+def test_dispatch_summary_pairs_forward_and_reverse_runs(tmp_path, cycles, order):
+    assert ab.measurement_order("dispatch", cycles) == order
     records = []
-    for index, label in enumerate("ABBA" * 3):
+    for index, label in enumerate(order):
         value = {"A": 300, "B": 280}[label] + (index // 2) * 5
         records.append(
             dict(
@@ -224,14 +226,15 @@ def test_dispatch_summary_pairs_forward_and_reverse_runs(tmp_path):
                 report=f"run_{index}/profiling.json",
             )
         )
-    summary = ab.summarize(records, 3, experiment="dispatch")
+    summary = ab.summarize(records, cycles, experiment="dispatch")
     assert summary["complete"] and set(summary["variants"]) == {"A", "B"}
-    assert summary["variants"]["B"]["mean_us"]["n"] == 6
+    assert summary["variants"]["B"]["mean_us"]["n"] == cycles
     assert set(summary["paired_deltas"]) == {"B-A"}
-    assert summary["paired_deltas"]["B-A"]["mean_us"]["values"] == [-20] * 6
-    assert not ab.summarize(records[:-1], 3, experiment="dispatch")["complete"]
-    text = ab.save_results(tmp_path, records, 3, experiment="dispatch")
-    assert "12/12 perf runs" in text and "one Dispatch commit" in text
+    assert summary["paired_deltas"]["B-A"]["mean_us"]["values"] == [-20] * cycles
+    assert not ab.summarize(records[:-1], cycles, experiment="dispatch")["complete"]
+    text = ab.save_results(tmp_path, records, cycles, experiment="dispatch")
+    assert f"{len(order)}/{len(order)} perf runs" in text and "one Dispatch commit" in text
+    assert ("one run per variant" in text) is (cycles == 1)
     assert "scan early stop" not in text and "D-B-C+A" not in text
 
 
@@ -563,5 +566,5 @@ def test_cli_help_isolated():
     result = subprocess.run([sys.executable, "-I", SCRIPT, "--help"], capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
     assert "--control-port" in result.stdout
-    assert "six runs per variant" in " ".join(result.stdout.split())
+    assert "Dispatch: AB pairs" in " ".join(result.stdout.split())
     assert "--experiment {scheduling,dispatch}" in result.stdout
