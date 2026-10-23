@@ -411,9 +411,9 @@ python -I -m deep_ep_experimental.megamoe.timer.trace_parser \
 | `AIV_INPUT_PREP_BARRIER_WAIT` | 输入准备后的既有 PIPE_ALL 排空和 AIC/AIV 屏障；AIC 对应原有 `AIC_WAIT_INPUT_PREP` |
 | `AIV_COUNT_TABLE_PREPARE` | AIV1 准备 count/prefix 表的完整父区间 |
 | `AIV_COUNT_METADATA_WAIT` | 获取所有来源的有效 count：包含 DMA、epoch 校验、转置、重试与退避，并非纯网络延迟 |
-| `AIV_GATEWAY_PAYLOAD_CHECK` | 构造所需来源集合、检查本核负责的 gateway、发布并等待本卡就绪槽的父区间 |
+| `AIV_GATEWAY_PAYLOAD_CHECK` | count-ready 发布后，按保存的来源集合检查本核负责的 gateway、发布并等待本卡就绪槽的父区间 |
 | `AIV_GATEWAY_PAYLOAD_WAIT` | 唯一检查者获取所需 gateway 的 `RelayPayloadReady` 及发布前的 GM 顺序保障；显示 source rank、gateway rank 和 sequence |
-| `AIV_COUNT_PREFIX_BUILD` | 计算专家 token 总数和 prefix 表，包含既有向量完成同步 |
+| `AIV_COUNT_PREFIX_BUILD` | 从原始 count 保存 gateway 依赖集合，再计算专家 token 总数和 prefix 表，包含既有向量完成同步 |
 | `AIV_COUNT_TABLE_PUBLISH` | count/prefix 写回、既有 MTE3 完成同步和 count-ready 发布 |
 | `AIC/AIV_COUNT_READY_WAIT` | AIC/AIV0 等待对应 block 的 AIV1 发布 count-ready |
 
@@ -561,7 +561,8 @@ A8W8 当前只运行路由专家，`num_shared_experts` 必须为0，不能传�
 两台机器的所有 rank 都固定由物理 AIV0 打包本地元数据，物理 AIV1 发送 RDMA。
 AIV1 在 Dispatch 和 Combine 全程独占 QP1，包括 Put、quiet 和 commit；AIV0 不推进 RDMA。
 此分工适用于 A8W4/A8W8；host_id 仍用于选择 rail 槽、gateway 和接收转发分工，
-打包使用 AIV0 自己的 epoch 计数槽，发送前仍等待 `LocalRailPacked`。
+打包使用 AIV0 自己的 epoch 计数槽，元数据发送前等待 `LocalRailPacked`；payload 先行提交，
+与 AIV0 剩余的元数据打包重叠。
 
 跨机输入 payload 在本卡全部 token/scale 准备完成后，按实际 B 一次 Put 到配对 gateway，
 不再扫描路由并拆成多个连续 token 段；B 小于预分配容量时只发送实际 B 行。
@@ -569,8 +570,9 @@ AIV1 在 Dispatch 和 Combine 全程独占 QP1，包括 Put、quiet 和 commit�
 该策略用于上述 B≤32 的 A8W4/A8W8 路径，包括没有远端路由的批次。
 元数据和 payload 先在同一 QP 提交，完成等待延后到 owner 的 reset/shared-input 工作之后；
 一次 quiet 覆盖两份数据，再发布共用的 `NetPayloadCommit` 并 quiet 该通知。四次 quiet 减为两次，
-接收 leader 获取这个标记后才发布 `MetaReady` 并转发 metadata；发送 owner 仍在完成本地发送后
-获取对端同一标记、发布 `RelayPayloadReady`。公共输入 barrier 保留，统一 commit 必须在它之前发布。
+接收 leader 获取这个标记后立即发布 `RelayPayloadReady` 和 `MetaReady`，然后转发 metadata；
+接收就绪不再等待本卡反方向的发送完成。发送 owner 完成两次 quiet 后只发布 `TxDone`。
+公共输入 barrier 保留，统一 commit 和接收就绪仍须在它之前发布。
 这会放弃 metadata 提前到达时的 relay 重叠机会，整体收益以关闭打点的 perf 为准。
 H=3584、B=32 时 payload 为118784 B；相较已测 EP32/K8 balanced 样本的8次7424 B提交，
 该策略以每 rank 额外59392 B流量换取一次提交和更少的发送端扫描工作。
@@ -578,8 +580,10 @@ H=3584、B=32 时 payload 为118784 B；相较已测 EP32/K8 balanced 样本的8
 并以关闭打点的 `rank-max-mean` 判断整体收益，不能仅由 POST 次数推断加速比例。
 
 跨机输入的 gateway 依赖按 AIV1 block 分工：各核从同一份有效 count 表得到本 rank
-实际需要的来源；唯一检查者确认对应 gateway 就绪后，向本卡独立的512 B槽发布当前 epoch，
-所有消费者等到所需本卡槽就绪后才发布 count-ready。各检查者先完成自己的检查和发布，
+实际需要的来源，并在原始 count 被前缀和覆盖前保存依赖 mask。数量表及前缀写回完成后立即
+发布 count-ready，允许 AIC/AIV0 提前准备 GMM 状态和权重。随后唯一检查者确认对应 gateway
+就绪，向本卡独立的512 B槽发布当前 epoch；AIV1 等到所需本卡槽就绪后才读取 payload。
+各检查者先完成自己的检查和发布，
 再消费本卡通知，避免把并行检查串行化。28个 AIV1 都需要16个来源的用例中，
 gateway 检查调用由448次降为16次；这些是依赖检查调用数，未就绪时仍会轮询。
 新增16×512 B槽及对齐 padding 纳入现有输入屏障前的 workspace reset，

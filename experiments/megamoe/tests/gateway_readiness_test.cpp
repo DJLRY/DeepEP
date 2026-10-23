@@ -75,14 +75,20 @@ struct State {
     std::array<uint64_t, kMaxGroups> finishedAt{};
     std::array<uint32_t, kMaxGroups> countReads{};
 
-    int32_t* Local(uint32_t slot) { return local.data() + (slot + 1U) * kLineWords; }
+    int32_t* Local(uint32_t slot)
+    {
+        return local.data() + (slot + 1U) * kLineWords;
+    }
     int32_t* Remote(uint32_t slot)
     {
         // The source is on the other host; its gateway is on this host.
         const uint32_t gateway = (rank < kSlots ? 0U : kSlots) + slot;
         return windows[gateway].data() + kReadyOffset / sizeof(int32_t);
     }
-    bool Needed(uint32_t slot) const { return (needed & (uint32_t(1) << slot)) != 0U; }
+    bool Needed(uint32_t slot) const
+    {
+        return (needed & (uint32_t(1) << slot)) != 0U;
+    }
 };
 inline State* state = nullptr;
 
@@ -180,8 +186,8 @@ inline void AcquirePayload()
     std::lock_guard<std::mutex> lock(s.mutex);
     for (uint32_t slot = 0U; slot < kSlots; ++slot) {
         if (s.Needed(slot)) {
-            Check(s.localObservedAt[currentGroup][slot] > s.publishedAt[slot] &&
-                      s.publishedAt[slot] != 0U, "payload DMA ordering preceded a local notification");
+            Check(s.localObservedAt[currentGroup][slot] > s.publishedAt[slot] && s.publishedAt[slot] != 0U,
+                  "payload DMA ordering preceded a local notification");
         }
     }
     Check(s.acquiredAt[currentGroup] == 0U, "consumer issued duplicate payload acquire");
@@ -257,16 +263,34 @@ struct Params {
         GM_ADDR gatewayPayloadReadyPtr = nullptr;
     } workspaceInfo;
 };
-inline uint32_t HierarchicalHost(uint32_t rank) { return rank / HIERARCHICAL_RANKS_PER_HOST; }
-inline uint32_t HierarchicalGateway(uint32_t source) { return source ^ HIERARCHICAL_RANKS_PER_HOST; }
+inline uint32_t HierarchicalHost(uint32_t rank)
+{
+    return rank / HIERARCHICAL_RANKS_PER_HOST;
+}
+inline uint32_t HierarchicalGateway(uint32_t source)
+{
+    return source ^ HIERARCHICAL_RANKS_PER_HOST;
+}
 inline uint64_t HierarchicalSignalOffset(HierarchicalSignal signal)
 {
     return static_cast<uint64_t>(signal) * HIERARCHICAL_FLAG_BYTES;
 }
-inline uint32_t GetSubBlockIdx() { return GatewayTest::currentLane; }
-inline bool UseHierarchicalRoce(const MegaMoeTilingData* tiling) { return tiling->hierarchical; }
-inline void WaitUntilGmFlagEquals(int32_t* pointer, int32_t value) { GatewayTest::WaitFlag(pointer, value); }
-inline void WriteGmByPassDCache(int32_t* pointer, int32_t value) { GatewayTest::Publish(pointer, value); }
+inline uint32_t GetSubBlockIdx()
+{
+    return GatewayTest::currentLane;
+}
+inline bool UseHierarchicalRoce(const MegaMoeTilingData* tiling)
+{
+    return tiling->hierarchical;
+}
+inline void WaitUntilGmFlagEquals(int32_t* pointer, int32_t value)
+{
+    GatewayTest::WaitFlag(pointer, value);
+}
+inline void WriteGmByPassDCache(int32_t* pointer, int32_t value)
+{
+    GatewayTest::Publish(pointer, value);
+}
 template <HardEvent Event, uint32_t Id>
 inline void SyncFuncStatic()
 {
@@ -299,6 +323,12 @@ public:
         std::lock_guard<std::mutex> lock(state->mutex);
         ++state->countReads[currentGroup];
         return data_[index];
+    }
+    void OverwriteWithPrefixes()
+    {
+        // Zero counts may become nonzero inclusive prefixes. Acquiring after
+        // publication must use the saved dependency mask, never rescan this.
+        data_.fill(123);
     }
 
 private:
@@ -334,7 +364,8 @@ struct Fixture {
             s.aborted = true;
             s.changed.notify_all();
         }
-        for (auto& worker : workers) if (worker.joinable()) worker.join();
+        for (auto& worker : workers)
+            if (worker.joinable()) worker.join();
         state = nullptr;
     }
 
@@ -387,8 +418,11 @@ struct Fixture {
                 CountTensor counts(s);
                 BlockWorkspaceContext workspace{group, s.groups};
                 AscendTimerDevice timer;
-                AcquireHierarchicalGatewayPayload(common, workspace, params, addresses.data(), counts,
-                                                   timed ? &timer : nullptr);
+                const uint32_t needed = BuildHierarchicalGatewayNeededMask(common, workspace, params, counts);
+                Check(needed == s.needed, "dependency snapshot lost or invented a remote source");
+                counts.OverwriteWithPrefixes();
+                AcquireHierarchicalGatewayPayload(common, workspace, params, addresses.data(), needed,
+                                                  timed ? &timer : nullptr);
                 std::lock_guard<std::mutex> lock(s.mutex);
                 Check(s.acquiredAt[group] != 0U, "consumer returned before its payload DMA acquire");
                 for (uint32_t slot = 0U; slot < kSlots; ++slot) {
@@ -525,7 +559,8 @@ void LateConsumer()
     // publication and must never clear a ready flag from the same invocation.
     for (uint32_t group = 0U; group < kSlots; ++group) f.Start(group);
     f.Await([&] {
-        for (uint32_t slot = 0U; slot < kSlots; ++slot) if (!f.s.publications[slot]) return false;
+        for (uint32_t slot = 0U; slot < kSlots; ++slot)
+            if (!f.s.publications[slot]) return false;
         return true;
     });
     for (uint32_t group = kSlots; group < f.s.groups; ++group) f.Start(group);
@@ -550,16 +585,21 @@ void Guards()
     f.Begin(157U, 0xffffU);
     CountTensor counts(f.s);
     currentGroup = 0U;
+    const auto guardedAcquire = [&](BlockWorkspaceContext workspace) {
+        const uint32_t mask = BuildHierarchicalGatewayNeededMask(f.common, workspace, f.params, counts);
+        Check(mask == 0U, "guarded path created payload dependencies");
+        AcquireHierarchicalGatewayPayload(f.common, workspace, f.params, f.addresses.data(), mask);
+    };
     currentLane = 0U;
-    AcquireHierarchicalGatewayPayload(f.common, {0U, 1U}, f.params, f.addresses.data(), counts);
+    guardedAcquire({0U, 1U});
     currentLane = 1U;
     f.tiling.hierarchical = false;
-    AcquireHierarchicalGatewayPayload(f.common, {0U, 1U}, f.params, f.addresses.data(), counts);
+    guardedAcquire({0U, 1U});
     f.tiling.hierarchical = true;
-    AcquireHierarchicalGatewayPayload(f.common, {0U, 0U}, f.params, f.addresses.data(), counts);
-    AcquireHierarchicalGatewayPayload(f.common, {1U, 1U}, f.params, f.addresses.data(), counts);
+    guardedAcquire({0U, 0U});
+    guardedAcquire({1U, 1U});
 #ifdef GATEWAY_TEST_AIC
-    AcquireHierarchicalGatewayPayload(f.common, {0U, 1U}, f.params, f.addresses.data(), counts);
+    guardedAcquire({0U, 1U});
 #endif
     Check(f.s.countReads[0] == 0U && f.s.order == 0U, "guarded path touched counts, flags or synchronization");
 }
@@ -571,13 +611,20 @@ int main(int argc, char** argv)
     try {
         Check(argc == 2, "expected one scenario name");
         const std::string scenario = argv[1];
-        if (scenario == "distribution") Distribution();
-        else if (scenario == "late-arrival") LateArrival();
-        else if (scenario == "epochs") Epochs();
-        else if (scenario == "late-consumer") LateConsumer();
-        else if (scenario == "telemetry") Telemetry();
-        else if (scenario == "guards") Guards();
-        else throw std::runtime_error("unknown scenario");
+        if (scenario == "distribution")
+            Distribution();
+        else if (scenario == "late-arrival")
+            LateArrival();
+        else if (scenario == "epochs")
+            Epochs();
+        else if (scenario == "late-consumer")
+            LateConsumer();
+        else if (scenario == "telemetry")
+            Telemetry();
+        else if (scenario == "guards")
+            Guards();
+        else
+            throw std::runtime_error("unknown scenario");
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

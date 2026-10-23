@@ -35,15 +35,6 @@ __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& comm
     const uint32_t myHost = HierarchicalHost(common.rankId);
     const uint32_t gateway = HierarchicalGateway(common.rankId);
     auto* roceScratch = HierarchicalRoceScratch(params);
-    WaitHierarchicalLocalSignal(params, HierarchicalSignal::LocalRailPacked);
-
-    GM_ADDR packedRail = params.peermemInfo.railTopkIdsRecvPtr + myHost * config.railTopkIdsSlotBytes;
-    const uint32_t railBytes = static_cast<uint32_t>(CalcRailTopkIdsSlotDataBytes(common.tokenNum, common.topK));
-    RocePutBytes(packedRail, packedRail, railBytes, gateway, roceScratch, timer, AscendTimer::RdmaPhase::DispatchMeta);
-    // Both data Puts use the same owned QP. FinishHierarchicalDispatch quiets
-    // them together before publishing NetPayloadCommit, which now certifies
-    // both metadata and payload. No receiver may consume metadata before it.
-
     // All local token/scale rows are ready before this stage. Decode is bounded
     // to 32 tokens and both regions reserve the full batch, so one contiguous
     // Put avoids route rescans and per-run posting overhead. Send actual B, not
@@ -52,6 +43,14 @@ __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& comm
         static_cast<uint32_t>(CalcQuantTokenScaleBytes(common.tokenHiddenDim, 1U, common.topK, false));
     RocePutBytes(params.peermemInfo.relayPayloadPtr, params.peermemInfo.quantTokenScalePtr, common.tokenNum * rowBytes,
                  gateway, roceScratch, timer, AscendTimer::RdmaPhase::DispatchPayload);
+    // Payload is independent of the rail packer: let its transfer overlap the
+    // remaining metadata packing instead of putting that wait on both Puts.
+    WaitHierarchicalLocalSignal(params, HierarchicalSignal::LocalRailPacked);
+    GM_ADDR packedRail = params.peermemInfo.railTopkIdsRecvPtr + myHost * config.railTopkIdsSlotBytes;
+    const uint32_t railBytes = static_cast<uint32_t>(CalcRailTopkIdsSlotDataBytes(common.tokenNum, common.topK));
+    RocePutBytes(packedRail, packedRail, railBytes, gateway, roceScratch, timer, AscendTimer::RdmaPhase::DispatchMeta);
+    // Both Puts use the same owned QP and share the completion/commit below.
+    // Neither metadata nor payload may be consumed before NetPayloadCommit.
     // Completion is deliberately deferred until after this owner's reset/shared
     // input work. Batches with no remote routes still publish the completion epoch.
 }
@@ -88,6 +87,9 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
         RoceWaitCommit(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit),
                        params.tilingData->hierarchicalSequence, timer, AscendTimer::RdmaPhase::DispatchMeta,
                        HierarchicalGateway(common.rankId));
+        // Incoming payload readiness is independent of this rank's outgoing
+        // CQ. Publish it here so peer experts need not wait for our TxDone.
+        PublishHierarchicalLocalSignal(params, HierarchicalSignal::RelayPayloadReady);
         PublishHierarchicalLocalSignal(params, HierarchicalSignal::MetaReady);
     }
     const uint32_t relayCore = job.jobIndex - 2U;
@@ -125,11 +127,8 @@ __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, cons
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence)), gateway,
         HierarchicalRoceScratch(params), timer, AscendTimer::RdmaPhase::DispatchPayload);
     PublishHierarchicalLocalSignal(params, HierarchicalSignal::TxDone);
-    // Both sides finish their own outbound notification before waiting for the
-    // opposite direction. No software ACK is required for source completion.
-    RoceWaitCommit(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit),
-                   params.tilingData->hierarchicalSequence, timer, AscendTimer::RdmaPhase::DispatchPayload, gateway);
-    PublishHierarchicalLocalSignal(params, HierarchicalSignal::RelayPayloadReady);
+    // The independent receive leader acquires the opposite direction and
+    // publishes RelayPayloadReady before reaching the public input barrier.
 }
 
 // All producers have drained before this call. Only local peer pointers are

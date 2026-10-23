@@ -648,11 +648,6 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
             AscendTimerFixedScope counts(timer, AscendTimer::AIV_COUNT_METADATA_WAIT);
             LoadMteExpertCounts(common, params, scratch, static_cast<uint32_t>(expectEpoch));
         }
-        if (UseHierarchicalRoce(params.tilingData)) {
-            AscendTimerFixedScope payload(timer, AscendTimer::AIV_GATEWAY_PAYLOAD_CHECK);
-            AcquireHierarchicalGatewayPayload(common, countWorkspace, params, g_winRankAddr_,
-                                               scratch.cumsumInfoTensor, timer);
-        }
     } else {
         AscendTimerFixedScope counts(timer, AscendTimer::AIV_COUNT_METADATA_WAIT);
         GlobalTensor<int32_t> expertCountGlobal;
@@ -688,28 +683,41 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
             }
         }
     }
+    uint32_t neededGatewayMask = 0U;
     {
         AscendTimerFixedScope prefix(timer, AscendTimer::AIV_COUNT_PREFIX_BUILD);
+        if (UseHierarchicalRoce(params.tilingData)) {
+            neededGatewayMask =
+                BuildHierarchicalGatewayNeededMask(common, countWorkspace, params, scratch.cumsumInfoTensor);
+        }
         SyncFuncStatic<AscendC::HardEvent::S_V, SYNC_EVENT_ID2>();
         ComputeExpertCountTables(scratch.cumsumInfoTensor, scratch.expertTokenNumsOutTensor, common.moeExpertPerRank,
                                  common.worldSize, params.tilingData->maxOutputSize);
         SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
     }
-    AscendTimerFixedScope publish(timer, AscendTimer::AIV_COUNT_TABLE_PUBLISH);
-    uint64_t countOffset = GetExpertCountWorkspaceOffset(countWorkspace, common.moeExpertPerRank, 0U, true);
-    SyncFuncStatic<AscendC::HardEvent::V_MTE3, SYNC_EVENT_ID2>();
-    DataCopyPad(scratch.expertRevNumsGlobalTensor[countOffset], scratch.expertTokenNumsOutTensor,
-                {1U, common.moeExpertPerRank * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U});
-    if constexpr (NeedCumsumReload) {
-        DataCopyPad(scratch.cumsumInfoGlobalTensor, scratch.cumsumInfoTensor,
-                    {1U, rawCountElementCount * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U});
-    }
-    SyncFuncStatic<AscendC::HardEvent::MTE3_S, SYNC_EVENT_ID2>();
+    {
+        AscendTimerFixedScope publish(timer, AscendTimer::AIV_COUNT_TABLE_PUBLISH);
+        uint64_t countOffset = GetExpertCountWorkspaceOffset(countWorkspace, common.moeExpertPerRank, 0U, true);
+        SyncFuncStatic<AscendC::HardEvent::V_MTE3, SYNC_EVENT_ID2>();
+        DataCopyPad(scratch.expertRevNumsGlobalTensor[countOffset], scratch.expertTokenNumsOutTensor,
+                    {1U, common.moeExpertPerRank * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U});
+        if constexpr (NeedCumsumReload) {
+            DataCopyPad(scratch.cumsumInfoGlobalTensor, scratch.cumsumInfoTensor,
+                        {1U, rawCountElementCount * static_cast<uint32_t>(sizeof(int32_t)), 0U, 0U, 0U});
+        }
+        SyncFuncStatic<AscendC::HardEvent::MTE3_S, SYNC_EVENT_ID2>();
 
-    __gm__ int32_t* countTableReady =
-        reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.flagSendCntCalToUpdParamsPtr) +
-        static_cast<uint64_t>(countWorkspace.blockIdx) * INT_CACHELINE;
-    WriteGmByPassDCache(countTableReady, static_cast<int32_t>(1));
+        __gm__ int32_t* countTableReady =
+            reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.flagSendCntCalToUpdParamsPtr) +
+            static_cast<uint64_t>(countWorkspace.blockIdx) * INT_CACHELINE;
+        WriteGmByPassDCache(countTableReady, static_cast<int32_t>(1));
+    }
+    // AIC/AIV0 can prepare GMM state and weights using the completed count table
+    // while AIV1 acquires payload. Dispatch still starts only after this wait.
+    if (UseHierarchicalRoce(params.tilingData)) {
+        AscendTimerFixedScope payload(timer, AscendTimer::AIV_GATEWAY_PAYLOAD_CHECK);
+        AcquireHierarchicalGatewayPayload(common, countWorkspace, params, g_winRankAddr_, neededGatewayMask, timer);
+    }
 }
 
 /*

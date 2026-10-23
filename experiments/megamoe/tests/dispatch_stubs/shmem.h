@@ -5,6 +5,7 @@
 // symmetric heap uses the production layout; this does not simulate NPU caches.
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <vector>
 #include "kernel_operator.h"
 
@@ -32,6 +33,8 @@ inline uint32_t waits = 0U;
 inline uint32_t quiets = 0U;
 inline uint32_t packCalls = 0U;
 inline uint32_t relayCalls = 0U;
+inline uint32_t receiveLeaderJob = 0U;
+inline std::function<void()> completePacking;
 constexpr uint32_t kScratchOffset = 4096U;
 
 inline void Check(bool condition, const char* message)
