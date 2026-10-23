@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 
 from .timer.__main__ import parse_ranks
-from .performance import alignment_config, collect_profile, enqueue_batch, summarize_rounds
+from .performance import PERF_METHODS, SLEEP_CYCLES, alignment_config, collect_profile, enqueue_batch, summarize_rounds
 
 
 def load_config(name, bs_values=None):
@@ -118,6 +118,12 @@ def main():
     parser.add_argument("--config", default="smoke", help="Packaged name or JSON path")
     parser.add_argument("--bs-values", help="Only model config override, e.g. 96,4096")
     parser.add_argument("--mode", choices=("accuracy", "perf", "trace"), default="accuracy")
+    parser.add_argument(
+        "--perf-method",
+        choices=PERF_METHODS,
+        default="legacy",
+        help="legacy: one Exp prefix; shmem: per-round L2 flush, device sleep and SHMEM barrier",
+    )
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
     parser.add_argument(
         "--routing",
@@ -135,6 +141,8 @@ def main():
     parser.add_argument("--relative-rmse", type=float, default=0.02, help="Timer on/off output tolerance only")
     args = parser.parse_args()
     args.timer = args.timer or args.mode == "trace"
+    if args.perf_method != "legacy" and args.mode == "accuracy" and not args.timer:
+        parser.error("--perf-method shmem requires perf, trace, or --timer")
     config = load_config(args.config, args.bs_values)
     if args.check_tokens < 0 or not 0 < args.relative_rmse < 1:
         parser.error("Invalid accuracy sample count or tolerance")
@@ -168,6 +176,7 @@ def run(args, config, group):
         (
             config,
             args.mode,
+            args.perf_method,
             args.input,
             args.routing,
             args.timer,
@@ -211,8 +220,11 @@ def run(args, config, group):
         local_rank=int(os.environ["LOCAL_RANK"]),
         timer_ranks=timer_ranks,
         host_coordination="tcpstore",
-        iteration_sync="none",
-        alignment_scope="once_before_batch" if args.mode == "perf" or args.timer else "none",
+        perf_method=args.perf_method,
+        iteration_sync="shmem_world_on_stream" if args.perf_method == "shmem" else "none",
+        alignment_scope=("before_each_iteration" if args.perf_method == "shmem" else "once_before_batch")
+        if args.mode == "perf" or args.timer
+        else "none",
         device_communication=(
             "shmem_mte_roce" if int(os.environ["LOCAL_WORLD_SIZE"]) == 16 and world > 16 else "shmem_mte"
         ),
@@ -287,22 +299,58 @@ def run(args, config, group):
                 **shared_kwargs,
             )
 
-        prefix = None
+        prefix, flush_buffer = None, None
+        batch_options = dict(method=args.perf_method)
+        measurement = dict(
+            perf_method=args.perf_method,
+            iteration_sync="none",
+            alignment_scope="once_before_batch",
+            alignment=config["alignment"],
+            l2_flush_bytes=0,
+            sleep_cycles=0,
+        )
         if args.mode == "perf" or args.timer:
             error = None
             try:
-                alignment = config["alignment"]
-                prefix = torch.zeros((alignment["rows"], alignment["cols"]), dtype=torch.float32, device="npu")
-                torch.exp(prefix, out=prefix)  # 预热 Exp，不能把懒初始化带入采集批次。
+                if args.perf_method == "legacy":
+                    alignment = config["alignment"]
+                    prefix = torch.zeros((alignment["rows"], alignment["cols"]), dtype=torch.float32, device="npu")
+                    torch.exp(prefix, out=prefix)  # 预热 Exp，不能把懒初始化带入采集批次。
+                else:
+                    properties = torch.npu.get_device_properties(torch.npu.current_device())
+                    l2_bytes = int(properties.L2_cache_size)
+                    if l2_bytes <= 0:
+                        raise ValueError("SHMEM profiling requires a positive device L2_cache_size")
+                    flush_buffer = torch.empty(2 * l2_bytes, dtype=torch.uint8, device="npu")
+                    flush_buffer.zero_()
+                    buffer.benchmark_sleep(0)  # Warm up the helper before capture.
+                    batch_options.update(
+                        barrier=buffer.benchmark_barrier, sleep=buffer.benchmark_sleep, flush_buffer=flush_buffer
+                    )
+                    measurement.update(
+                        iteration_sync="shmem_world_on_stream",
+                        alignment_scope="before_each_iteration",
+                        alignment=None,
+                        l2_flush_bytes=2 * l2_bytes,
+                        sleep_cycles=SLEEP_CYCLES,
+                        shmem_api="aclshmemx_roce_barrier_all"
+                        if buffer._hierarchical_roce
+                        else "aclshmemx_barrier_all_on_stream",
+                    )
             except Exception as failure:
-                error = f"rank={rank} BS={bs} alignment={config['alignment']}: {failure}"
+                error = f"rank={rank} BS={bs} perf_method={args.perf_method}: {failure}"
             collective_check(group, f"alignment allocation BS={bs}", error)
+            if args.perf_method == "shmem":
+                torch.npu.synchronize()
+                group.barrier(f"SHMEM profiling helpers ready BS={bs}")
+                buffer.benchmark_barrier()  # Resolve first-use launch costs outside capture.
+                torch.npu.synchronize()
+            (case / "measurement.json").write_text(json.dumps(measurement, indent=2), encoding="utf-8")
             if rank == 0:
                 stage = "TRACE" if args.mode == "trace" else "PROFILE"
                 print(
-                    f"[{stage}] BS={bs} alignment={alignment} "
-                    f"temporary_bytes={alignment['rows'] * alignment['cols'] * 4} "
-                    f"batch_iterations={config['iters']} iteration_sync=none",
+                    f"[{stage}] BS={bs} method={args.perf_method} measurement={measurement} "
+                    f"batch_iterations={config['iters']}",
                     flush=True,
                 )
         if args.mode != "trace":
@@ -339,21 +387,19 @@ def run(args, config, group):
                     flush=True,
                 )
         elif args.mode == "perf":
-            samples = collect_profile(call, group, torch, config, prefix, case / "profiler", bs)
+            samples = collect_profile(call, group, torch, config, prefix, case / "profiler", bs, **batch_options)
             (case / "kernel_samples.json").write_text(json.dumps(samples, indent=2), encoding="utf-8")
             timings = [sample["duration_us"] for sample in samples]
             per_rank = group.all_gather(timings, f"profiling BS={bs}")
             report = summarize_rounds(per_rank, int(os.environ["LOCAL_WORLD_SIZE"]))
-            report["alignment"] = config["alignment"]
-            report["alignment_scope"] = "once_before_batch"
-            report["iteration_sync"] = "none"
+            report.update(measurement)
             (case / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             if rank == 0:
                 print(
                     f"[PERF] BS={bs} MegaMoe E2E={report['mean_us']:.3f}us "
                     f"rank-max-mean={report['rank_max_mean_us']:.3f}us "
                     f"rounds={report['rounds']}/{report['recorded_rounds']} "
-                    f"(last ceil(iters/2); kernel Duration; rank-min mean; timer off; continuous batch)",
+                    f"(last ceil(iters/2); kernel Duration; rank-min mean; timer off; method={args.perf_method})",
                     flush=True,
                 )
         if args.timer:
@@ -370,7 +416,7 @@ def run(args, config, group):
                 call()
             torch.npu.synchronize()
             group.barrier(f"timer batch BS={bs}")
-            enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], timer)
+            enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], timer, **batch_options)
             torch.npu.synchronize()
             if uninstrumented is not None:
                 from .reference import error_metrics
@@ -398,7 +444,7 @@ def run(args, config, group):
                 timer_dir.mkdir(parents=True, exist_ok=True)
                 write_breakdown([r for r in records if r is not None], timer_dir, f"BS={bs}")
             del timer
-        del prefix
+        del prefix, flush_buffer, batch_options
         group.barrier(f"case complete BS={bs}")
     group.barrier("before SHMEM teardown")
     buffer.destroy()

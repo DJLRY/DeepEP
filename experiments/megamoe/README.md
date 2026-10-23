@@ -206,18 +206,34 @@ bash experiments/megamoe/scripts/run_bs32.sh configure --python /path/to/env/bin
 
 ```bash
 bash experiments/megamoe/scripts/run_bs32.sh perf
+# 旧方法：整批 Exp20 + 连续 MegaMoE（默认）。
+bash experiments/megamoe/scripts/run_bs32.sh perf --perf-method legacy
+# 新方法：每轮清理 L2 + device sleep + SHMEM 全卡同步 + MegaMoE。
+bash experiments/megamoe/scripts/run_bs32.sh perf --perf-method shmem
 # 可选：两台使用相同的预热、采样次数。
 bash experiments/megamoe/scripts/run_bs32.sh perf --warmup 20 --iters 100
 ```
 
 `perf` 不生成或读取 Golden，不重新编译。默认预热20轮、采集100轮，并统计后50轮；
 模型、BS32、FP8输入、FP4权重、balanced路由均与精度用例一致。
-恢复连续批次测试：整批开始前通过 TCPStore 会合，排入一次 Exp 前置计算，随后连续下发 MegaMoE。
-每批前置计算重复 `alignment.repeats` 次（默认800次），复用约12 GB显存/卡，不计入 MegaMoE kernel Duration。
-测试不建立专用 HCCL 进程组，轮间不插入 AllReduce、Exp、Host barrier 或 `torch.npu.synchronize()`；
-算子内部仍使用 SHMEM MTE/RoCE。批次边界的同步保留，不保证各 rank 同一轮的实际开始时间一致。
-`manifest.json` / `profiling.json` 的 `iteration_sync` 为 `none`，`alignment_scope` 为 `once_before_batch`，
-用于区分此前逐轮 HCCL 同步及逐轮 Exp 的测试结果。
+`--perf-method legacy` 保留连续批次方法：整批开始前通过 TCPStore 会合，排入一次 Exp 前置计算，
+随后连续下发 MegaMoE。`alignment.repeats` 默认从800回退为20，复用约12 GB显存/卡；
+轮间不插入同步或额外计算。`iteration_sync=none`，`alignment_scope=once_before_batch`。
+
+`--perf-method shmem` 参考 [DeepGEMM-Ascend bench_msprof](https://github.com/deepseek-ai/DeepGEMM-Ascend/blob/main/deep_gemm/testing/bench.py)：
+每轮写零一个大小为设备 L2 两倍的缓冲区，排入20,000,000系统计数周期的设备 sleep，再执行 SHMEM WORLD barrier，
+最后下发 MegaMoE。这个模式不分配12 GB Exp缓冲区。单机调用 `aclshmemx_barrier_all_on_stream`；
+跨机 RoCE 用单 AIV 辅助 kernel 调用 `aclshmemx_roce_barrier_all`，显式提供256 B UB和event 0，
+使用 SDK 的全连接 QP及 WORLD 同步状态。当前锁定 SDK 的通用流上 barrier 通过远端 GM 同步，不能直接替代 RoCE 接口。
+`iteration_sync=shmem_world_on_stream`，`alignment_scope=before_each_iteration`。
+
+两个模式都只在批次边界做 Host 同步，不建立 HCCL 进程组。SHMEM barrier 在当前流排队，
+MegaMoE 的专属流通过已有事件依赖等待它；下一轮预处理也等待前一轮完成。
+只统计 MegaMoE kernel Duration，清 L2、sleep、barrier、Exp均排除在外。
+`manifest.json` / `profiling.json` 记录 `perf_method`；每个 BS 的 `measurement.json` 还记录实际接口、L2缓冲字节数和sleep周期，
+`shmem` 模式将不使用的 Exp配置记录为 `alignment=null`。两台机器必须选择相同方法，否则在开始采样前报错。
+新模式需要两端重新 `build` 安装 wheel（无需为此重建相同版本的 SHMEM SDK）；首次 helper调用在采集外预热。
+逐轮 barrier 用于减少快慢卡累积偏移，不保证各卡同一物理时刻启动。两种模式的缓存状态不同，性能结果应分别比较。
 结果保存到 `<case_dir>/perf_node_<rank>_<随机字符>/`，终端会打印完整路径和汇总：
 
 | 文件 | 内容 |
@@ -354,7 +370,7 @@ bash experiments/megamoe/scripts/run_bs32.sh trace --timer-ranks 0-31 --warmup 2
 
 `trace` 独立采集设备流水，不执行性能 Profiler 或 Golden 校验。默认预热2轮、运行1轮，
 每个 rank 共调用3次 MegaMoE；仅在采集批次的最后一轮、选中的 rank 上设备打点。
-可用 `--warmup`、`--iters` 覆盖次数；与 `perf` 一样每批开始前执行一次 Exp 对齐计算，随后连续下发 MegaMoE，
+可用 `--warmup`、`--iters` 覆盖次数；与 `perf` 一样支持 `--perf-method legacy|shmem`，默认每批 Exp20 后连续下发 MegaMoE，
 临时占用约12 GB显存/卡。未选中 timer 的 rank 也必须执行相同轮数。
 正式性能测试使用 `perf`，其默认预热20轮、采集100轮不变。
 `trace` 不会自动构建；未安装支持 timer 的 wheel 时会在启动 worker 前提示执行 `build --timer`。
@@ -717,6 +733,7 @@ python experiments/megamoe/scripts/batch_launch.py --hosts-file "$HOSTS_FILE" --
 | 参数 | 默认 / 作用 |
 | --- | --- |
 | `--mode perf\|accuracy` | 默认 perf 执行性能测试；accuracy 检查全量输出和专家计数 |
+| `--perf-method legacy\|shmem` | 默认 legacy：每批 Exp20；shmem：每轮清 L2、device sleep和SHMEM同步，同样作用于timer采集 |
 | `--input fp8\|bf16` | 默认 fp8；只改变输入类型，权重仍为 FP4 |
 | `--config NAME或路径` | 默认 `deepseek_v4_pro`；可传模型 JSON 路径 |
 | `--bs-values 96,4096` | 覆盖 JSON 中 BS 列表；每个 BS 单独启动 |

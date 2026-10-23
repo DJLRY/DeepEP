@@ -286,7 +286,8 @@ def test_errors_only_success_and_unknown_failure_keep_full_logs(saved, tmp_path,
 
 
 @pytest.mark.parametrize("node,action", [(0, "perf"), (1, "perf"), (0, "trace"), (1, "trace")])
-def test_sampling_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, node, action):
+@pytest.mark.parametrize("method", ["legacy", "shmem"])
+def test_sampling_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, node, action, method):
     path, config = saved
     config["node_rank"] = node
     launcher.save_config(path, config)
@@ -304,6 +305,7 @@ def test_sampling_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, 
         if "torch.distributed.run" in command:
             assert command[command.index("--node-rank") + 1] == str(node)
             assert command[command.index("--mode") + 1] == action
+            assert command[command.index("--perf-method") + 1] == method
             assert command[command.index("--input") + 1] == "fp8"
             assert command[command.index("--routing") + 1] == "balanced"
             assert command[command.index("--nproc-per-node") + 1] == "16"
@@ -329,7 +331,8 @@ def test_sampling_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, 
 
     monkeypatch.setattr(launcher, "execute", execute)
     for _ in range(2):
-        launcher.main([action, "--config", str(path)])
+        launcher.main([action, "--config", str(path), "--perf-method", method])
+    assert json.loads((outputs[-1] / "run.json").read_text())["perf_method"] == method
     assert len(calls) == (4 if action == "trace" else 2)
     assert outputs[0] != outputs[1]
     summary = (outputs[-1] / "summary.txt").read_text()
@@ -434,6 +437,8 @@ def test_failed_trace_does_not_print_done_or_summary(saved, monkeypatch, capsys,
         ["build", "--iters", "100"],
         ["trace", "--warmup", "-1"],
         ["perf", "--iters", "0"],
+        ["run", "--perf-method", "shmem"],
+        ["perf", "--perf-method", "unknown"],
         ["trace", "--timer-ranks", "32"],
         ["trace", "--timer-ranks", "1-0"],
         ["trace", "--timer-ranks", "0,0"],

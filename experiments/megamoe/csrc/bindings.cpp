@@ -3,6 +3,9 @@
 
 #include "forward.hpp"
 #include "shmem.h"
+#include "kernel_launch.hpp"
+#include "torch_npu/csrc/core/npu/NPUStream.h"
+#include "tiling/platform/platform_ascendc.h"
 #include "kernels/mega_moe/common/ascend_timer_v2.hpp"
 #include "kernels/mega_moe/common/mega_moe_constants.hpp"
 
@@ -21,6 +24,24 @@ PYBIND11_MODULE(_C, module)
         .def("forward", &Plan::forward)
         .def_property_readonly("workspace_bytes", &Plan::workspace_bytes);
     module.def("ffts_config", [] { return shmemx_get_ffts_config(); });
+    module.def("benchmark_sleep", [](uint64_t cycles) {
+        auto* platform = platform_ascendc::PlatformAscendCManager::GetInstance();
+        TORCH_CHECK(platform != nullptr && platform->GetCoreNumAic() > 0, "invalid Ascend platform");
+        TORCH_CHECK(cycles <= 1000000000ULL, "benchmark sleep must be <= 1 billion system ticks");
+        benchmark_sleep_do(platform->GetCoreNumAic(), c10_npu::getCurrentNPUStream().stream(), cycles);
+    });
+    module.def("benchmark_barrier", [](bool roce) {
+        const auto stream = c10_npu::getCurrentNPUStream().stream();
+        if (roce) {
+#ifdef DEEPEP_MEGAMOE_ROCE
+            benchmark_roce_barrier_do(stream, shmemx_get_ffts_config());
+#else
+            TORCH_CHECK(false, "SHMEM RoCE profiling requires a wheel built with an RDMA backend");
+#endif
+        } else {
+            aclshmemx_barrier_all_on_stream(stream);
+        }
+    });
     module.attr("timer_numel") = AscendTimer::TOTAL_BUFFER_SIZE;
 #ifdef DEEPEP_MEGAMOE_TIMER
     module.attr("timer_enabled") = true;

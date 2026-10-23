@@ -10,7 +10,10 @@ import statistics
 
 
 # 整批开始前的计算，让 Host 有时间排入后续算子；不计入 kernel Duration。
-DEFAULT_ALIGNMENT = dict(rows=100000, cols=30000, repeats=800)
+DEFAULT_ALIGNMENT = dict(rows=100000, cols=30000, repeats=20)
+PERF_METHODS = ("legacy", "shmem")
+# Match DeepGEMM-Ascend bench_msprof's device delay (system counter ticks).
+SLEEP_CYCLES = 20_000_000
 
 
 def alignment_config(config):
@@ -20,11 +23,32 @@ def alignment_config(config):
     return value
 
 
-def enqueue_batch(call, torch, prefix, alignment, iterations, timer=None):
+def enqueue_batch(
+    call,
+    torch,
+    prefix,
+    alignment,
+    iterations,
+    timer=None,
+    *,
+    method="legacy",
+    barrier=None,
+    sleep=None,
+    flush_buffer=None,
+):
     """No host barriers, synchronize, or D2H between collective launches."""
-    for _ in range(alignment["repeats"]):
-        torch.exp(prefix, out=prefix)
+    if method not in PERF_METHODS:
+        raise ValueError(f"Unknown performance method: {method}")
+    if method == "shmem" and (barrier is None or sleep is None or flush_buffer is None):
+        raise ValueError("shmem method requires a device barrier, sleep and L2 flush buffer")
+    if method == "legacy":
+        for _ in range(alignment["repeats"]):
+            torch.exp(prefix, out=prefix)
     for iteration in range(iterations):
+        if method == "shmem":
+            flush_buffer.zero_()
+            sleep(SLEEP_CYCLES)
+            barrier()
         # 所有 rank 排入同样次数；只在最后一轮、选中的 rank 上打点。
         call(timer if iteration + 1 == iterations else None)
 
@@ -115,7 +139,7 @@ def summarize_rounds(per_rank, ranks_per_node=None):
     return report
 
 
-def collect_profile(call, group, torch, config, prefix, directory, bs):
+def collect_profile(call, group, torch, config, prefix, directory, bs, **batch_options):
     import torch_npu
 
     profiler = torch_npu.profiler
@@ -136,10 +160,10 @@ def collect_profile(call, group, torch, config, prefix, directory, bs):
         with_modules=False,
         experimental_config=experimental,
     ) as prof:
-        # profiler 初始化后先 Host 会合；整批连续下发，不在轮间打断设备队列。
+        # 两种方法都只在整批边界 Host 会合；逐轮同步由 SHMEM 设备任务完成。
         torch.npu.synchronize()
         group.barrier(f"profiler ready BS={bs}")
-        enqueue_batch(call, torch, prefix, config["alignment"], config["iters"])
+        enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], **batch_options)
         torch.npu.synchronize()
         print(f"[PROFILE] BS={bs} batch complete; exporting {directory}", flush=True)
         prof.step()

@@ -281,6 +281,25 @@ class SymmBuffer:
             error = str(failure)
         collective_check(self.group, "input preflight", error, (bs, x is not None))
 
+    def benchmark_sleep(self, cycles):
+        """Queue a profiling delay on the current stream; no host synchronization."""
+        with self._lock:
+            self._runtime.ensure_alive()
+            extension = _extension()
+            if not hasattr(extension, "benchmark_sleep") or not hasattr(extension, "benchmark_barrier"):
+                raise RuntimeError("SHMEM profiling requires rebuilding and reinstalling the MegaMoE wheel")
+            extension.benchmark_sleep(cycles)
+
+    def benchmark_barrier(self):
+        """Collectively queue SHMEM WORLD synchronization before the next call.
+
+        The current stream joins prior MegaMoE work; the next call waits on this
+        stream. Every rank must enqueue the same number of barriers in order.
+        """
+        with self._lock:
+            self._runtime.ensure_alive()
+            _extension().benchmark_barrier(self._hierarchical_roce)
+
     def destroy(self):
         with self._lock:
             self._runtime.close()

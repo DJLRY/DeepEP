@@ -197,6 +197,27 @@ def fp8_weights():
     )
 
 
+@pytest.mark.parametrize("roce", [False, True])
+def test_benchmark_helpers_use_live_owner_and_select_shmem_transport(backend, roce):
+    log = []
+    backend.ext.benchmark_sleep = lambda cycles: log.append(("sleep", cycles))
+    backend.ext.benchmark_barrier = lambda selected: log.append(("barrier", selected))
+    backend.buffer._hierarchical_roce = roce
+    backend.buffer.benchmark_sleep(20_000_000)
+    backend.buffer.benchmark_barrier()
+    assert log == [("sleep", 20_000_000), ("barrier", roce)]
+    assert not backend.events  # No host completion/teardown or MegaMoE call.
+    backend.buffer._runtime.closed = True
+    with pytest.raises(RuntimeError, match="destroyed"):
+        backend.buffer.benchmark_barrier()
+    assert len(log) == 2
+
+
+def test_shmem_benchmark_detects_old_wheel_before_capture(backend):
+    with pytest.raises(RuntimeError, match="rebuilding"):
+        backend.buffer.benchmark_sleep(0)
+
+
 @pytest.mark.parametrize("bf16", [False, True])
 def test_public_workflow_output_stats_timer_and_preparation_reuse(backend, bf16):
     b = backend.buffer

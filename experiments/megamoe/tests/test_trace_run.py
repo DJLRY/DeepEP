@@ -17,7 +17,10 @@ from deep_ep_experimental.megamoe.timer import breakdown
 @pytest.mark.parametrize("rank", [0, 1, 16])
 @pytest.mark.parametrize("warmup,iters", [(2, 1), (0, 5)])
 @pytest.mark.parametrize("mode", ["trace", "perf"])
-def test_profile_and_trace_run_one_warmup_and_continuous_batch(tmp_path, monkeypatch, rank, warmup, iters, mode):
+@pytest.mark.parametrize("method", ["legacy", "shmem"])
+def test_profile_and_trace_run_one_warmup_and_continuous_batch(
+    tmp_path, monkeypatch, rank, warmup, iters, mode, method
+):
     output = tmp_path / "output"
     config = dict(
         schema_version=1,
@@ -41,6 +44,8 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(tmp_path, monkeyp
             "benchmark",
             "--mode",
             mode,
+            "--perf-method",
+            method,
             "--config",
             str(config_path),
             "--output-dir",
@@ -52,6 +57,7 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(tmp_path, monkeyp
         ],
     )
     torch = MagicMock()
+    torch.npu.get_device_properties.return_value.L2_cache_size = 128
     monkeypatch.setitem(sys.modules, "torch", torch)
     monkeypatch.setitem(sys.modules, "torch.distributed", torch.distributed)
     torch.distributed.init_process_group.side_effect = AssertionError("benchmark must not initialize HCCL")
@@ -80,9 +86,9 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(tmp_path, monkeyp
     calls = []
     monkeypatch.setattr(api, "fp8_fp4_mega_moe", lambda *a, **kw: calls.append(kw["timer"]))
 
-    def collect(call, group, torch, config, prefix, directory, bs):
+    def collect(call, group, torch, config, prefix, directory, bs, **batch_options):
         assert mode == "perf", "trace started performance profiler"
-        benchmark.enqueue_batch(call, torch, prefix, config["alignment"], config["iters"])
+        benchmark.enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], **batch_options)
         return [dict(duration_us=i + 1) for i in range(iters)]
 
     monkeypatch.setattr(benchmark, "collect_profile", collect)
@@ -111,16 +117,23 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(tmp_path, monkeyp
         assert not list(output.rglob(name))
     if mode == "perf":
         report = json.loads((output / f"rank_{rank}" / "bs_2" / "profiling.json").read_text())
-        assert report["iteration_sync"] == "none"
-        assert report["alignment_scope"] == "once_before_batch"
+        assert report["iteration_sync"] == ("none" if method == "legacy" else "shmem_world_on_stream")
+        assert report["alignment_scope"] == ("once_before_batch" if method == "legacy" else "before_each_iteration")
+        assert report["perf_method"] == method
         assert report["recorded_rounds"] == iters
         assert len(report["per_rank_rounds_us"]) == 32
         assert report["timer_pass"] is False
     manifest = json.loads((output / f"rank_{rank}" / "manifest.json").read_text())
     assert manifest["mode"] == mode
-    assert manifest["iteration_sync"] == "none"
-    assert manifest["alignment_scope"] == "once_before_batch"
-    assert torch.exp.call_count == 1 + config["alignment"]["repeats"]  # Exp warmup + one batch prelude.
+    assert manifest["iteration_sync"] == ("none" if method == "legacy" else "shmem_world_on_stream")
+    assert manifest["alignment_scope"] == ("once_before_batch" if method == "legacy" else "before_each_iteration")
+    assert manifest["perf_method"] == method
+    assert torch.exp.call_count == (1 + config["alignment"]["repeats"] if method == "legacy" else 0)
+    assert buffer.benchmark_barrier.call_count == (1 + iters if method == "shmem" else 0)
+    assert buffer.benchmark_sleep.call_count == (1 + iters if method == "shmem" else 0)
+    measurement = json.loads((output / f"rank_{rank}" / "bs_2" / "measurement.json").read_text())
+    assert measurement["l2_flush_bytes"] == (256 if method == "shmem" else 0)
+    assert measurement["alignment"] == (None if method == "shmem" else config["alignment"])
     torch.distributed.init_process_group.assert_not_called()
     torch.distributed.all_reduce.assert_not_called()
     torch.distributed.destroy_process_group.assert_not_called()

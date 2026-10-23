@@ -15,6 +15,7 @@ from deep_ep_experimental.megamoe.performance import (
     enqueue_batch,
     read_kernel_samples,
     summarize_rounds,
+    SLEEP_CYCLES,
 )
 
 
@@ -34,7 +35,14 @@ def test_samples_merge_shards_sort_and_keep_slow_round(tmp_path):
     write_samples(tmp_path / "one/kernel_details.csv", [kernel(300, 10000), kernel(100, 200)])
     write_samples(
         tmp_path / "two/kernel_details_1.csv",
-        [kernel(200, 210), kernel(50, 100000, "Exp"), kernel(90, 50000, "HcclAllReduce")],
+        [
+            kernel(200, 210),
+            kernel(50, 100000, "Exp"),
+            kernel(90, 50000, "HcclAllReduce"),
+            kernel(91, 20000, "benchmark_sleep_kernel"),
+            kernel(92, 300, "benchmark_roce_barrier_kernel"),
+            kernel(93, 100, "barrier_on_stream_kernel"),
+        ],
     )
     samples = read_kernel_samples(tmp_path, 3)
     assert [s["duration_us"] for s in samples] == [200, 210, 10000]
@@ -169,7 +177,7 @@ def test_profiler_host_barrier_before_batch_without_per_round_synchronize(tmp_pa
 
 def test_alignment_is_explicit_validated_and_recorded(tmp_path):
     config = load_config("deepseek_v4_pro")
-    assert config["alignment"] == dict(rows=100000, cols=30000, repeats=800)
+    assert config["alignment"] == dict(rows=100000, cols=30000, repeats=20)
     for value in ({}, dict(rows=1, cols=2, repeats=0), dict(rows=True, cols=2, repeats=1)):
         with pytest.raises(ValueError, match="alignment"):
             alignment_config(dict(alignment=value))
@@ -177,3 +185,28 @@ def test_alignment_is_explicit_validated_and_recorded(tmp_path):
     path = tmp_path / "case.json"
     path.write_text(json.dumps(config))
     assert load_config(path)["alignment"] == config["alignment"]
+
+
+def test_shmem_rounds_flush_sleep_barrier_then_kernel_without_exp_or_host_waits():
+    log, timer = [], object()
+    enqueue_batch(
+        lambda value: log.append(("call", value)),
+        SimpleNamespace(),
+        None,
+        dict(repeats=20),
+        3,
+        timer,
+        method="shmem",
+        flush_buffer=SimpleNamespace(zero_=lambda: log.append("flush")),
+        sleep=lambda cycles: log.append(("sleep", cycles)),
+        barrier=lambda: log.append("shmem"),
+    )
+    assert log == sum(
+        (["flush", ("sleep", SLEEP_CYCLES), "shmem", ("call", value)] for value in (None, None, timer)), []
+    )
+
+
+@pytest.mark.parametrize("method", ["shmem", "unknown"])
+def test_invalid_method_or_missing_shmem_hooks_fail_before_launch(method):
+    with pytest.raises(ValueError):
+        enqueue_batch(lambda _: pytest.fail("invalid batch launched"), SimpleNamespace(), None, {}, 2, method=method)

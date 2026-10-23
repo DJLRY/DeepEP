@@ -16,6 +16,43 @@
 
 using namespace AscendC;
 
+// Keep helper names distinct from mega_moe_kernel: profiler samples exclude them.
+__global__ __mix__(1, 2) void benchmark_sleep_kernel(uint64_t cycles)
+{
+#if defined(__NPU_DEVICE__)
+    InitSocState();
+    const uint64_t start = GetSystemCycle();
+    while (static_cast<uint64_t>(GetSystemCycle()) - start < cycles) {
+        __asm__ __volatile__("nop");
+    }
+#endif
+}
+
+[[bisheng::core_ratio(0, 1)]] __global__ __aicore__ void benchmark_roce_barrier_kernel(uint64_t ffts_addr)
+{
+#if defined(__NPU_DEVICE__) && defined(DEEPEP_MEGAMOE_ROCE)
+    // A single AIV owns the SDK WORLD collective. No default SDK UB or QP1
+    // submissions are shared with MegaMoE: stream dependencies retire it first.
+    InitSocState();
+    util_set_ffts_config(ffts_addr);
+    TPipe pipe;
+    TBuf<TPosition::VECOUT> scratch;
+    pipe.InitBuffer(scratch, 256);
+    aclshmemx_roce_barrier_all<uint8_t>(reinterpret_cast<__ubuf__ uint8_t*>(scratch.Get<uint8_t>().GetPhyAddr()), 0);
+#endif
+}
+
+extern "C" __attribute__((visibility("default"))) void benchmark_sleep_do(
+    uint32_t blocks, void* stream, uint64_t cycles)
+{
+    benchmark_sleep_kernel<<<blocks, 0, stream>>>(cycles);
+}
+
+extern "C" __attribute__((visibility("default"))) void benchmark_roce_barrier_do(void* stream, uint64_t ffts_addr)
+{
+    benchmark_roce_barrier_kernel<<<1, 0, stream>>>(ffts_addr);
+}
+
 // Explicit types replace asc_opc dtype/format/tiling-key specialisation.
 // A8W4's existing matmul prologue continues to interpret weights as NZ/C0_32.
 // Batch scheduling preserves the old ACL schemMode=1 cross-core contract.

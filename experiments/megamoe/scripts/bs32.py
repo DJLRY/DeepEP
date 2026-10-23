@@ -255,7 +255,7 @@ print('[CHECK] Python:', sys.executable, 'deep_ep:', deep_ep.__file__, flush=Tru
     execute([config["python"], "-I", "-c", code, str(ROOT), config["rdma_backend"], env["DEEPEP_MEGAMOE_TIMER"]], env)
 
 
-def test_commands(config, run_dir, *, mode="accuracy", timer_ranks=None):
+def test_commands(config, run_dir, *, mode="accuracy", timer_ranks=None, perf_method="legacy"):
     python = [config["python"], "-I", "-m"]
     golden_dir = str(Path(config["case_dir"]) / "golden")
     common = [
@@ -309,6 +309,8 @@ def test_commands(config, run_dir, *, mode="accuracy", timer_ranks=None):
     ]
     if timer_ranks is not None:
         benchmark.extend(["--timer", "--timer-ranks", ",".join(map(str, timer_ranks))])
+    if mode in ("perf", "trace"):
+        benchmark.extend(["--perf-method", perf_method])
     return golden, benchmark
 
 
@@ -341,6 +343,7 @@ def performance_summary(config, run_dir):
     report = json.loads(path.read_text(encoding="utf-8"))
     lines = [
         "[PERF SUMMARY] EP32 BS32; FP8 input / FP4 weights; balanced routing",
+        f"Performance method: {report.get('perf_method', 'legacy')}",
         f"All-rank kernel Duration; {report['rounds']}/{report['recorded_rounds']} rounds (tail half)",
         f"Mean of per-round minimum rank: {report['mean_us']:.3f} us",
         f"Mean of per-round maximum rank: {report['rank_max_mean_us']:.3f} us",
@@ -382,6 +385,7 @@ def dispatch(
     iters=None,
     timer_ranks=None,
     include_wait=False,
+    perf_method="legacy",
 ):
     if platform.system() != "Linux":
         raise RuntimeError("Build/run require Linux; configure/show-config can run without devices")
@@ -429,6 +433,7 @@ def dispatch(
                 warmup=case["warmup"],
                 iters=case["iters"],
                 include_wait=include_wait,
+                perf_method=perf_method,
             ),
             indent=2,
         )
@@ -436,7 +441,9 @@ def dispatch(
         encoding="utf-8",
     )
     print(f"[RUN] node={config['node_rank']} master={config['master_addr']} output={run_dir}", flush=True)
-    golden, benchmark = test_commands(config, run_dir, mode=action if sampling else "accuracy", timer_ranks=selected)
+    golden, benchmark = test_commands(
+        config, run_dir, mode=action if sampling else "accuracy", timer_ranks=selected, perf_method=perf_method
+    )
     if not sampling:
         execute(golden, env, run_dir / "golden.log")
     if action != "golden":
@@ -499,6 +506,12 @@ def main(argv=None):
     )
     parser.add_argument("--warmup", type=int, help="perf/trace only: warmup calls (default: perf 20, trace 2)")
     parser.add_argument(
+        "--perf-method",
+        choices=("legacy", "shmem"),
+        default=None,
+        help="perf/trace only: legacy Exp20 batch (default) or per-round SHMEM alignment",
+    )
+    parser.add_argument(
         "--iters",
         type=int,
         help="perf/trace only: batch calls (default: perf 100, report last half; trace 1, instrument final call)",
@@ -523,6 +536,8 @@ def main(argv=None):
         parser.error("--timer requires build; use the trace action for collection")
     if args.timer_ranks is not None and args.action != "trace":
         parser.error("--timer-ranks requires trace")
+    if args.perf_method is not None and args.action not in ("perf", "trace"):
+        parser.error("--perf-method requires perf or trace")
     if args.include_wait is not None and args.action != "trace":
         parser.error("--include-wait/--hide-wait require trace")
     if args.warmup is not None or args.iters is not None:
@@ -549,6 +564,8 @@ def main(argv=None):
         options["timer"] = True
     if args.action in ("perf", "trace"):
         options.update(warmup=args.warmup, iters=args.iters, timer_ranks=args.timer_ranks)
+        if args.perf_method is not None:
+            options["perf_method"] = args.perf_method
     if args.action == "trace":
         options["include_wait"] = bool(args.include_wait)
     dispatch(args.action, config, **options)
