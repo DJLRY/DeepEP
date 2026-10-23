@@ -97,7 +97,7 @@ def test_tail_half_selection_even_odd_and_single_round(iterations, first, select
     assert report["rank_min_rounds_us"][-1] == iterations
 
 
-def test_aligned_batch_only_final_round_has_timer():
+def test_exp_once_per_batch_barrier_each_round_and_only_final_round_has_timer():
     log, prefix, timer = [], object(), object()
     torch = SimpleNamespace(exp=lambda data, out: log.append(("exp", data, out)))
     enqueue_batch(
@@ -109,8 +109,14 @@ def test_aligned_batch_only_final_round_has_timer():
         timer,
         barrier=lambda: log.append("device barrier"),
     )
-    prelude = [("exp", prefix, prefix)] * 2 + ["device barrier"]
-    assert log == prelude + [("call", None)] + prelude + [("call", None)] + prelude + [("call", timer)]
+    assert log == [("exp", prefix, prefix)] * 2 + [
+        "device barrier",
+        ("call", None),
+        "device barrier",
+        ("call", None),
+        "device barrier",
+        ("call", timer),
+    ]
 
 
 def test_device_barrier_full_world_warmup_and_zero_tensor_reuse(monkeypatch):
@@ -205,8 +211,6 @@ def test_profiler_device_barrier_each_round_without_host_synchronize(tmp_path, m
         "exp",
         "device barrier",
         ("call", None),
-        "exp",
-        "exp",
         "device barrier",
         ("call", None),
         "sync",

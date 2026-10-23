@@ -220,7 +220,7 @@ def run(args, config, group):
         timer_ranks=timer_ranks,
         host_coordination="tcpstore",
         iteration_sync=ROUND_SYNC if round_barrier is not None else "none",
-        alignment_scope="each_iteration_before_device_barrier" if round_barrier is not None else "none",
+        alignment_scope="once_before_batch" if round_barrier is not None else "none",
         device_communication=(
             "shmem_mte_roce" if int(os.environ["LOCAL_WORLD_SIZE"]) == 16 and world > 16 else "shmem_mte"
         ),
@@ -353,7 +353,7 @@ def run(args, config, group):
             per_rank = group.all_gather(timings, f"profiling BS={bs}")
             report = summarize_rounds(per_rank, int(os.environ["LOCAL_WORLD_SIZE"]))
             report["alignment"] = config["alignment"]
-            report["alignment_scope"] = "each_iteration_before_device_barrier"
+            report["alignment_scope"] = "once_before_batch"
             report["iteration_sync"] = ROUND_SYNC
             (case / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             if rank == 0:

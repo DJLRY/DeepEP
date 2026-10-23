@@ -10,7 +10,7 @@ from pathlib import Path
 import statistics
 
 
-# 每轮设备 barrier 前的计算，让 Host 有时间排入后续算子；不计入 kernel Duration。
+# 整批开始前的计算，让 Host 有时间排入后续算子；不计入 kernel Duration。
 DEFAULT_ALIGNMENT = dict(rows=100000, cols=30000, repeats=20)
 ROUND_SYNC = "hccl_all_reduce_before_each_iteration"
 
@@ -59,10 +59,10 @@ def alignment_config(config):
 
 
 def enqueue_batch(call, torch, prefix, alignment, iterations, timer=None, *, barrier):
-    """Queue busy work -> global device rendezvous -> MegaMoE every round."""
+    """Queue busy work once per batch, then device rendezvous -> MegaMoE each round."""
+    for _ in range(alignment["repeats"]):
+        torch.exp(prefix, out=prefix)
     for iteration in range(iterations):
-        for _ in range(alignment["repeats"]):
-            torch.exp(prefix, out=prefix)
         barrier()
         # 所有 rank 排入同样次数；只在最后一轮、选中的 rank 上打点。
         call(timer if iteration + 1 == iterations else None)

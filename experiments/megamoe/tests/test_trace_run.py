@@ -111,13 +111,15 @@ def test_profile_and_trace_run_one_warmup_and_synchronized_batch(tmp_path, monke
     if mode == "perf":
         report = json.loads((output / f"rank_{rank}" / "bs_2" / "profiling.json").read_text())
         assert report["iteration_sync"] == "hccl_all_reduce_before_each_iteration"
-        assert report["alignment_scope"] == "each_iteration_before_device_barrier"
+        assert report["alignment_scope"] == "once_before_batch"
         assert report["recorded_rounds"] == iters
         assert len(report["per_rank_rounds_us"]) == 32
         assert report["timer_pass"] is False
     manifest = json.loads((output / f"rank_{rank}" / "manifest.json").read_text())
     assert manifest["mode"] == mode
     assert manifest["iteration_sync"] == "hccl_all_reduce_before_each_iteration"
+    assert manifest["alignment_scope"] == "once_before_batch"
+    assert torch.exp.call_count == 1 + config["alignment"]["repeats"]  # Exp warmup + one batch prelude.
     assert round_barrier.call_count == iters  # Includes rank 1, which has no timer.
     round_barrier.close.assert_called_once()
     buffer.destroy.assert_called_once()
