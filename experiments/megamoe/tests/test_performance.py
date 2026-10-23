@@ -5,13 +5,11 @@ import csv
 import json
 import sys
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import pytest
 
 from deep_ep_experimental.megamoe.benchmark import load_config
 from deep_ep_experimental.megamoe.performance import (
-    DeviceRoundBarrier,
     alignment_config,
     collect_profile,
     enqueue_batch,
@@ -97,7 +95,7 @@ def test_tail_half_selection_even_odd_and_single_round(iterations, first, select
     assert report["rank_min_rounds_us"][-1] == iterations
 
 
-def test_exp_once_per_batch_barrier_each_round_and_only_final_round_has_timer():
+def test_exp_once_per_batch_continuous_launches_and_only_final_round_has_timer():
     log, prefix, timer = [], object(), object()
     torch = SimpleNamespace(exp=lambda data, out: log.append(("exp", data, out)))
     enqueue_batch(
@@ -107,63 +105,15 @@ def test_exp_once_per_batch_barrier_each_round_and_only_final_round_has_timer():
         dict(repeats=2),
         3,
         timer,
-        barrier=lambda: log.append("device barrier"),
     )
     assert log == [("exp", prefix, prefix)] * 2 + [
-        "device barrier",
         ("call", None),
-        "device barrier",
         ("call", None),
-        "device barrier",
         ("call", timer),
     ]
 
 
-def test_device_barrier_full_world_warmup_and_zero_tensor_reuse(monkeypatch):
-    log, dummy = [], object()
-    dist = SimpleNamespace(
-        is_initialized=lambda: False,
-        init_process_group=MagicMock(side_effect=lambda **kw: log.append("init")),
-        all_reduce=MagicMock(side_effect=lambda *a, **kw: log.append("all_reduce")),
-        ReduceOp=SimpleNamespace(SUM="sum"),
-        destroy_process_group=lambda: log.append("destroy"),
-    )
-    torch = SimpleNamespace(
-        distributed=dist,
-        float32="float32",
-        zeros=MagicMock(return_value=dummy),
-        npu=SimpleNamespace(synchronize=lambda: log.append("sync")),
-    )
-    monkeypatch.setitem(sys.modules, "torch", torch)
-    monkeypatch.setitem(sys.modules, "torch.distributed", dist)
-    group = SimpleNamespace(rank=lambda: 19, size=lambda: 32, barrier=lambda stage: log.append(stage))
-    barrier = DeviceRoundBarrier(torch, group)
-    assert log == ["init", "all_reduce", "sync", "profiling device barrier ready"]
-    kwargs = dist.init_process_group.call_args.kwargs
-    assert (kwargs["backend"], kwargs["init_method"], kwargs["rank"], kwargs["world_size"]) == (
-        "hccl",
-        "env://",
-        19,
-        32,
-    )
-    torch.zeros.assert_called_once_with(1, dtype="float32", device="npu")
-    log.clear()
-    barrier()
-    barrier()
-    assert log == ["all_reduce", "all_reduce"]  # No host/device synchronize per round.
-    assert all(
-        call.args == (dummy,) and call.kwargs == dict(op="sum", async_op=False)
-        for call in dist.all_reduce.call_args_list
-    )
-    barrier.close()
-    assert log[-2:] == ["sync", "destroy"]
-    dist.is_initialized = lambda: True
-    with pytest.raises(RuntimeError, match="own HCCL"):
-        DeviceRoundBarrier(torch, group)
-    dist.init_process_group.assert_called_once()
-
-
-def test_profiler_device_barrier_each_round_without_host_synchronize(tmp_path, monkeypatch):
+def test_profiler_host_barrier_before_batch_without_per_round_synchronize(tmp_path, monkeypatch):
     log = []
 
     class Profile:
@@ -201,7 +151,6 @@ def test_profiler_device_barrier_each_round_without_host_synchronize(tmp_path, m
         object(),
         tmp_path,
         96,
-        barrier=lambda: log.append("device barrier"),
     )
     assert log == [
         "enter",
@@ -209,9 +158,7 @@ def test_profiler_device_barrier_each_round_without_host_synchronize(tmp_path, m
         "profiler ready BS=96",
         "exp",
         "exp",
-        "device barrier",
         ("call", None),
-        "device barrier",
         ("call", None),
         "sync",
         "step",

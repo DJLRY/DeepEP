@@ -17,7 +17,7 @@ from deep_ep_experimental.megamoe.timer import breakdown
 @pytest.mark.parametrize("rank", [0, 1, 16])
 @pytest.mark.parametrize("warmup,iters", [(2, 1), (0, 5)])
 @pytest.mark.parametrize("mode", ["trace", "perf"])
-def test_profile_and_trace_run_one_warmup_and_synchronized_batch(tmp_path, monkeypatch, rank, warmup, iters, mode):
+def test_profile_and_trace_run_one_warmup_and_continuous_batch(tmp_path, monkeypatch, rank, warmup, iters, mode):
     output = tmp_path / "output"
     config = dict(
         schema_version=1,
@@ -53,6 +53,9 @@ def test_profile_and_trace_run_one_warmup_and_synchronized_batch(tmp_path, monke
     )
     torch = MagicMock()
     monkeypatch.setitem(sys.modules, "torch", torch)
+    monkeypatch.setitem(sys.modules, "torch.distributed", torch.distributed)
+    torch.distributed.init_process_group.side_effect = AssertionError("benchmark must not initialize HCCL")
+    torch.distributed.all_reduce.side_effect = AssertionError("benchmark must not insert AllReduce")
     monkeypatch.setitem(sys.modules, "torch_npu", SimpleNamespace())  # No profiler API available.
     group = SimpleNamespace(
         rank=lambda: rank,
@@ -63,8 +66,6 @@ def test_profile_and_trace_run_one_warmup_and_synchronized_batch(tmp_path, monke
         abort=MagicMock(),
     )
     monkeypatch.setattr(api.StoreGroup, "from_env", lambda: group)
-    round_barrier = MagicMock()
-    monkeypatch.setattr(benchmark, "DeviceRoundBarrier", lambda torch, group: round_barrier)
 
     def check(group, stage, error, signature=None):
         assert error is None, f"{stage}: {error}"
@@ -79,9 +80,9 @@ def test_profile_and_trace_run_one_warmup_and_synchronized_batch(tmp_path, monke
     calls = []
     monkeypatch.setattr(api, "fp8_fp4_mega_moe", lambda *a, **kw: calls.append(kw["timer"]))
 
-    def collect(call, group, torch, config, prefix, directory, bs, *, barrier):
+    def collect(call, group, torch, config, prefix, directory, bs):
         assert mode == "perf", "trace started performance profiler"
-        benchmark.enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], barrier=barrier)
+        benchmark.enqueue_batch(call, torch, prefix, config["alignment"], config["iters"])
         return [dict(duration_us=i + 1) for i in range(iters)]
 
     monkeypatch.setattr(benchmark, "collect_profile", collect)
@@ -110,18 +111,19 @@ def test_profile_and_trace_run_one_warmup_and_synchronized_batch(tmp_path, monke
         assert not list(output.rglob(name))
     if mode == "perf":
         report = json.loads((output / f"rank_{rank}" / "bs_2" / "profiling.json").read_text())
-        assert report["iteration_sync"] == "hccl_all_reduce_before_each_iteration"
+        assert report["iteration_sync"] == "none"
         assert report["alignment_scope"] == "once_before_batch"
         assert report["recorded_rounds"] == iters
         assert len(report["per_rank_rounds_us"]) == 32
         assert report["timer_pass"] is False
     manifest = json.loads((output / f"rank_{rank}" / "manifest.json").read_text())
     assert manifest["mode"] == mode
-    assert manifest["iteration_sync"] == "hccl_all_reduce_before_each_iteration"
+    assert manifest["iteration_sync"] == "none"
     assert manifest["alignment_scope"] == "once_before_batch"
     assert torch.exp.call_count == 1 + config["alignment"]["repeats"]  # Exp warmup + one batch prelude.
-    assert round_barrier.call_count == iters  # Includes rank 1, which has no timer.
-    round_barrier.close.assert_called_once()
+    torch.distributed.init_process_group.assert_not_called()
+    torch.distributed.all_reduce.assert_not_called()
+    torch.distributed.destroy_process_group.assert_not_called()
     buffer.destroy.assert_called_once()
     group.close.assert_called_once()
     group.abort.assert_not_called()

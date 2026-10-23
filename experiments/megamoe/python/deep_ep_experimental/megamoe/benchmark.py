@@ -11,14 +11,7 @@ import os
 from pathlib import Path
 
 from .timer.__main__ import parse_ranks
-from .performance import (
-    ROUND_SYNC,
-    DeviceRoundBarrier,
-    alignment_config,
-    collect_profile,
-    enqueue_batch,
-    summarize_rounds,
-)
+from .performance import alignment_config, collect_profile, enqueue_batch, summarize_rounds
 
 
 def load_config(name, bs_values=None):
@@ -208,7 +201,6 @@ def run(args, config, group):
     errors = group.all_gather(output_error, "output directory")
     if any(errors):
         raise RuntimeError(f"Output creation failed; choose a new output directory: {errors}")
-    round_barrier = DeviceRoundBarrier(torch, group) if args.mode == "perf" or args.timer else None
     manifest = dict(
         config=config,
         input=args.input,
@@ -219,8 +211,8 @@ def run(args, config, group):
         local_rank=int(os.environ["LOCAL_RANK"]),
         timer_ranks=timer_ranks,
         host_coordination="tcpstore",
-        iteration_sync=ROUND_SYNC if round_barrier is not None else "none",
-        alignment_scope="once_before_batch" if round_barrier is not None else "none",
+        iteration_sync="none",
+        alignment_scope="once_before_batch" if args.mode == "perf" or args.timer else "none",
         device_communication=(
             "shmem_mte_roce" if int(os.environ["LOCAL_WORLD_SIZE"]) == 16 and world > 16 else "shmem_mte"
         ),
@@ -310,7 +302,7 @@ def run(args, config, group):
                 print(
                     f"[{stage}] BS={bs} alignment={alignment} "
                     f"temporary_bytes={alignment['rows'] * alignment['cols'] * 4} "
-                    f"batch_iterations={config['iters']} iteration_sync={ROUND_SYNC}",
+                    f"batch_iterations={config['iters']} iteration_sync=none",
                     flush=True,
                 )
         if args.mode != "trace":
@@ -347,21 +339,21 @@ def run(args, config, group):
                     flush=True,
                 )
         elif args.mode == "perf":
-            samples = collect_profile(call, group, torch, config, prefix, case / "profiler", bs, barrier=round_barrier)
+            samples = collect_profile(call, group, torch, config, prefix, case / "profiler", bs)
             (case / "kernel_samples.json").write_text(json.dumps(samples, indent=2), encoding="utf-8")
             timings = [sample["duration_us"] for sample in samples]
             per_rank = group.all_gather(timings, f"profiling BS={bs}")
             report = summarize_rounds(per_rank, int(os.environ["LOCAL_WORLD_SIZE"]))
             report["alignment"] = config["alignment"]
             report["alignment_scope"] = "once_before_batch"
-            report["iteration_sync"] = ROUND_SYNC
+            report["iteration_sync"] = "none"
             (case / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             if rank == 0:
                 print(
                     f"[PERF] BS={bs} MegaMoe E2E={report['mean_us']:.3f}us "
                     f"rank-max-mean={report['rank_max_mean_us']:.3f}us "
                     f"rounds={report['rounds']}/{report['recorded_rounds']} "
-                    f"(last ceil(iters/2); kernel Duration; rank-min mean; timer off; per-round HCCL barrier)",
+                    f"(last ceil(iters/2); kernel Duration; rank-min mean; timer off; continuous batch)",
                     flush=True,
                 )
         if args.timer:
@@ -378,7 +370,7 @@ def run(args, config, group):
                 call()
             torch.npu.synchronize()
             group.barrier(f"timer batch BS={bs}")
-            enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], timer, barrier=round_barrier)
+            enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], timer)
             torch.npu.synchronize()
             if uninstrumented is not None:
                 from .reference import error_metrics
@@ -410,8 +402,6 @@ def run(args, config, group):
         group.barrier(f"case complete BS={bs}")
     group.barrier("before SHMEM teardown")
     buffer.destroy()
-    if round_barrier is not None:
-        round_barrier.close()
     group.close()
 
 
