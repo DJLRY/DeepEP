@@ -140,7 +140,7 @@ int main(int argc, char** argv)
 #ifdef DEEPEP_MEGAMOE_ROCE
         expected_world = 32;
         deepep::Session session(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true);
-        assert(qp_engine == ACLSHMEM_DATA_OP_ROCE && qp_count == 2 && !session.udma());
+        assert(qp_engine == ACLSHMEM_DATA_OP_ROCE && qp_count == 3 && !session.udma());
         assert(workspace_alignment == 512);
         fails([&]() { session.barrier(); });
         fails([&]() { session.close(); });

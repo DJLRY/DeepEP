@@ -558,8 +558,10 @@ python3 experiments/megamoe/scripts/trace_text.py restore part1.txt part2.txt \
 FP8 和内部量化的 BF16 输入均沿用原接口，容量可大于实际 B。B>32 及更多16卡主机暂不支持。
 A8W8 当前只运行路由专家，`num_shared_experts` 必须为0，不能传入 timer。
 
-两台机器的所有 rank 都固定由物理 AIV0 打包本地元数据，物理 AIV1 发送 RDMA。
-AIV1 在 Dispatch 和 Combine 全程独占 QP1，包括 Put、quiet 和 commit；AIV0 不推进 RDMA。
+两台机器的所有 rank 都固定由物理 AIV0 打包本地元数据，物理 AIV1 在 Dispatch 和 Combine
+全程独占 QP1，最后一个物理 AIV1 在输入准备期间独占 QP2 发送 metadata；QP0 留给 SHMEM。
+运行时初始化三个 RoCE QP，各发送者独立执行本 QP 的 Put、quiet 和 commit。
+此阶段结束后 metadata owner 恢复正常计算分工，不占用后续流水的专用计算核。
 此分工适用于 A8W4/A8W8；host_id 仍用于选择 rail 槽、gateway 和接收转发分工，
 打包使用 AIV0 自己的 epoch 计数槽，元数据发送前等待 `LocalRailPacked`；payload 先行提交，
 与 AIV0 剩余的元数据打包重叠。
@@ -568,16 +570,46 @@ AIV1 在 Dispatch 和 Combine 全程独占 QP1，包括 Put、quiet 和 commit�
 不再扫描路由并拆成多个连续 token 段；B 小于预分配容量时只发送实际 B 行。
 接收区保留原 token 编号，专家仍按路由元数据读取，多传的行不会增加计算。
 该策略用于上述 B≤32 的 A8W4/A8W8 路径，包括没有远端路由的批次。
-元数据和 payload 先在同一 QP 提交，完成等待延后到 owner 的 reset/shared-input 工作之后；
-一次 quiet 覆盖两份数据，再发布共用的 `NetPayloadCommit` 并 quiet 该通知。四次 quiet 减为两次，
-接收 leader 获取这个标记后立即发布 `RelayPayloadReady` 和 `MetaReady`，然后转发 metadata；
-接收就绪不再等待本卡反方向的发送完成。发送 owner 完成两次 quiet 后只发布 `TxDone`。
-公共输入 barrier 保留，统一 commit 和接收就绪仍须在它之前发布。
-这会放弃 metadata 提前到达时的 relay 重叠机会，整体收益以关闭打点的 perf 为准。
+metadata 提交后立即在 QP2 执行 quiet → `NetMetaCommit` → quiet，不等待 payload 或
+本核的 reset/shared-input 工作。metadata 接收 leader 只获取 `NetMetaCommit`，发布
+`MetaReady` 并开始路由重建、索引和计数转发，从而与 QP1 的 payload 传输重叠。
+payload 的完成等待仍延后到原 owner 的 reset/shared-input 工作之后，再在 QP1 执行
+quiet → `NetPayloadCommit` → quiet，完成后发布 `TxDone`。两个 commit 不表示对方通道已完成。
+AIV0 发布 `LocalRailPacked` 后复用为 payload 接收 leader，独立获取入站 `NetPayloadCommit`
+并发布 `RelayPayloadReady`；它不操作发送 QP/CQ，也不等待本卡发送完成。
+保留公共输入 barrier，两个发送 QP 均在此之前排空。Sequence 在打包前初始化，payload owner
+在使用它作为 commit 源前检查当前轮次；通知源必须保留到两条 QP 都完成。
+路由 worker 从原来的 `[2, AIV数量)` 改为 `[2, AIV数量-1)`，重新均分全部专家，
+避免新增发送者导致原尾部专家无人转发。两机路径要求至少三个完整 AIC/AIV pair。
+每方向由一个 commit、两次 quiet 变为两个 commit、四次 quiet，分别由两个 AIV 并行推进；
+QP 仍共享 NIC 和链路，新增通知及少一个路由 worker 的成本必须用关闭打点的 perf 验证。
 H=3584、B=32 时 payload 为118784 B；相较已测 EP32/K8 balanced 样本的8次7424 B提交，
 该策略以每 rank 额外59392 B流量换取一次提交和更少的发送端扫描工作。
 性能验证应同时检查 payload POST 次数、quiet、输入准备结束及首 GMM 时间，
 并以关闭打点的 `rank-max-mean` 判断整体收益，不能仅由 POST 次数推断加速比例。
+
+验证双 QP 版本时，两台机器更新到同一提交，在各自已有配置的 checkout 中按相同阶段执行：
+
+```bash
+bash experiments/megamoe/scripts/run_bs32.sh show-config
+bash experiments/megamoe/scripts/run_bs32.sh build --errors-only
+bash experiments/megamoe/scripts/run_bs32.sh run
+bash experiments/megamoe/scripts/run_bs32.sh perf --perf-method legacy
+```
+
+两端都完成构建后再启动 `run`，两端都完成精度检查后再启动 `perf`。QP 数量在 runtime
+初始化时设置，必须重新安装两端扩展并启动新进程；已有匹配的 SHMEM SDK 可以复用。
+比较基线为 `80e1ef9`，保持配置、perf 方法及 timer OFF 构建一致。需要定位阶段时，两端执行：
+
+```bash
+bash experiments/megamoe/scripts/run_bs32.sh build --timer --errors-only
+bash experiments/megamoe/scripts/run_bs32.sh trace --timer-ranks 0,14,16,30 --include-wait
+```
+
+检查 metadata 的 POST/QUIET/commit 位于最后一个 AIV1，payload 位于第一个 AIV1，
+payload 接收 WAIT 位于第一个 AIV0。56个 AIV 时，metadata owner 是第27组的 AIV1；
+不能只查看第0组。观察 metadata relay 是否与 payload 等待重叠，以及输入屏障和首 GMM
+是否提前；trace 只用于定位。返回正式性能测试前重新执行不带 `--timer` 的 build。
 
 跨机输入的 gateway 依赖按 AIV1 block 分工：各核从同一份有效 count 表得到本 rank
 实际需要的来源，并在原始 count 被前缀和覆盖前保存依赖 mask。数量表及前缀写回完成后立即
@@ -629,7 +661,8 @@ Combine POST 分布和 quiet/commit 等待。CPU 回归不能替代设备精度�
 
 两机 RoCE runtime 的 `barrier()` 和 `destroy()` 先同步本卡全部 stream，再通过现有
 StoreGroup（TCPStore）或 ProcessGroup 交换完成状态；全部 rank 成功后才允许清理 SHMEM。
-当前 kernel 在返回前已等待应用 QP1 完成，这一顺序确保释放前没有未完成的通信。
+当前 kernel 在输入屏障前排空 metadata QP2，并在返回前等待 payload/Combine QP1 完成，
+这一顺序确保释放前没有未完成的通信。
 这里不调用直接读取对端 GM 的通用 `aclshmem_barrier_all()`，也不要求机内各 rank 建立 RoCE QP。
 所有 rank 必须按相同顺序调用，调用期间不得并发提交新的算子；任一 rank 同步失败则保留资源并要求重启作业。
 该修复涉及 Python 和原生扩展，两台机器都需重新构建/安装匹配的 wheel；已有 SHMEM SDK 无需为此修改。

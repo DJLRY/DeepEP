@@ -30,9 +30,8 @@ __aicore__ inline void WaitHierarchicalLocalSignal(const Params& params, Hierarc
 // copy, never the packer's reusable UB. Payload rows retain their original token
 // indices at the gateway; route metadata determines which rows consumers read.
 __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& common, const Params& params,
-                                                const SendMaskConfig& config, AscendTimerDevice* timer = nullptr)
+                                                AscendTimerDevice* timer = nullptr)
 {
-    const uint32_t myHost = HierarchicalHost(common.rankId);
     const uint32_t gateway = HierarchicalGateway(common.rankId);
     auto* roceScratch = HierarchicalRoceScratch(params);
     // All local token/scale rows are ready before this stage. Decode is bounded
@@ -43,16 +42,28 @@ __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& comm
         static_cast<uint32_t>(CalcQuantTokenScaleBytes(common.tokenHiddenDim, 1U, common.topK, false));
     RocePutBytes(params.peermemInfo.relayPayloadPtr, params.peermemInfo.quantTokenScalePtr, common.tokenNum * rowBytes,
                  gateway, roceScratch, timer, AscendTimer::RdmaPhase::DispatchPayload);
-    // Payload is independent of the rail packer: let its transfer overlap the
-    // remaining metadata packing instead of putting that wait on both Puts.
+    // QP1 starts before rail packing completes. Its owner overlaps this transfer
+    // with reset/shared input work, then publishes only the payload commit.
+}
+
+__aicore__ inline void PostHierarchicalDispatchMetadata(const MoeStageCommonConfig& common, const Params& params,
+                                                        const SendMaskConfig& config,
+                                                        AscendTimerDevice* timer = nullptr)
+{
     WaitHierarchicalLocalSignal(params, HierarchicalSignal::LocalRailPacked);
+    const uint32_t myHost = HierarchicalHost(common.rankId);
+    const uint32_t gateway = HierarchicalGateway(common.rankId);
+    auto* roceScratch = HierarchicalRoceScratch(params);
     GM_ADDR packedRail = params.peermemInfo.railTopkIdsRecvPtr + myHost * config.railTopkIdsSlotBytes;
     const uint32_t railBytes = static_cast<uint32_t>(CalcRailTopkIdsSlotDataBytes(common.tokenNum, common.topK));
-    RocePutBytes(packedRail, packedRail, railBytes, gateway, roceScratch, timer, AscendTimer::RdmaPhase::DispatchMeta);
-    // Both Puts use the same owned QP and share the completion/commit below.
-    // Neither metadata nor payload may be consumed before NetPayloadCommit.
-    // Completion is deliberately deferred until after this owner's reset/shared
-    // input work. Batches with no remote routes still publish the completion epoch.
+    RocePutBytes<MEGAMOE_ROCE_META_QP_INDEX>(packedRail, packedRail, railBytes, gateway, roceScratch, timer,
+                                             AscendTimer::RdmaPhase::DispatchMeta);
+    // Release the small metadata immediately, on its own queue. Deferring this
+    // quiet until after reset/shared work would delay all remote route workers.
+    RocePublishCommit<MEGAMOE_ROCE_META_QP_INDEX>(
+        reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetMetaCommit)),
+        reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence)), gateway,
+        roceScratch, timer, AscendTimer::RdmaPhase::DispatchMeta);
 }
 
 __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& job, const MoeStageCommonConfig& common,
@@ -69,31 +80,38 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
         PublishHierarchicalLocalSignal(params, HierarchicalSignal::Sequence);
         SendTopkIdsToRailServer(common, winRankAddr, config, params, scratch, myHost, job.jobIndex);
         PublishHierarchicalLocalSignal(params, HierarchicalSignal::LocalRailPacked);
+        // Reuse the packer as the independent payload receive leader. Packing
+        // has released both local relays and the metadata sender before this
+        // wait; no route worker or outgoing completion is held behind payload.
+        RoceWaitCommit(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit),
+                       params.tilingData->hierarchicalSequence, timer, AscendTimer::RdmaPhase::DispatchPayload,
+                       HierarchicalGateway(common.rankId));
+        PublishHierarchicalLocalSignal(params, HierarchicalSignal::RelayPayloadReady);
         return;
     }
     if (job.jobIndex == HierarchicalSendJob()) {
-        PostHierarchicalDispatch(common, params, config, timer);
+        PostHierarchicalDispatch(common, params, timer);
         return;
     }
-    if (job.jobIndex >= job.totalJobs || job.totalJobs <= 2U) {
+    if (job.jobIndex == HierarchicalMetaSendJob(job.totalJobs)) {
+        PostHierarchicalDispatchMetadata(common, params, config, timer);
+        return;
+    }
+    if (job.jobIndex >= job.totalJobs || job.totalJobs <= 3U) {
         return;
     }
 
-    // The receive leader observes the unified metadata+payload commit; it never
-    // touches the sender's CQ. The sender returns above and reaches Finish
-    // through only local reset/shared work, before the public input barrier.
-    // Keep the commit before that barrier or this relay wait would form a cycle.
+    // The metadata receive leader releases routing without waiting for payload.
+    // Neither receiver touches a sender's QP/CQ. Both senders publish before the
+    // public input barrier, so receive waits cannot form a barrier cycle.
     if (job.jobIndex == 2U + otherHost) {
-        RoceWaitCommit(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit),
+        RoceWaitCommit(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetMetaCommit),
                        params.tilingData->hierarchicalSequence, timer, AscendTimer::RdmaPhase::DispatchMeta,
                        HierarchicalGateway(common.rankId));
-        // Incoming payload readiness is independent of this rank's outgoing
-        // CQ. Publish it here so peer experts need not wait for our TxDone.
-        PublishHierarchicalLocalSignal(params, HierarchicalSignal::RelayPayloadReady);
         PublishHierarchicalLocalSignal(params, HierarchicalSignal::MetaReady);
     }
     const uint32_t relayCore = job.jobIndex - 2U;
-    const uint32_t relayCores = job.totalJobs - 2U;
+    const uint32_t relayCores = job.totalJobs - 3U;
     const uint32_t expertsPerHost = HIERARCHICAL_RANKS_PER_HOST * common.moeExpertPerRank;
     for (uint32_t sourceHost = relayCore % 2U; sourceHost < 2U; sourceHost += relayCores) {
         WaitHierarchicalLocalSignal(
@@ -119,16 +137,17 @@ __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, cons
         return;
     }
     const uint32_t gateway = HierarchicalGateway(common.rankId);
-    // Complete both earlier data Puts before the single remote notification.
-    // The trailing quiet still protects Sequence until the notification source
-    // has been consumed, including calls with no cross-host expert routes.
+    // Sequence is published before packing, but this owner no longer waits for
+    // LocalRailPacked. Acquire the current value before the commit reads it.
+    WaitHierarchicalLocalSignal(params, HierarchicalSignal::Sequence);
+    // QP1 completes only payload. The metadata owner independently drains QP2
+    // before the public barrier; Sequence cannot be reused before both finish.
     RocePublishCommit(
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit)),
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence)), gateway,
         HierarchicalRoceScratch(params), timer, AscendTimer::RdmaPhase::DispatchPayload);
     PublishHierarchicalLocalSignal(params, HierarchicalSignal::TxDone);
-    // The independent receive leader acquires the opposite direction and
-    // publishes RelayPayloadReady before reaching the public input barrier.
+    // The packer independently acquires incoming payload and publishes ready.
 }
 
 // All producers have drained before this call. Only local peer pointers are

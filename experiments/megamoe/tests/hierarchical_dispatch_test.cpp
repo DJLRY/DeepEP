@@ -1,8 +1,7 @@
 // Copyright (c) 2026, Lu Lu
 
-// Execute the production Dispatch, transport completion, and memory layout.
-// Only device primitives and the metadata pack/relay entry points are
-// doubled. This validates byte ranges and protocol order, not NIC visibility.
+// Run the production Dispatch, QP completion, relay partition and heap layout.
+// Only device primitives and the metadata pack/relay operations are doubled.
 #include <algorithm>
 #include <array>
 #include <cassert>
@@ -15,22 +14,15 @@
 #include "../csrc/kernels/mega_moe/common/mega_moe_roce.hpp"
 
 #define MEGA_MOE_SEND_MASK_H
-constexpr int AIC = 0;
-constexpr int AIV = 1;
-constexpr int g_coreType = AIV;
+constexpr int AIC = 0, AIV = 1, g_coreType = AIV;
 
 namespace MegaMoeImpl {
 using namespace AscendC;
 struct MoeStageCommonConfig {
-    uint32_t rankId;
-    uint32_t tokenNum;
-    uint32_t topK;
-    uint32_t tokenHiddenDim;
-    uint32_t moeExpertPerRank;
+    uint32_t rankId, tokenNum, topK, tokenHiddenDim, moeExpertPerRank;
 };
 struct AivJobContext {
-    uint32_t jobIndex;
-    uint32_t totalJobs;
+    uint32_t jobIndex, totalJobs;
 };
 struct Params {
     MegaMoeTilingData* tilingData;
@@ -41,6 +33,7 @@ struct SendMaskConfig {
 };
 struct SendMaskScratch {};
 inline GM_ADDR g_winRankAddr_[32]{};
+inline std::vector<uint32_t> coverage;
 
 inline int32_t* HierarchicalSignalAddress(const PeermemInfo& info, HierarchicalSignal signal)
 {
@@ -50,14 +43,17 @@ inline void WriteGmByPassDCache(int32_t* address, int32_t value)
 {
     using namespace DispatchTest;
     const auto offset = Offset(reinterpret_cast<uint8_t*>(address), sizeof(value));
-    if (offset == relayReady || offset == metaReady) {
-        Check(RoceTest::blockIndex == static_cast<int>(receiveLeaderJob),
-              "readiness was not published by the receive leader");
-        Check(waits >= 1U && RoceTest::mteCanRead && ReadWord(local, payloadCommit) == sequence,
-              "metadata/payload readiness preceded the unified receive acquire");
+    if (offset == metaReady) {
+        Check(RoceTest::blockIndex == static_cast<int>(receiveLeaderJob) &&
+                  metaAcquired[RoceTest::blockIndex] == sequence && RoceTest::mteCanRead,
+              "metadata readiness preceded its own receive acquire");
+    }
+    if (offset == relayReady) {
+        Check(RoceTest::blockIndex == 0 && payloadAcquired[0] == sequence && RoceTest::mteCanRead,
+              "payload readiness preceded its independent receive acquire");
     }
     if (offset == txDone) {
-        Check(queued.empty() && ReadWord(remote, payloadCommit) == sequence,
+        Check(RoceTest::blockIndex == 1 && Pending(1U) == 0U && ReadWord(remote, payloadCommit) == sequence,
               "TxDone preceded outgoing payload completion");
     }
     std::memcpy(address, &value, sizeof(value));
@@ -70,12 +66,7 @@ inline int32_t ReadGmByPassDCache(const int32_t* address)
 }
 inline void WaitUntilGmFlagEquals(int32_t* address, int32_t value)
 {
-    if (DispatchTest::completePacking) {
-        auto pack = std::move(DispatchTest::completePacking);
-        DispatchTest::completePacking = nullptr;
-        pack();
-    }
-    DispatchTest::Check(ReadGmByPassDCache(address) == value, "Dispatch skipped local rail readiness");
+    DispatchTest::Check(ReadGmByPassDCache(address) == value, "stale local sequence/rail readiness");
     RoceTest::signalObserved = true;
 }
 template <HardEvent Event, uint32_t Id>
@@ -85,39 +76,47 @@ void SyncFuncStatic()
     AscendC::WaitFlag<Event>(Id);
 }
 
-// Rail bytes are prepared by the fixture; validate the actual packer's identity,
-// destination and publication order when production Dispatch invokes it.
 inline void SendTopkIdsToRailServer(const MoeStageCommonConfig& common, GM_ADDR*, const SendMaskConfig&,
-                                    const Params& params, SendMaskScratch&, uint32_t targetServerIdx, uint32_t jobIdx)
+                                    const Params& params, SendMaskScratch&, uint32_t targetHost, uint32_t job)
 {
     using namespace DispatchTest;
-    Check(RoceTest::blockIndex == 0 && jobIdx == 0U, "metadata packer/epoch owner is not physical AIV0");
-    Check(targetServerIdx == HierarchicalHost(common.rankId), "packer used its AIV index as the host rail slot");
+    Check(RoceTest::blockIndex == 0 && job == 0U, "metadata packer/epoch owner is not physical AIV0");
+    Check(targetHost == HierarchicalHost(common.rankId), "packer used its AIV index as the rail slot");
     Check(static_cast<uint32_t>(ReadGmByPassDCache(
               HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence))) == sequence,
-          "packer started before the current sequence was published");
+          "packer started before initializing the sequence");
     Check(static_cast<uint32_t>(ReadGmByPassDCache(
               HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::LocalRailPacked))) != sequence,
-          "rail readiness was published before packing finished");
+          "rail readiness was published before packing");
     ++packCalls;
 }
-inline void CalcRailRelayExpertRange(uint32_t, uint32_t, uint32_t, uint32_t, uint32_t, uint32_t& first, uint32_t& count)
-{
-    DispatchTest::Check(RoceTest::blockIndex != 1, "sender unexpectedly assigned relay work");
-    first = 0U;
-    count = 1U;
-}
-inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig&, GM_ADDR*, const SendMaskConfig&, const Params&,
-                                      SendMaskScratch&, uint32_t, uint32_t, int32_t, int32_t)
+
+/* PRODUCTION_RELAY_RANGE */
+
+inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig& common, GM_ADDR*, const SendMaskConfig&,
+                                      const Params& params, SendMaskScratch&, uint32_t sourceHost, uint32_t job,
+                                      int32_t first, int32_t count)
 {
     using namespace DispatchTest;
-    Check(RoceTest::blockIndex != 1 && ReadWord(local, metaReady) == sequence && RoceTest::mteCanRead,
-          "metadata relay preceded the unified receive acquire");
+    Check(job >= 2U && job < metaSenderJob && job == static_cast<uint32_t>(RoceTest::blockIndex),
+          "sender/packer was assigned relay work");
+    const auto ready = sourceHost == HierarchicalHost(common.rankId) ? HierarchicalSignal::LocalRailPacked
+                                                                     : HierarchicalSignal::MetaReady;
+    Check(static_cast<uint32_t>(ReadGmByPassDCache(HierarchicalSignalAddress(params.peermemInfo, ready))) == sequence &&
+              RoceTest::mteCanRead,
+          "relay preceded metadata readiness");
+    const uint32_t experts = 16U * common.moeExpertPerRank;
+    const int32_t localFirst = first - static_cast<int32_t>(HierarchicalHost(common.rankId) * experts);
+    Check(localFirst >= 0 && count > 0 && localFirst + count <= static_cast<int32_t>(experts),
+          "invalid relay expert range");
+    for (int32_t expert = localFirst; expert < localFirst + count; ++expert) {
+        ++coverage[sourceHost * experts + static_cast<uint32_t>(expert)];
+    }
     ++relayCalls;
 }
 inline void GmSignalWaitBarrier(int32_t*, int32_t)
 {
-    throw std::runtime_error("Dispatch unexpectedly entered final host barrier");
+    throw std::runtime_error("Dispatch entered an unexpected final host barrier");
 }
 template <bool>
 void SyncAll()
@@ -130,8 +129,25 @@ void SyncAll()
 
 using namespace MegaMoeImpl;
 
+struct JobScope {
+    int previous = RoceTest::blockIndex;
+    explicit JobScope(uint32_t job)
+    {
+        RoceTest::blockIndex = static_cast<int>(job);
+        RoceTest::subBlockIndex = static_cast<int>(job % 2U);
+        RoceTest::signalObserved = RoceTest::scalarEventSet = RoceTest::mteCanRead = false;
+    }
+    ~JobScope()
+    {
+        RoceTest::blockIndex = previous;
+        RoceTest::subBlockIndex = previous % 2;
+        RoceTest::signalObserved = RoceTest::scalarEventSet = RoceTest::mteCanRead = false;
+    }
+};
+
 void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidden, uint32_t topk,
-                   std::string_view pattern)
+                   std::string_view pattern, bool metadataFirst, uint32_t jobs = 56U, uint32_t epoch = 257U,
+                   bool outgoingPayloadFirst = false)
 {
     using namespace DispatchTest;
     MegaMoeTilingData t{};
@@ -142,12 +158,12 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     t.moeExpertPerRank = 12U;
     t.epWorldSize = 32U;
     t.dispatchRanksPerNode = 16U;
-    t.blockAivNum = 56U;
+    t.blockAivNum = jobs;
     t.topoType = TOPO_TYPE_MTE_ROCE;
     t.groupedMatmulMode = GROUPED_MATMUL_MODE_A8W4;
     t.roceScratchUbOffset = kScratchOffset;
-    t.hierarchicalSequence = 257U;
-    Check(UseDecodeRailRouting(&t), "fixture requires the production decode rail layout");
+    t.hierarchicalSequence = epoch;
+    Check(UseDecodeRailRouting(&t), "fixture requires decode rail layout");
     const PeermemSizeParams sizes{capacity,           topk, hidden, 12U, 32U, 2U, 1U, false, false,
                                   TOPO_TYPE_MTE_ROCE, true, 16U};
     const auto heapBytes = static_cast<size_t>(CalcPeermemLeastSize(sizes));
@@ -157,157 +173,207 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     queued.clear();
     quiets = waits = packCalls = relayCalls = 0U;
     peer = HierarchicalGateway(rank);
-    sequence = t.hierarchicalSequence;
+    sequence = epoch;
     receiveLeaderJob = 2U + (1U - HierarchicalHost(rank));
-    completePacking = nullptr;
+    metaSenderJob = HierarchicalMetaSendJob(jobs);
+    metaAcquired.fill(0U);
+    payloadAcquired.fill(0U);
+    onPayloadWait = nullptr;
+    coverage.assign(2U * 16U * 12U, 0U);
     RoceTest::operations.clear();
-    RoceTest::signalObserved = RoceTest::scalarEventSet = RoceTest::mteCanRead = false;
     Params params{&t, PeermemInfo(local.data(), &t)};
     MoeStageCommonConfig common{rank, bs, topk, hidden, 12U};
     SendMaskConfig config{static_cast<uint64_t>(CalcRailTopkIdsSlotBytes(&t))};
     SendMaskScratch scratch;
-    const auto flagOffset = [&](HierarchicalSignal signal) {
+    const auto offset = [&](HierarchicalSignal signal) {
         return Offset(reinterpret_cast<uint8_t*>(HierarchicalSignalAddress(params.peermemInfo, signal)), 4U);
     };
-    metaCommit = flagOffset(HierarchicalSignal::NetMetaCommit);
-    payloadCommit = flagOffset(HierarchicalSignal::NetPayloadCommit);
-    metaReady = flagOffset(HierarchicalSignal::MetaReady);
-    relayReady = flagOffset(HierarchicalSignal::RelayPayloadReady);
-    txDone = flagOffset(HierarchicalSignal::TxDone);
-    // A stale unified commit must not be satisfied by an old split notification.
-    WriteGmByPassDCache(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit),
-                        sequence - 1U);
-    WriteGmByPassDCache(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetMetaCommit), sequence);
+    metaCommit = offset(HierarchicalSignal::NetMetaCommit);
+    payloadCommit = offset(HierarchicalSignal::NetPayloadCommit);
+    metaReady = offset(HierarchicalSignal::MetaReady);
+    relayReady = offset(HierarchicalSignal::RelayPayloadReady);
+    txDone = offset(HierarchicalSignal::TxDone);
+    for (auto signal :
+         {HierarchicalSignal::Sequence, HierarchicalSignal::LocalRailPacked, HierarchicalSignal::NetMetaCommit,
+          HierarchicalSignal::NetPayloadCommit, HierarchicalSignal::MetaReady, HierarchicalSignal::RelayPayloadReady,
+          HierarchicalSignal::TxDone}) {
+        SetWord(local, offset(signal), sequence - 1U);
+    }
 
-    const uint32_t rowBytes = static_cast<uint32_t>(CalcQuantTokenScaleBytes(hidden, 1U, topk, false));
-    const uint32_t activeBytes = bs * rowBytes;
+    const uint32_t activeBytes = bs * static_cast<uint32_t>(CalcQuantTokenScaleBytes(hidden, 1U, topk, false));
     const uint32_t source = Offset(params.peermemInfo.quantTokenScalePtr, activeBytes);
     const uint32_t destination = Offset(params.peermemInfo.relayPayloadPtr, activeBytes);
     Check(params.peermemInfo.quantTokenScalePtr + activeBytes <= params.peermemInfo.combineSendPtr &&
               params.peermemInfo.relayPayloadPtr + activeBytes <= params.peermemInfo.gatewayCombinePtr,
-          "actual batch exceeds its production allocation");
-    for (uint32_t token = 0U; token < bs; ++token) {
-        for (uint32_t byte = 0U; byte < rowBytes; ++byte) {
-            local[source + token * rowBytes + byte] = static_cast<uint8_t>((token * 37U + byte * 13U + rank) % 251U);
-        }
+          "actual batch exceeds its allocation");
+    for (uint32_t byte = 0U; byte < activeBytes; ++byte) {
+        local[source + byte] = static_cast<uint8_t>((byte * 13U + rank) % 251U);
     }
     const auto payload = std::vector<uint8_t>(local.begin() + source, local.begin() + source + activeBytes);
     const uint32_t railBytes = static_cast<uint32_t>(CalcRailTopkIdsSlotDataBytes(bs, topk));
     const uint32_t rail =
         Offset(params.peermemInfo.railTopkIdsRecvPtr + HierarchicalHost(rank) * config.railTopkIdsSlotBytes, railBytes);
-    // Use real rail packet positions and both zero-remote and sparse routes.
     for (uint32_t token = 0U; token < bs; ++token) {
         for (uint32_t slot = 0U; slot < topk; ++slot) {
             const bool other = pattern == "remote" || (pattern == "mixed" && (token + slot) % 3U == 0U) ||
                                (pattern == "last" && token + 1U == bs && slot + 1U == topk);
-            const uint32_t targetHost = HierarchicalHost(rank) ^ static_cast<uint32_t>(other);
-            const int32_t expert = static_cast<int32_t>((targetHost * 16U + (token + slot) % 16U) * 12U + slot % 12U);
+            const uint32_t host = HierarchicalHost(rank) ^ static_cast<uint32_t>(other);
+            const int32_t expert = static_cast<int32_t>((host * 16U + (token + slot) % 16U) * 12U + slot % 12U);
             const uint32_t item = token * topk + slot;
-            const uint32_t packetWord = (item / 127U) * 128U + item % 127U;
-            std::memcpy(local.data() + rail + packetWord * 4U, &expert, sizeof(expert));
+            std::memcpy(local.data() + rail + ((item / 127U) * 128U + item % 127U) * 4U, &expert, sizeof(expert));
         }
     }
     auto expected = remote;
-    for (uint32_t job = 0U; job < 56U; ++job) {
-        if (job == 1U) continue;
-        RoceTest::blockIndex = static_cast<int>(job);
-        RoceTest::subBlockIndex = static_cast<int>(job % 2U);
-        FinishHierarchicalDispatch({job, 56U}, common, params);
-    }
-    Check(posts.empty() && quiets == 0U && waits == 0U, "packer/nonowner touched the QP");
-    RoceTest::blockIndex = RoceTest::subBlockIndex = 1;
-    const AivJobContext owner{1U, 56U};
-    // Schedule the packer only when the sender reaches the rail wait. Payload
-    // must already be in flight, while metadata must still be unsubmitted.
-    completePacking = [&] {
-        Check(posts.size() == 1U && queued.size() == 1U && quiets == 0U && packCalls == 0U,
-              "payload did not overlap unfinished metadata packing");
-        Check(queued[0].source == source && queued[0].destination == destination && queued[0].bytes == activeBytes,
-              "the first submission was not the actual-batch payload");
-        RoceTest::blockIndex = RoceTest::subBlockIndex = 0;
-        GatherAndPostHierarchicalDispatch({0U, 56U}, common, params, nullptr, config, scratch);
-        Check(ReadWord(local, flagOffset(HierarchicalSignal::LocalRailPacked)) == sequence,
-              "AIV0 did not finish packing and publish readiness");
-        RoceTest::blockIndex = RoceTest::subBlockIndex = 1;
+    const auto gather = [&](uint32_t job) {
+        JobScope scope(job);
+        GatherAndPostHierarchicalDispatch({job, jobs}, common, params, nullptr, config, scratch);
     };
-    GatherAndPostHierarchicalDispatch(owner, common, params, nullptr, config, scratch);
-    Check(packCalls == 1U, "AIV1 repeated AIV0's packing work");
-    Check(remote == expected, "Dispatch data completed before the shared quiet");
-    Check(posts.size() == 2U && queued.size() == 2U && quiets == 0U && waits == 0U,
-          "Dispatch did not defer both data Puts to one completion");
-    Check(queued[1].source == rail && queued[1].destination == rail && queued[1].bytes == railBytes,
-          "Dispatch did not submit packed metadata after the rail acquire");
-    Check((RoceTest::operations == std::vector<int>{1, 1}), "Dispatch inserted completion between the two data Puts");
-    const AivJobContext receiver{2U + (1U - HierarchicalHost(rank)), 56U};
-    RoceTest::blockIndex = static_cast<int>(receiver.jobIndex);
-    RoceTest::subBlockIndex = static_cast<int>(receiver.jobIndex % 2U);
-    RoceTest::signalObserved = RoceTest::scalarEventSet = RoceTest::mteCanRead = false;
-    bool staleRejected = false;
-    try {
-        GatherAndPostHierarchicalDispatch(receiver, common, params, nullptr, config, scratch);
-    } catch (const std::runtime_error&) {
-        staleRejected = true;
+    const auto finish = [&](uint32_t job) {
+        JobScope scope(job);
+        FinishHierarchicalDispatch({job, jobs}, common, params);
+    };
+    for (uint32_t job = 0U; job < jobs; ++job) {
+        if (job != 1U) finish(job);
     }
-    Check(staleRejected && relayCalls == 0U && ReadWord(local, metaReady) != sequence &&
-              ReadWord(local, relayReady) != sequence,
-          "split metadata flag incorrectly released the unified receiver");
-    // Incoming completion can arrive while our outgoing data is still in flight.
-    // The independent receive leader must not touch the sender's QP/CQ or wait
-    // for its local TxDone; this permits the sender to reach Finish independently.
-    WriteGmByPassDCache(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit), sequence);
-    GatherAndPostHierarchicalDispatch(receiver, common, params, nullptr, config, scratch);
-    Check(relayCalls == 1U && waits == 1U && quiets == 0U && posts.size() == 2U && queued.size() == 2U,
-          "receive leader did not relay independently of outgoing completion");
-    Check(ReadWord(local, relayReady) == sequence && ReadWord(local, txDone) != sequence,
-          "incoming payload readiness was held behind outgoing completion");
-    RoceTest::blockIndex = RoceTest::subBlockIndex = 1;
-    // Finish must only complete outgoing work; the receive leader already
-    // published readiness and must remain its sole writer.
-    RoceTest::signalObserved = RoceTest::scalarEventSet = RoceTest::mteCanRead = false;
-    // Both GM sources must remain stable until the unified completion.
-    Check(payload == std::vector<uint8_t>(local.begin() + source, local.begin() + source + activeBytes),
-          "posting changed the quantized source");
-    FinishHierarchicalDispatch(owner, common, params);
-    std::copy_n(local.data() + rail, railBytes, expected.data() + rail);
+    Check(posts.empty() && quiets == 0U && waits == 0U, "nonowner touched the payload completion path");
+
+    gather(1U);
+    Check(posts.size() == 1U && queued.size() == 1U && packCalls == 0U && quiets == 0U,
+          "payload did not start before metadata packing");
+    Check(queued[0].source == source && queued[0].destination == destination && queued[0].bytes == activeBytes,
+          "payload did not use the actual batch range");
+    bool stale = false;
+    try {
+        finish(1U);
+    } catch (const std::runtime_error&) {
+        stale = true;
+    }
+    Check(stale && quiets == 0U, "payload sender committed an uninitialized sequence");
+
+    if (outgoingPayloadFirst) {
+        // The packer initializes Sequence before packing. Hold LocalRailPacked
+        // at the previous epoch: QP1 must still complete without QP2 or receive.
+        SetWord(local, offset(HierarchicalSignal::Sequence), sequence);
+        finish(1U);
+        std::copy(payload.begin(), payload.end(), expected.begin() + destination);
+        SetWord(expected, payloadCommit, sequence);
+        Check(remote == expected && queued.empty() && quiets == 2U && posts.size() == 2U && waits == 0U &&
+                  ReadWord(local, offset(HierarchicalSignal::LocalRailPacked)) != sequence,
+              "payload completion depended on metadata packing or incoming traffic");
+    }
+
+    const auto receiveMeta = [&] {
+        bool rejected = false;
+        try {
+            gather(receiveLeaderJob);
+        } catch (const std::runtime_error&) {
+            rejected = true;
+        }
+        Check(rejected && relayCalls == 0U && ReadWord(local, metaReady) != sequence,
+              "payload or old metadata released routing");
+        SetWord(local, metaCommit, sequence);
+        gather(receiveLeaderJob);
+        Check(relayCalls > 0U && ReadWord(local, metaReady) == sequence, "metadata did not release routing");
+    };
+    const auto sendMeta = [&] {
+        gather(metaSenderJob);
+        Check(Pending(1U) == (outgoingPayloadFirst ? 0U : 1U) && Pending(2U) == 0U &&
+                  quiets == (outgoingPayloadFirst ? 4U : 2U) && posts.size() == (outgoingPayloadFirst ? 4U : 3U),
+              "metadata completion drained or waited for payload");
+        Check(ReadWord(remote, metaCommit) == sequence &&
+                  (ReadWord(remote, payloadCommit) == sequence) == outgoingPayloadFirst,
+              "metadata did not commit independently");
+        std::copy_n(local.data() + rail, railBytes, expected.data() + rail);
+        SetWord(expected, metaCommit, sequence);
+        Check(remote == expected, "metadata changed payload, capacity tail, or neighboring memory");
+    };
+    onPayloadWait = [&] {
+        Check(ReadWord(local, offset(HierarchicalSignal::LocalRailPacked)) == sequence && packCalls == 1U,
+              "payload receive blocked the metadata packer before publication");
+        if (metadataFirst) {
+            receiveMeta();
+            Check(ReadWord(local, relayReady) != sequence &&
+                      (ReadWord(local, txDone) == sequence) == outgoingPayloadFirst,
+                  "metadata falsely certified incoming or outgoing payload");
+            sendMeta();
+        }
+        SetWord(local, payloadCommit, sequence);
+    };
+    gather(0U);
+    Check(ReadWord(local, relayReady) == sequence && (ReadWord(local, txDone) == sequence) == outgoingPayloadFirst,
+          "incoming payload waited for outgoing completion");
+    if (!metadataFirst) {
+        Check(ReadWord(local, metaReady) != sequence, "payload incorrectly released metadata");
+        sendMeta();
+        receiveMeta();
+    }
+
+    // Exercise every production relay assignment, including the old tail's
+    // experts now redistributed over one fewer worker. No holes/duplicates.
+    for (uint32_t job = 2U; job < metaSenderJob; ++job) {
+        if (job != receiveLeaderJob) gather(job);
+    }
+    Check(std::all_of(coverage.begin(), coverage.end(), [](uint32_t count) { return count == 1U; }),
+          "reserving the metadata sender lost or duplicated a source/expert range");
+
+    if (!outgoingPayloadFirst) finish(1U);
     std::copy(payload.begin(), payload.end(), expected.begin() + destination);
-    std::memcpy(expected.data() + payloadCommit, &sequence, sizeof(sequence));
-    Check(remote == expected, "whole-batch payload changed active data, capacity tail, or neighboring regions");
-    Check(queued.empty() && posts.size() == 3U && quiets == 2U && waits == 1U,
-          "Finish omitted completion/commit or zero-remote notification");
-    Check((RoceTest::operations == std::vector<int>{1, 1, 2, 1, 2}), "unified payload/commit quiet ordering changed");
-    Check(ReadWord(local, txDone) == sequence && ReadWord(local, relayReady) == sequence && !RoceTest::mteCanRead,
-          "sender repeated the receive acquire or lost independent readiness");
-    std::fill_n(local.data() + source, activeBytes, uint8_t{0xDDU});
-    std::fill_n(local.data() + rail, railBytes, uint8_t{0xCCU});
-    Check(remote == expected, "completed receive still referenced the reusable source");
+    SetWord(expected, payloadCommit, sequence);
+    Check(remote == expected, "payload changed active data, capacity tail, or neighboring memory");
+    Check(queued.empty() && posts.size() == 4U && quiets == 4U && waits == 2U,
+          "split completion has missing or duplicate operations");
+    const auto expectedOperations = outgoingPayloadFirst ? std::vector<int>{11, 12, 11, 12, 21, 22, 21, 22}
+                                                         : std::vector<int>{11, 21, 22, 21, 22, 12, 11, 12};
+    Check(RoceTest::operations == expectedOperations, "per-QP data/commit ordering changed");
+    Check(ReadWord(local, txDone) == sequence && ReadWord(local, relayReady) == sequence,
+          "outgoing completion lost independently published incoming readiness");
+    std::fill_n(local.data() + source, activeBytes, 0xDDU);
+    std::fill_n(local.data() + rail, railBytes, 0xCCU);
+    Check(remote == expected, "completed receive still referenced reusable source memory");
 }
 
 int main()
 {
     try {
         for (uint32_t rank : {5U, 21U}) {
-            for (const auto shape : std::array<std::array<uint32_t, 2>, 4>{{{1, 32}, {7, 64}, {31, 32}, {32, 64}}}) {
-                for (const auto pattern : {"local", "remote", "mixed", "last"}) {
-                    CheckDispatch(rank, shape[0], shape[1], 3584U, 8U, pattern);
+            for (bool metaFirst : {false, true}) {
+                for (const auto shape :
+                     std::array<std::array<uint32_t, 2>, 4>{{{1, 32}, {7, 64}, {31, 32}, {32, 64}}}) {
+                    for (const auto pattern : {"local", "remote", "mixed", "last"}) {
+                        CheckDispatch(rank, shape[0], shape[1], 3584U, 8U, pattern, metaFirst);
+                    }
                 }
+                for (uint32_t epoch : {127U, 128U, 257U, 258U}) {
+                    CheckDispatch(rank, 31U, 64U, 1024U, 1U, "last", metaFirst, 6U, epoch);
+                }
+                CheckDispatch(rank, 32U, 32U, 8192U, 32U, "remote", metaFirst, 64U);
+                CheckDispatch(rank, 32U, 64U, 3584U, 8U, "mixed", metaFirst, 56U, 260U, true);
             }
-            CheckDispatch(rank, 31U, 64U, 1024U, 1U, "last");
-            CheckDispatch(rank, 32U, 32U, 8192U, 32U, "remote");
-            CheckDispatch(rank, 1U, 64U, 3584U, 32U, "local");
         }
-        // Negative control: the asynchronous double must detect early source
-        // reuse instead of accidentally behaving as a synchronous memcpy.
-        auto* ub = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(DispatchTest::kScratchOffset));
-        MegaMoeImpl::RocePutBytes(DispatchTest::local.data() + 64U, DispatchTest::local.data() + 128U, 16U,
-                                  DispatchTest::peer, ub);
-        DispatchTest::local[128U] ^= 1U;
-        bool rejected = false;
-        try {
-            MegaMoeImpl::RoceQuiet(DispatchTest::peer, ub);
-        } catch (const std::runtime_error&) {
-            rejected = true;
+        // Ensure the asynchronous double detects source reuse on either QP.
+        for (uint32_t qp : {1U, 2U}) {
+            DispatchTest::queued.clear();
+            JobScope scope(qp == 1U ? 1U : DispatchTest::metaSenderJob);
+            auto* ub = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(DispatchTest::kScratchOffset));
+            if (qp == 1U) {
+                RocePutBytes(DispatchTest::local.data() + 64U, DispatchTest::local.data() + 128U, 16U,
+                             DispatchTest::peer, ub);
+            } else {
+                RocePutBytes<MEGAMOE_ROCE_META_QP_INDEX>(
+                    DispatchTest::local.data() + 64U, DispatchTest::local.data() + 128U, 16U, DispatchTest::peer, ub);
+            }
+            DispatchTest::local[128U] ^= 1U;
+            bool rejected = false;
+            try {
+                if (qp == 1U)
+                    RoceQuiet(DispatchTest::peer, ub);
+                else
+                    RoceQuiet<MEGAMOE_ROCE_META_QP_INDEX>(DispatchTest::peer, ub);
+            } catch (const std::runtime_error&) {
+                rejected = true;
+            }
+            DispatchTest::Check(rejected, "double failed to detect an invalid source lifetime");
         }
-        DispatchTest::Check(rejected, "asynchronous test double failed to detect an invalid source lifetime");
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

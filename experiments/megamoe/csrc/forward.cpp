@@ -264,6 +264,8 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     TORCH_CHECK(
         !hierarchical || (world == MegaMoeImpl::HIERARCHICAL_WORLD_SIZE && bs <= MegaMoeImpl::HIERARCHICAL_MAX_TOKENS),
         "MTE+RoCE MegaMoE requires two 16-rank hosts and BS in [1,32]");
+    TORCH_CHECK(!hierarchical || (p.aiv >= 6U && p.aiv % 2U == 0U),
+                "MTE+RoCE MegaMoE requires at least three complete AIC/AIV pairs");
 #ifndef DEEPEP_MEGAMOE_ROCE
     TORCH_CHECK(!hierarchical, "Rebuild MegaMoE with a RoCE-enabled SHMEM SDK (XSCALE or HNS_1825)");
 #endif

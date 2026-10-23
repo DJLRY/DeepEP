@@ -234,4 +234,8 @@ int main(int argc, char** argv)
     }
     assert(HierarchicalPackJob() == 0U);
     assert(HierarchicalSendJob() == 1U);
+    for (uint32_t aivs : {6U, 56U, 64U}) {
+        assert(HierarchicalMetaSendJob(aivs) == aivs - 1U);
+        assert(HierarchicalMetaSendJob(aivs) % 2U == 1U);
+    }
 }

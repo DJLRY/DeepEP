@@ -105,8 +105,9 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     // reserved until a new process is launched; do not finalize foreign state.
     occupied = true;
     if (roce) {
-        // QP0 belongs to SDK operations; one sender owns application QP1 per peer.
-        check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, 2), "aclshmemx_set_qp_num (RoCE)");
+        // QP0 belongs to SDK operations. Independent MegaMoE senders own QP1
+        // (payload/Combine) and QP2 (metadata); quiet must not join their work.
+        check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, 3), "aclshmemx_set_qp_num (RoCE)");
     }
     if (udma) {
         // Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.

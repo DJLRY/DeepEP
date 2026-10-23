@@ -48,15 +48,41 @@ def compile_and_run(tmp_path, backend, source_name, timer=False, stub_directorie
     if compiler is None:
         pytest.skip("Transport helper compilation requires g++ or clang++")
     source = Path(__file__).with_name(source_name)
+    fixture_directory = source.parent
+    if source_name == "hierarchical_dispatch_test.cpp":
+        production = (fixture_directory.parent / "csrc/kernels/mega_moe/stage/mega_moe_send_mask.hpp").read_text(
+            encoding="utf-8"
+        )
+        start = production.index("__aicore__ inline void CalcRailRelayExpertRange(")
+        opening = production.index("{", start)
+        end, depth = opening + 1, 1
+        while depth:
+            depth += (production[end] == "{") - (production[end] == "}")
+            end += 1
+        generated = tmp_path / source_name
+        generated.write_text(
+            source.read_text(encoding="utf-8").replace("/* PRODUCTION_RELAY_RANGE */", production[start:end]),
+            encoding="utf-8",
+        )
+        source = generated
     binary = tmp_path / "roce_transport_test"
     command = [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror"]
+    if source_name == "hierarchical_dispatch_test.cpp":
+        # The fixture checks full symmetric heaps, both arrival orders and all
+        # relay partitions. Optimize its byte comparisons, retaining assertions.
+        command.append("-O2")
     if backend is not None:
         command.append(f"-DACLSHMEMI_RDMA_K_BACKEND_{backend}=1")
     if timer:
         command.append("-DDEEPEP_MEGAMOE_TIMER=1")
     command += [f"-I{Path(__file__).with_name(directory)}" for directory in stub_directories]
-    command += [str(source), "-o", str(binary)]
+    command += [f"-I{fixture_directory}", str(source), "-o", str(binary)]
     result = subprocess.run(command, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
-    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+    result = subprocess.run(
+        [str(binary)],
+        capture_output=True,
+        text=True,
+        timeout=30 if source_name == "hierarchical_dispatch_test.cpp" else 10,
+    )
     assert result.returncode == 0, result.stderr

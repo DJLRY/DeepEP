@@ -10,9 +10,10 @@
 
 namespace MegaMoeImpl {
 
-// QP0 belongs to SHMEM's default collectives. Physical AIV1 owns QP1 for the
-// paired peer throughout hierarchical Dispatch and Combine on both hosts.
+// QP0 belongs to SHMEM's default collectives. Physical AIV1 owns QP1 for
+// payload/Combine; the last physical AIV1 owns QP2 for Dispatch metadata.
 constexpr uint32_t MEGAMOE_ROCE_QP_INDEX = 1U;
+constexpr uint32_t MEGAMOE_ROCE_META_QP_INDEX = 2U;
 constexpr uint32_t MEGAMOE_ROCE_EVENT_ID = 7U;
 constexpr uint32_t MEGAMOE_ROCE_SCRATCH_BYTES = 256U;
 
@@ -21,6 +22,7 @@ constexpr uint32_t MEGAMOE_ROCE_SCRATCH_BYTES = 256U;
 // Producers must drain their MTE3 writes before publishing readiness to this owner;
 // scalar producers must write through to GM. The source stays immutable until Quiet.
 // Scratch is private to this AIV, 32B-aligned, and at least 256B; no default SDK UB is used.
+template <uint32_t QpIndex = MEGAMOE_ROCE_QP_INDEX>
 __aicore__ inline void RocePutBytes(GM_ADDR dstLocalSym, GM_ADDR srcLocalSym, uint32_t bytes, uint32_t peer,
                                     __ubuf__ uint8_t* scratch, AscendTimerDevice* timer = nullptr,
                                     AscendTimer::RdmaPhase phase = AscendTimer::RdmaPhase::DispatchPayload,
@@ -31,8 +33,8 @@ __aicore__ inline void RocePutBytes(GM_ADDR dstLocalSym, GM_ADDR srcLocalSym, ui
     }
     AscendTimerRdmaScope timing(timer, AscendTimer::AIV_RDMA_POST, phase, peer, bytes, isCommit);
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_XSCALE) || defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-    aclshmemx_roce_qp_put_nbi<uint8_t>(dstLocalSym, srcLocalSym, scratch, bytes, static_cast<int>(peer),
-                                       MEGAMOE_ROCE_QP_INDEX, MEGAMOE_ROCE_EVENT_ID);
+    aclshmemx_roce_qp_put_nbi<uint8_t>(dstLocalSym, srcLocalSym, scratch, bytes, static_cast<int>(peer), QpIndex,
+                                       MEGAMOE_ROCE_EVENT_ID);
 #else
     // Host rejects this topology without a matching SDK; fail closed if that guard regresses.
     (void)dstLocalSym;
@@ -43,6 +45,7 @@ __aicore__ inline void RocePutBytes(GM_ADDR dstLocalSym, GM_ADDR srcLocalSym, ui
 #endif
 }
 
+template <uint32_t QpIndex = MEGAMOE_ROCE_QP_INDEX>
 __aicore__ inline void RoceQuiet(uint32_t peer, __ubuf__ uint8_t* scratch, AscendTimerDevice* timer = nullptr,
                                  AscendTimer::RdmaPhase phase = AscendTimer::RdmaPhase::DispatchPayload,
                                  bool isCommit = false)
@@ -50,7 +53,7 @@ __aicore__ inline void RoceQuiet(uint32_t peer, __ubuf__ uint8_t* scratch, Ascen
     AscendTimerRdmaScope timing(timer, AscendTimer::AIV_RDMA_QUIET_WAIT, phase, peer, isCommit ? sizeof(uint32_t) : 0U,
                                 isCommit);
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_XSCALE) || defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-    aclshmemx_roce_qp_quiet<uint8_t>(peer, MEGAMOE_ROCE_QP_INDEX, scratch, MEGAMOE_ROCE_EVENT_ID);
+    aclshmemx_roce_qp_quiet<uint8_t>(peer, QpIndex, scratch, MEGAMOE_ROCE_EVENT_ID);
 #else
     (void)peer;
     (void)scratch;
@@ -63,13 +66,14 @@ __aicore__ inline void RoceQuiet(uint32_t peer, __ubuf__ uint8_t* scratch, Ascen
 // This is the same quiet -> signal write -> quiet ordering used by the pinned SHMEM
 // RoCE barrier, restricted to our owned QP instead of a collective or the default QP0.
 // Each sequence/commit owns a distinct 512B line; the receiver never clears an inbox.
+template <uint32_t QpIndex = MEGAMOE_ROCE_QP_INDEX>
 __aicore__ inline void RocePublishCommit(GM_ADDR dstFlagLocalSym, GM_ADDR srcSeqLocalSym, uint32_t peer,
                                          __ubuf__ uint8_t* scratch, AscendTimerDevice* timer = nullptr,
                                          AscendTimer::RdmaPhase phase = AscendTimer::RdmaPhase::DispatchPayload)
 {
-    RoceQuiet(peer, scratch, timer, phase);
-    RocePutBytes(dstFlagLocalSym, srcSeqLocalSym, sizeof(uint32_t), peer, scratch, timer, phase, true);
-    RoceQuiet(peer, scratch, timer, phase, true);
+    RoceQuiet<QpIndex>(peer, scratch, timer, phase);
+    RocePutBytes<QpIndex>(dstFlagLocalSym, srcSeqLocalSym, sizeof(uint32_t), peer, scratch, timer, phase, true);
+    RoceQuiet<QpIndex>(peer, scratch, timer, phase, true);
 }
 
 // Quiet alone is sender-side completion. Receivers wait for the ordered commit in

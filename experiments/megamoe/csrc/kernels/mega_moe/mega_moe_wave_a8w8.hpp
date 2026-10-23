@@ -1066,7 +1066,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
             PipeBarrier<PIPE_ALL>();
         }
     }
-    // FinishHierarchicalDispatch has quieted both payload and commit before this
+    // Both Dispatch owners have drained their data and commits before this
     // full-core barrier. Physical AIV1 retains QP1 ownership through Combine
     // on both hosts; only AIV1 posts or consumes its CQ.
     SyncAll<false>();  // AIC 等待 AIV 完成输入准备与 flag 清零后再进入计算

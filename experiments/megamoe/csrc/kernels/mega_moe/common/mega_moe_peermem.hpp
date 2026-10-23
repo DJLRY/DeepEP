@@ -95,6 +95,13 @@ HOST_DEVICE uint32_t HierarchicalSendJob()
     return 1U;
 }
 
+// Reserve the last physical AIV1 only during input preparation. Removing the
+// tail owner leaves the relay jobs [2, aivCount - 1) densely numbered.
+HOST_DEVICE uint32_t HierarchicalMetaSendJob(uint32_t aivCount)
+{
+    return aivCount - 1U;
+}
+
 HOST_DEVICE uint64_t HierarchicalSignalOffset(HierarchicalSignal signal)
 {
     return static_cast<uint64_t>(signal) * HIERARCHICAL_FLAG_BYTES;
