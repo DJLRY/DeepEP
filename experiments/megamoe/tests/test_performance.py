@@ -169,7 +169,7 @@ def test_profiler_host_barrier_before_batch_without_per_round_synchronize(tmp_pa
 
 def test_alignment_is_explicit_validated_and_recorded(tmp_path):
     config = load_config("deepseek_v4_pro")
-    assert config["alignment"] == dict(rows=100000, cols=30000, repeats=20)
+    assert config["alignment"] == dict(rows=100000, cols=30000, repeats=800)
     for value in ({}, dict(rows=1, cols=2, repeats=0), dict(rows=True, cols=2, repeats=1)):
         with pytest.raises(ValueError, match="alignment"):
             alignment_config(dict(alignment=value))

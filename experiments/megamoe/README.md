@@ -213,7 +213,7 @@ bash experiments/megamoe/scripts/run_bs32.sh perf --warmup 20 --iters 100
 `perf` 不生成或读取 Golden，不重新编译。默认预热20轮、采集100轮，并统计后50轮；
 模型、BS32、FP8输入、FP4权重、balanced路由均与精度用例一致。
 恢复连续批次测试：整批开始前通过 TCPStore 会合，排入一次 Exp 前置计算，随后连续下发 MegaMoE。
-每批前置计算重复 `alignment.repeats` 次（默认20次），复用约12 GB显存/卡，不计入 MegaMoE kernel Duration。
+每批前置计算重复 `alignment.repeats` 次（默认800次），复用约12 GB显存/卡，不计入 MegaMoE kernel Duration。
 测试不建立专用 HCCL 进程组，轮间不插入 AllReduce、Exp、Host barrier 或 `torch.npu.synchronize()`；
 算子内部仍使用 SHMEM MTE/RoCE。批次边界的同步保留，不保证各 rank 同一轮的实际开始时间一致。
 `manifest.json` / `profiling.json` 的 `iteration_sync` 为 `none`，`alignment_scope` 为 `once_before_batch`，

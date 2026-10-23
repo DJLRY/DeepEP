@@ -10,7 +10,7 @@ import statistics
 
 
 # 整批开始前的计算，让 Host 有时间排入后续算子；不计入 kernel Duration。
-DEFAULT_ALIGNMENT = dict(rows=100000, cols=30000, repeats=20)
+DEFAULT_ALIGNMENT = dict(rows=100000, cols=30000, repeats=800)
 
 
 def alignment_config(config):
