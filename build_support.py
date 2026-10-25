@@ -153,6 +153,10 @@ def shmem_rdma_backend(sdk):
     build = sdk.get("build", {})
     if not isinstance(build, dict) or build.get("rdma_backend", "NONE") not in ("NONE", "XSCALE", "HNS_1825"):
         raise RuntimeError("SHMEM SDK rdma_backend must be NONE, XSCALE or HNS_1825")
+    if build.get("rdma_backend") == "HNS_1825":
+        mode = build.get("hns_1825_pi_on_chip")
+        if type(mode) is not int or mode not in (0, 1):
+            raise RuntimeError("HNS_1825 SDK must record hns_1825_pi_on_chip as integer 0 or 1")
     return build.get("rdma_backend", "NONE")
 
 
@@ -262,6 +266,7 @@ def build_configuration(environment=None):
     result["shmem"] = {
         "revision": sdk.get("revision", "unknown") if isinstance(sdk, dict) else "unknown",
         "rdma_backend": shmem_rdma_backend(sdk) if isinstance(sdk, dict) else "NONE",
+        "hns_1825_pi_on_chip": sdk.get("build", {}).get("hns_1825_pi_on_chip") if isinstance(sdk, dict) else None,
         "sha256": {
             path.relative_to(manifest.parent).as_posix(): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in files

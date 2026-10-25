@@ -25,6 +25,7 @@ if(DEFINED DEEPEP_SHMEM_RDMA_BACKEND AND NOT DEEPEP_SHMEM_RDMA_BACKEND STREQUAL 
     message(FATAL_ERROR "Configured RDMA backend disagrees with the SHMEM SDK identity")
 endif()
 set(DEEPEP_SHMEM_RDMA_BACKEND "${_shmem_rdma_backend}")
+include("${CMAKE_CURRENT_LIST_DIR}/ShmemDoorbell.cmake")
 # Resolve from the selected SDK on every configure, including direct CMake use.
 unset(ASCENDCL_LIBRARY CACHE)
 unset(ASCEND_RUNTIME_LIBRARY CACHE)

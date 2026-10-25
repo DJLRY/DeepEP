@@ -11,6 +11,8 @@ constexpr int ACLSHMEM_DATA_OP_ROCE = 2;
 using data_op_engine_type_t = int;
 constexpr int ACLSHMEMX_INIT_WITH_DEFAULT = 1;
 constexpr int ACLSHMEMX_INIT_WITH_MPI = 2;
+constexpr int ACLSHMEM_CONFIG_DEFAULT = 0;
+constexpr int ACLSHMEM_CONFIG_ENABLED = 2;
 struct aclshmemx_uniqueid_t {
     char bytes[128]{};
 };
@@ -24,9 +26,11 @@ struct aclshmemx_init_attr_t {
         int data_op_engine_type = 0;
         unsigned shm_init_timeout = 120, shm_create_timeout = 120, control_operation_timeout = 120;
     } option_attr;
+    struct {
+        int udma_shared_jetty = ACLSHMEM_CONFIG_DEFAULT;
+    } runtime_config;
 };
 int aclshmemx_init_status();
 int aclshmemx_init_attr(int, aclshmemx_init_attr_t*);
 int aclshmem_finalize();
 int aclshmemx_set_qp_num(data_op_engine_type_t, uint32_t);
-int aclshmemx_set_shared_jetty(data_op_engine_type_t, bool);

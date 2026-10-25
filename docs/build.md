@@ -15,7 +15,7 @@ MegaMoE 和 EpGmmFused 通过独立开关选择构建，见下文实验组件说
 - CANN 9.2.0 与配套驱动/框架，目标 Ascend950；构建仅接受该 CANN 版本与目标架构。
 - 由本仓子模块构建或使用外部固定提交的 SHMEM SDK（见 `dependencies.lock.json`），安装根包含 `include/`、
   `lib/libshmem.so` 以及 `src/device`、`src/device_simt` 等 Device 头文件。
-- 普通（HT）dispatch/combine 依赖 SHMEM 的 shared-jetty 支持，包括 Host 配置接口和 Device 共享队列状态；使用锁文件固定的 `cann/shmem` dev 提交，不直接跟随分支最新版本。
+- 普通（HT）dispatch/combine 依赖 SHMEM 的 shared-jetty 支持，包括 Host 配置接口和 Device 共享队列状态；使用锁文件固定的 `cann/shmem` master 提交，不直接跟随分支最新版本。当前版本的 UDMA 路径须显式设置 `DEEPEP_SHMEM_DENSE_QPS=1`；详见 [SHMEM !944 迁移说明](shmem-944.md)。
 - CANN 安装中须包含 `tools/bisheng_compiler/bin/bisheng`，Device 使用 `-xasc` 编译。
 - 普通 CPU 测试仅需 `requirements-dev.txt`；wheel 构建依赖固定在 `pyproject.toml`。
 - wheel 构建不自动下载/编译外部 SDK，不将驱动/CANN/SHMEM 打入 wheel。SDK 及其传递依赖必须由部署环境提供。
@@ -58,6 +58,8 @@ export DEEPEP_BUILD_MEGAMOE=ON
 
 `--rdma-backend` 默认 `NONE`，不启用 RoCE；原有8卡分组和16卡单机继续使用 MTE。
 SDK 的 `build.rdma_backend` 写入 `deepep-sdk.json`，构建缓存与 `--if-needed` 复用会校验该值。
+HNS1825 新固件默认使用 PI-on-chip 模式；SDK 与内核的模式一致性、首次升级重建及历史 commit 复测命令见
+[SHMEM !944 迁移说明](shmem-944.md)。
 切换后端需要重新构建 SDK 和 wheel。MegaMoE 构建入口的等价命令是
 `bash experiments/megamoe/scripts/build.sh --rdma-backend XSCALE --rebuild-shmem`。
 用户代码只需 `ranks_per_node=16`；当前跨机范围为两机 EP32、W4A8（A8W4）或 A8W8、实际每卡 B=1～32，
@@ -77,6 +79,7 @@ python scripts/record_shmem_sdk.py --sdk "$SHMEM_ROOT" \
 ```
 
 外部 RoCE SDK 在首次登记时须追加 `--rdma-backend XSCALE` 或 `--rdma-backend HNS_1825`，
+HNS1825 还须追加 `--hns-1825-pi-on-chip 0` 或 `1`，
 声明提供方实际构建的后端。该选项不会给现有库增加 RDMA 能力；已有 manifest 不能覆盖或手改。
 缺少 backend 字段的旧 SDK 身份按 `NONE` 处理。CMake 从 SDK 身份自动配置 MegaMoE 的匹配后端，
 16卡跨机初始化还会校验实际加载的 SHMEM 库与 wheel 记录一致。

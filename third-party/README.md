@@ -6,11 +6,12 @@
 
 | 目录 | 用途 | 固定提交 |
 | --- | --- | --- |
-| `shmem/` | 通信 SDK，提供 shared-jetty 支持 | `7f9d961d378225e69058080532cf4f5be16cc83d` |
+| `shmem/` | 通信 SDK，含 HNS1825 PI-on-chip doorbell 适配 | `87b63bd3206214450ef09c32010bf9fd1cbad21b` |
 | `catlass/` | MegaMoE 编译时使用的模板头文件，不单独编译动态库 | `2b4bd7cbf7e67ebab23d7d5a99d472c83f90d9a1` |
 
 来源见根 [.gitmodules](../.gitmodules)，版本约束见 [dependencies.lock.json](../dependencies.lock.json)。
-SHMEM 固定到 `cann/shmem` 的 dev 提交；升级后需重编 SDK 和 wheel，准备步骤见[构建指南](../docs/build.md)。
+SHMEM 固定到 `cann/shmem` 的 master 合入 !944 的提交；升级后需重编 SDK 和 wheel，准备步骤见[构建指南](../docs/build.md)。
+新驱动重建与历史 commit 迁移见 [SHMEM !944 复测说明](../docs/shmem-944.md)。
 两个子仓库的许可证均为 CANN Open Software License Agreement Version 2.0，原文保留在各自的 `LICENSE` 中。
 MegaMoE 源文件中的 CANN 版权和许可声明保留，许可全文归档于 [cann.LICENSE](cann.LICENSE)，并随启用 MegaMoE 的 wheel 分发。
 第三方许可适用于对应来源内容，不替代项目自身的发行许可；引入依赖时遵循[贡献指南](../CONTRIBUTING.md#许可证)。
@@ -31,7 +32,7 @@ export LD_LIBRARY_PATH="$PWD/third-party/shmem/install/shmem/lib:${LD_LIBRARY_PA
 离线环境需预先提供 `third-party/shmem/3rdparty/json/single_include/nlohmann/json.hpp` 及对应源码。
 
 已有 build/install 时默认停止，避免覆盖正在被其他作业使用的 SDK。明确需要重建时，先停止使用该 SDK 的作业，
-再运行 `python scripts/build_shmem.py --rebuild`；上游会重新生成该子模块的 build/install，随后必须重建依赖它的 wheel。
+再运行 `python scripts/build_shmem.py --rebuild`；准备脚本清理该子模块的 build/install 后调用上游重建，随后必须重建依赖它的 wheel。
 默认拒绝修改过的源码；开发验证可显式传入 `--allow-local-changes`，脚本会记录修改指纹，并在编译后检查源码未再次变化。该选项不允许更换锁定提交；`--rebuild` 不会强制重置或覆盖源码。
 
 未设置环境变量时，wheel 构建默认使用 `third-party/shmem/install/shmem` 与 `third-party/catlass`。
