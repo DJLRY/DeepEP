@@ -78,7 +78,17 @@ def test_live_and_symmetric_wqe_addresses_with_pinned_sdk(tmp_path, debug):
     source.write_text(contract_source(), encoding="utf-8")
     binary = tmp_path / ("contract.exe" if os.name == "nt" else "contract")
     result = subprocess.run(
-        [compiler, "-std=c++17", f"-DTEST_DEBUG={int(debug)}", "-iquote", str(ROOT), str(source), "-o", str(binary)],
+        [
+            compiler,
+            "-std=c++17",
+            "-D__CCE_AICORE__=1",
+            f"-DTEST_DEBUG={int(debug)}",
+            "-iquote",
+            str(ROOT),
+            str(source),
+            "-o",
+            str(binary),
+        ],
         capture_output=True,
         encoding="utf-8",
         errors="replace",
@@ -89,12 +99,23 @@ def test_live_and_symmetric_wqe_addresses_with_pinned_sdk(tmp_path, debug):
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_adapters_preserve_distinct_device_address_spaces(tmp_path):
+@pytest.mark.parametrize("device_macro", ["__CCE_AICORE__", "__CCE_KT_TEST__"])
+def test_adapters_preserve_distinct_device_address_spaces(tmp_path, device_macro):
     compiler = shutil.which("clang++")
     if compiler is None:
         pytest.skip("Clang required to enforce distinct pointer address spaces")
     fixture = Path(__file__).with_name("shmem_udma_address_space_test.cpp")
-    command = [compiler, "-std=c++17", "-iquote", str(ROOT), "-c", str(fixture), "-o", str(tmp_path / "spaces.o")]
+    command = [
+        compiler,
+        "-std=c++17",
+        f"-D{device_macro}=1",
+        "-iquote",
+        str(ROOT),
+        "-c",
+        str(fixture),
+        "-o",
+        str(tmp_path / "spaces.o"),
+    ]
     result = subprocess.run(command, capture_output=True, encoding="utf-8", errors="replace", timeout=90)
     assert result.returncode == 0, result.stdout + result.stderr
     # Ensure this compiler actually rejects the conversion that Bisheng rejected.
@@ -103,3 +124,20 @@ def test_adapters_preserve_distinct_device_address_spaces(tmp_path):
     )
     assert invalid.returncode != 0
     assert "reinterpret_cast" in invalid.stderr and "not allowed" in invalid.stderr
+
+
+def test_host_pass_does_not_require_device_udma_types(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required")
+    source = tmp_path / "host.cpp"
+    # Like shmem.h's Host branch, provide no Device UDMA types or address qualifiers.
+    source.write_text('#include "csrc/kernels/dispatch/udma_live_address.hpp"\nint host_pass() { return 0; }\n')
+    result = subprocess.run(
+        [compiler, "-std=c++17", "-iquote", str(ROOT), "-c", str(source), "-o", str(tmp_path / "host.o")],
+        capture_output=True,
+        encoding="utf-8",
+        errors="replace",
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
