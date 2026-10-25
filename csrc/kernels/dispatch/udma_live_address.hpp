@@ -2,6 +2,8 @@
 
 #pragma once
 
+// Match shmem.h: Bisheng's Host pass does not expose Device UDMA types.
+#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
 namespace ascend_deepep {
 // Dispatch payloads use peer-published framework addresses, outside the symmetric heap.
 // SHMEM 87b63bd's internal builders now translate symmetric addresses. Build the
@@ -47,3 +49,4 @@ __aicore__ inline void SubmitLiveUdmaWqes(__gm__ uint8_t* target, __gm__ uint8_t
     state.pending_count = 0;
 }
 }  // namespace ascend_deepep
+#endif
