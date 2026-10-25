@@ -2,6 +2,7 @@
 
 #include "kernel_operator.h"
 #include "shmem.h"
+#include "udma_live_address.hpp"
 #include "simt_api/device_functions.h"
 #include "tiling.hpp"
 #include "launch.hpp"
@@ -450,7 +451,7 @@ __aicore__ inline void IssueDeepepPrimaryTile(DeepepPrimaryState& p, int32_t dst
             __gm__ uint8_t* hidden_source = hidden + token_index * hidden_row_bytes;
             // Same SDK aggregate primitive as public put, without its heap
             // translation. All intermediate RO remain CQE-free.
-            aclshmemi_udma_stage_send_wqe<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kUdmaDataRoNoCqeConfig>(
+            ascend_deepep::StageLiveUdmaWqe<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kUdmaDataRoNoCqeConfig>(
                 hidden_destination, hidden_source, dst_rank, qp_idx, hidden_row_bytes, udma_wqe_buffer,
                 udma_submit_state);
         }
@@ -461,7 +462,7 @@ __aicore__ inline void IssueDeepepPrimaryTile(DeepepPrimaryState& p, int32_t dst
         const int64_t output_offset = dst_local.GetValue(route_index - chunk_start) % address_stride;
         __gm__ uint8_t* hidden_destination = target + output_offset * hidden_row_bytes;
         __gm__ uint8_t* hidden_source = hidden + token_index * hidden_row_bytes;
-        aclshmemi_udma_submit_send_wqes<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kUdmaDataRoCqeConfig>(
+        ascend_deepep::SubmitLiveUdmaWqes<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kUdmaDataRoCqeConfig>(
             hidden_destination, hidden_source, dst_rank, qp_idx, hidden_row_bytes, udma_wqe_buffer, EVENT_ID0,
             udma_submit_state);
     }

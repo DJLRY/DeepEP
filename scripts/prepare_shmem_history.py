@@ -17,8 +17,42 @@ TEXT_PATHS = (
     "cmake/Dependencies.cmake",
     "experiments/megamoe/CMakeLists.txt",
     "build_support.py",
+    "csrc/kernels/dispatch/dispatch.cpp",
+    "csrc/kernels/dispatch/fm_primary.hpp",
+    "csrc/kernels/dispatch/fm_simt.hpp",
+    "csrc/kernels/dispatch/wqe_cache.hpp",
+    "csrc/kernels/combine/combine.cpp",
 )
-COPY_PATHS = ("scripts/build_shmem.py", "scripts/record_shmem_sdk.py", "cmake/ShmemDoorbell.cmake")
+COPY_PATHS = (
+    "scripts/build_shmem.py",
+    "scripts/record_shmem_sdk.py",
+    "cmake/ShmemDoorbell.cmake",
+    "csrc/kernels/dispatch/udma_live_address.hpp",
+)
+
+
+def adapt_udma_calls(original):
+    """Keep live framework addresses distinct from SHMEM's new symmetric-MR inputs."""
+    result = dict(original)
+    renames = {
+        "aclshmemi_udma_fill_sqe_base_ctx<": "ascend_deepep::FillLiveUdmaSqeBase<",
+        "aclshmemi_udma_stage_send_wqe<": "ascend_deepep::StageLiveUdmaWqe<",
+        "aclshmemi_udma_submit_send_wqes<": "ascend_deepep::SubmitLiveUdmaWqes<",
+    }
+    for path in TEXT_PATHS:
+        if path.startswith("csrc/kernels/dispatch/"):
+            text = result[path]
+            for before, after in renames.items():
+                text = text.replace(before, after)
+            if path.endswith("/dispatch.cpp") and '#include "udma_live_address.hpp"' not in text:
+                text = replace_once(text, '#include "shmem.h"', '#include "shmem.h"\n#include "udma_live_address.hpp"')
+            result[path] = text
+    path = "csrc/kernels/combine/combine.cpp"
+    before = "auto* remote = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(dst, target));"
+    after = "auto* remote = reinterpret_cast<__gm__ uint8_t*>(dst);"
+    if after not in result[path]:
+        result[path] = replace_once(result[path], before, after)
+    return result
 
 
 def git(*args, root=ROOT):
@@ -33,7 +67,7 @@ def replace_once(text, before, after):
 
 def overlay(original, payload):
     """Transform dependency/build integration only; do not copy newer algorithms."""
-    result = dict(original)
+    result = adapt_udma_calls(original)
     lock = json.loads(result["dependencies.lock.json"])
     lock["shmem"] = json.loads(payload["dependencies.lock.json"])["shmem"]
     result["dependencies.lock.json"] = json.dumps(lock, indent=2) + "\n"
