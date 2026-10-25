@@ -13,8 +13,9 @@ __aicore__ inline void FillLiveUdmaSqeBase(SqePtr sqe, __gm__ uint8_t* target, _
 {
     static_assert(Op == aclshmemi_udma_opcode_t::UDMA_OP_WRITE);
     static_assert(AscendC::IsSameType<SqePtr, __ubuf__ aclshmemi_sqe_ctx_t*>::value);
-    auto* heap = reinterpret_cast<__gm__ uint8_t*>(aclshmemi_get_state()->heap_base);
-    const aclshmemi_udma_addr_ctx_t addresses{reinterpret_cast<uint64_t>(heap), remote->addr};
+    const uint64_t heap_address = reinterpret_cast<uint64_t>(aclshmemi_get_state()->heap_base);
+    auto* heap = reinterpret_cast<__gm__ uint8_t*>(heap_address);
+    const aclshmemi_udma_addr_ctx_t addresses{heap_address, remote->addr};
     aclshmemi_udma_fill_sqe_base_ctx<T, Op, SqePtr, Config>(sqe, heap, remote, head, addresses);
     reinterpret_cast<__ubuf__ uint64_t*>(sqe)[5] = reinterpret_cast<uint64_t>(target);
 }
@@ -25,7 +26,8 @@ __aicore__ inline void StageLiveUdmaWqe(__gm__ uint8_t* target, __gm__ uint8_t* 
 {
     static_assert(Op == aclshmemi_udma_opcode_t::UDMA_OP_WRITE);
     const uint32_t pending = state.pending_count;
-    auto* heap = reinterpret_cast<__gm__ uint8_t*>(aclshmemi_get_state()->heap_base);
+    const uint64_t heap_address = reinterpret_cast<uint64_t>(aclshmemi_get_state()->heap_base);
+    auto* heap = reinterpret_cast<__gm__ uint8_t*>(heap_address);
     aclshmemi_udma_stage_send_wqe<T, Op, Config>(heap, source, peer, qp, bytes, scratch, state);
     auto* words = reinterpret_cast<__ubuf__ uint64_t*>(scratch + pending * ACLSHMEM_UDMA_DATA_MOVER_WQE_SIZE);
     words[5] = reinterpret_cast<uint64_t>(target);

@@ -87,3 +87,19 @@ def test_live_and_symmetric_wqe_addresses_with_pinned_sdk(tmp_path, debug):
     assert result.returncode == 0, result.stdout + result.stderr
     result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_adapters_preserve_distinct_device_address_spaces(tmp_path):
+    compiler = shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("Clang required to enforce distinct pointer address spaces")
+    fixture = Path(__file__).with_name("shmem_udma_address_space_test.cpp")
+    command = [compiler, "-std=c++17", "-iquote", str(ROOT), "-c", str(fixture), "-o", str(tmp_path / "spaces.o")]
+    result = subprocess.run(command, capture_output=True, encoding="utf-8", errors="replace", timeout=90)
+    assert result.returncode == 0, result.stdout + result.stderr
+    # Ensure this compiler actually rejects the conversion that Bisheng rejected.
+    invalid = subprocess.run(
+        command + ["-DTEST_ILLEGAL_CAST=1"], capture_output=True, encoding="utf-8", errors="replace", timeout=90
+    )
+    assert invalid.returncode != 0
+    assert "reinterpret_cast" in invalid.stderr and "not allowed" in invalid.stderr
