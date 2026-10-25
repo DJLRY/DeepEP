@@ -34,6 +34,12 @@ bash experiments/megamoe/scripts/run_bs32.sh perf --perf-method legacy --warmup 
 准备脚本会在 SHMEM 的 `project()` 后用 Python 检测的主机架构修正 SDK 路径，且保留原生编译模式。
 更新脚本后执行上面的 `build --rebuild-shmem --errors-only`，清除上次失败的构建缓存后重试。
 
+如果后续在 `fm_primary.hpp`、`fm_simt.hpp` 或 `wqe_cache.hpp` 报
+`aclshmemi_udma_fill_sqe_base_ctx` 需要 5 个参数，则还缺少 Device API 适配。
+新 SHMEM 的内部 WQE 构造接口会转换对称堆地址；Dispatch 的 live VA 通过专用适配保留原值，
+Combine 则向 SDK 传入本地对称地址，由 SDK 转换到对端 MR。更新当前分支后运行
+`build --errors-only` 即可复用已成功构建的新 SHMEM SDK。
+
 ## 历史 commit：保留原 SHA，应用依赖适配
 
 Git commit 的内容不可原地修改。直接 checkout 旧 SHA 仍会得到旧的 SHMEM 固定版本。
@@ -60,7 +66,7 @@ bash experiments/megamoe/scripts/run_bs32.sh run --config "$BS32_CONFIG"
 bash experiments/megamoe/scripts/run_bs32.sh perf --config "$BS32_CONFIG" --warmup 20 --iters 100
 ```
 
-脚本只更新 SHMEM 依赖、初始化 API、SDK 构建脚本与 doorbell 编译传递；不会复制新版算子、调度、
+脚本只更新 SHMEM 依赖、Host/Device API 适配、SDK 构建脚本与 doorbell 编译传递；不会复制新版算子、调度、
 通信协议或 benchmark 脚本。旧 commit 的计时方法、Exp 次数和参数支持也保留原样，比较数据时需核对一致。
 早于 BS32 脚本引入的 commit，依赖迁移仍适用，但须使用该版本原有的构建与测试入口。
 历史上已有的编译或算法缺陷不会由依赖迁移自动修复。

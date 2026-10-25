@@ -1583,7 +1583,8 @@ struct CrossPutBatch {
             else
                 ++direct_rows[lane];
         }
-        auto* remote = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(dst, target));
+        // SHMEM now converts this local symmetric address to the peer's MR.
+        auto* remote = reinterpret_cast<__gm__ uint8_t*>(dst);
         aclshmemi_udma_stage_send_wqe<uint8_t, aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kPayloadRoNoCqeConfig>(
             remote, src, target, 2U * owner + lane, row_bytes, scratch + lane * kWqeBatchScratchBytes, state[lane]);
         peer[lane] = target;

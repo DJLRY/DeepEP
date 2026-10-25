@@ -99,6 +99,15 @@ def test_all_historical_commits_accept_dependency_overlay():
             compile(files[name], name, "exec")
         assert not any(name.startswith("experiments/megamoe/csrc/") for name in files)
         assert not any(name.startswith("experiments/megamoe/scripts/") for name in files)
+        assert files == history.overlay(
+            files, {name: files[name] for name in (*history.COPY_PATHS, "dependencies.lock.json")}
+        )
+        for path in history.TEXT_PATHS:
+            if path.startswith("csrc/kernels/dispatch/"):
+                assert "aclshmemi_udma_fill_sqe_base_ctx<" not in files[path]
+                assert "aclshmemi_udma_stage_send_wqe<" not in files[path]
+                assert "aclshmemi_udma_submit_send_wqes<" not in files[path]
+        assert "aclshmem_ptr(dst, target)" not in files["csrc/kernels/combine/combine.cpp"]
 
 
 def test_history_worktree_preserves_commit_and_algorithms(tmp_path):
@@ -122,6 +131,16 @@ def test_history_worktree_preserves_commit_and_algorithms(tmp_path):
                 "attr.runtime_config.udma_shared_jetty = ACLSHMEM_CONFIG_ENABLED;",
                 'check(aclshmemx_set_shared_jetty(ACLSHMEM_DATA_OP_UDMA, true), "aclshmemx_set_shared_jetty");',
             )
+        if name.startswith("csrc/kernels/dispatch/") and name in history.TEXT_PATHS:
+            content = content.replace("ascend_deepep::FillLiveUdmaSqeBase<", "aclshmemi_udma_fill_sqe_base_ctx<")
+            content = content.replace("ascend_deepep::StageLiveUdmaWqe<", "aclshmemi_udma_stage_send_wqe<")
+            content = content.replace("ascend_deepep::SubmitLiveUdmaWqes<", "aclshmemi_udma_submit_send_wqes<")
+            content = content.replace('#include "udma_live_address.hpp"\n', "")
+        if name == "csrc/kernels/combine/combine.cpp":
+            content = content.replace(
+                "auto* remote = reinterpret_cast<__gm__ uint8_t*>(dst);",
+                "auto* remote = reinterpret_cast<__gm__ uint8_t*>(aclshmem_ptr(dst, target));",
+            )
         path.write_text(content, encoding="utf-8")
         original[name] = content
     algorithm = source / "experiments/megamoe/csrc/algorithm.cpp"
@@ -139,6 +158,7 @@ def test_history_worktree_preserves_commit_and_algorithms(tmp_path):
     pin = json.loads((ROOT / "dependencies.lock.json").read_text())["shmem"]["revision"]
     assert history.git("ls-files", "--stage", "third-party/shmem", root=output).startswith(f"160000 {pin}")
     assert "attr.runtime_config.udma_shared_jetty" in (output / "csrc/runtime/session.cpp").read_text()
+    assert "ascend_deepep::StageLiveUdmaWqe<" in (output / "csrc/kernels/dispatch/dispatch.cpp").read_text()
     with pytest.raises(ValueError, match="new directory"):
         history.prepare(revision, output, root=source)
     # Release only our temporary worktree registration; pytest owns its files.
