@@ -41,6 +41,7 @@ def test_build_passes_and_records_rdma_backend(tmp_path, monkeypatch, backend, m
     lock = {"shmem": {"revision": "pinned"}, "cann_version": "test", "target": "Ascend950"}
     (tmp_path / "dependencies.lock.json").write_text(json.dumps(lock))
     monkeypatch.setattr(module.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(module.platform, "machine", lambda: "x86_64")
     monkeypatch.setattr(module, "cann_version", lambda expected: {"Version": expected})
     monkeypatch.setattr(module, "source_patches", lambda path: [])
     monkeypatch.setattr(module.shutil, "which", lambda name: sys.executable)
@@ -60,6 +61,8 @@ def test_build_passes_and_records_rdma_backend(tmp_path, monkeypatch, backend, m
     assert len(calls) == 1
     assert calls[0][5:] == ([] if backend == "NONE" else ["-enable_rdma", "-rdma_backend", backend])
     assert identities[0]["build_info"]["rdma_backend"] == backend
+    assert "CMAKE_PROJECT_SHMEM_INCLUDE:FILEPATH=" in (source / "build/CMakeCache.txt").read_text()
+    assert 'set(CMAKE_SYSTEM_PROCESSOR "x86_64")' in (source / "build/deepep-host-processor.cmake").read_text()
     if backend == "HNS_1825":
         assert identities[0]["build_info"]["hns_1825_pi_on_chip"] == mode
         assert f"ACLSHMEMI_HNS_1825_PI_ON_CHIP:STRING={mode}" in (source / "build/CMakeCache.txt").read_text()

@@ -29,6 +29,11 @@ bash experiments/megamoe/scripts/run_bs32.sh perf --perf-method legacy --warmup 
 `--rebuild-shmem` 会清理该子模块的 `build/` 和 `install/` 并重建，避免旧头文件混入新 SDK。
 普通后续构建仍复用校验通过的 SDK。构建机需要原有 CANN 9.2.0 与 Torch 环境。
 
+如果 `runtime/kernel.h` 明明存在，编译参数却含有 `libtinfo.so.6: no version information available`
+或错误的 `third-party/shmem/x86_64-linux/...` 路径，是 shell 警告污染了 CMake 的架构检测。
+准备脚本会在 SHMEM 的 `project()` 后用 Python 检测的主机架构修正 SDK 路径，且保留原生编译模式。
+更新脚本后执行上面的 `build --rebuild-shmem --errors-only`，清除上次失败的构建缓存后重试。
+
 ## 历史 commit：保留原 SHA，应用依赖适配
 
 Git commit 的内容不可原地修改。直接 checkout 旧 SHA 仍会得到旧的 SHMEM 固定版本。
