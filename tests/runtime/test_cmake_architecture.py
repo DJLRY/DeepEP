@@ -2,6 +2,7 @@
 
 """Exercise SDK architecture selection with real CMake, without a CANN compiler."""
 
+import importlib.util
 from pathlib import Path
 import shutil
 import subprocess
@@ -98,3 +99,71 @@ def test_device_makefile_ignores_contaminated_processor(tmp_path, architecture):
         assert "libtinfo" not in flags
         cache = (directory / "CMakeCache.txt").read_text(encoding="utf-8")
         assert f"ASCENDCL_LIBRARY:FILEPATH={arch_dir.as_posix()}/lib64/libascendcl.so" in cache
+
+
+@pytest.mark.parametrize("architecture", ["x86_64", "aarch64"])
+def test_shmem_hook_repairs_sdk_include_paths_after_project(tmp_path, monkeypatch, architecture):
+    ninja = shutil.which("ninja")
+    make = ninja or shutil.which("make")
+    if make is None:
+        pytest.skip("Ninja or Make is required")
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    spec = importlib.util.spec_from_file_location("shmem_arch_build", ROOT / "scripts/build_shmem.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    source = tmp_path / "shmem source"
+    source.mkdir()
+    cann = tmp_path / "cann"
+    include = cann / f"{architecture}-linux/pkg_inc/runtime"
+    (include / "runtime").mkdir(parents=True)
+    (include / "runtime/kernel.h").write_text("// CANN Runtime header\n")
+    (source / "probe.cpp").write_text('#include "runtime/kernel.h"\n')
+    (source / "CMakeLists.txt").write_text(
+        "cmake_minimum_required(VERSION 3.20)\nproject(FIXTURE NONE)\n"
+        # Initialize the native platform before injecting the Linux diagnostic.
+        f"set(CMAKE_SYSTEM_PROCESSOR [=[{CONTAMINATED}]=])\n"
+        "project(SHMEM NONE)\n"
+        f'set(ASCEND_HOME_PATH "{cann.as_posix()}")\n'
+        # Match upstream's unquoted architecture-dependent include expression.
+        "include_directories(${ASCEND_HOME_PATH}/${CMAKE_SYSTEM_PROCESSOR}-linux/pkg_inc/runtime)\n"
+        "get_directory_property(includes INCLUDE_DIRECTORIES)\n"
+        'file(WRITE "${CMAKE_BINARY_DIR}/includes.txt" "${includes}")\n'
+        'file(WRITE "${CMAKE_BINARY_DIR}/platform.txt" "${CMAKE_SYSTEM_PROCESSOR}|${CMAKE_CROSSCOMPILING}")\n',
+        encoding="utf-8",
+    )
+
+    def configure(directory):
+        command = [
+            CMAKE,
+            "-S",
+            str(source),
+            "-B",
+            str(directory),
+            "-G",
+            "Ninja" if ninja else "Unix Makefiles",
+            f"-DCMAKE_MAKE_PROGRAM={Path(make).as_posix()}",
+        ]
+        result = subprocess.run(command, capture_output=True, encoding="utf-8", errors="replace")
+        assert result.returncode == 0, result.stdout + result.stderr
+        return (directory / "includes.txt").read_text(encoding="utf-8")
+
+    # Prove that the fixture reproduces the server's broken path without the hook.
+    assert "libtinfo" in configure(source / "baseline")
+    module.seed_cmake_cache(source, architecture, {"hns_1825_pi_on_chip": 1})
+    directory = source / "build"
+    for _ in range(2):
+        command = configure(directory).replace("\\", "/")
+        assert command == include.as_posix()
+        assert "libtinfo" not in command
+        assert (directory / "platform.txt").read_text() == f"{architecture}|FALSE"
+
+
+@pytest.mark.parametrize("processor", ["", CONTAMINATED, "../x86_64", "x86_64;other"])
+def test_shmem_hook_rejects_invalid_architecture_before_writing(tmp_path, monkeypatch, processor):
+    monkeypatch.syspath_prepend(str(ROOT / "scripts"))
+    spec = importlib.util.spec_from_file_location("shmem_arch_build", ROOT / "scripts/build_shmem.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    with pytest.raises(ValueError, match="Invalid host processor"):
+        module.seed_cmake_cache(tmp_path, processor, {})
+    assert not (tmp_path / "build").exists()
