@@ -54,15 +54,12 @@ int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
 {
     assert(attr->n_pes == expected_world && attr->local_mem_size == expected_bytes);
     assert(attr->option_attr.data_op_engine_type == (ACLSHMEM_DATA_OP_MTE | qp_engine));
+    assert(attr->runtime_config.udma_shared_jetty ==
+           (qp_engine == ACLSHMEM_DATA_OP_UDMA ? ACLSHMEM_CONFIG_ENABLED : ACLSHMEM_CONFIG_DEFAULT));
     if (init_status == 0) {
         initialized = 2;
     }
     return init_status;
-}
-int aclshmemx_set_shared_jetty(data_op_engine_type_t engine, bool enabled)
-{
-    assert(engine == ACLSHMEM_DATA_OP_UDMA && enabled);
-    return 0;
 }
 int aclshmemx_set_qp_num(data_op_engine_type_t engine, uint32_t count)
 {

@@ -134,6 +134,8 @@ CATLASS 只拉取本仓使用的 C++ 头文件所在仓库，不递归下载 DSL
 已激活 Conda 时，入口会在 Python 启动前优先使用该环境的运行库。
 已有 SDK 可用 `SHMEM_ROOT`、`CATLASS_ROOT` 指定；已有子模块须保持干净且版本与[依赖锁文件](../../dependencies.lock.json)一致。
 需要重建仓内 SHMEM 时，停止使用该 SDK 的作业后传 `--rebuild-shmem`。
+HNS1825 新固件适配固定到 SHMEM !944 合入版本；当前分支重建与历史 commit 兼容迁移见
+[SHMEM !944 复测说明](../../docs/shmem-944.md)。
 wheel 位于 `dist/build-*/`；运行前按构建输出设置 SHMEM 的 `LD_LIBRARY_PATH`。
 基础包的 `pip wheel` 默认关闭 MegaMoE，详见[构建文档](../../docs/build.md)。
 

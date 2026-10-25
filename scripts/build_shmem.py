@@ -53,6 +53,12 @@ def source_patches(source):
 def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=False, rdma_backend="NONE"):
     if rdma_backend not in {"NONE", "XSCALE", "HNS_1825"}:
         raise ValueError("rdma_backend must be NONE, XSCALE or HNS_1825")
+    # New HNS1825 firmware requires PI-on-chip. Make this reproducible, including
+    # builds on hosts where hinicadm5 cannot inspect the deployment NICs.
+    doorbell = os.environ.get("DEEPEP_HNS_1825_PI_ON_CHIP", "1")
+    if doorbell not in {"0", "1"}:
+        raise ValueError("DEEPEP_HNS_1825_PI_ON_CHIP must be 0 or 1")
+    mode_info = {"hns_1825_pi_on_chip": int(doorbell)} if rdma_backend == "HNS_1825" else {}
     if platform.system() != "Linux":
         raise RuntimeError("SHMEM compilation requires Linux and the pinned CANN SDK")
     root = Path(root).resolve()
@@ -83,7 +89,7 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
     if not jobs.isdecimal() or not 1 <= int(jobs) <= 64:
         raise ValueError("CMAKE_BUILD_PARALLEL_LEVEL must be in [1, 64]")
 
-    # 上游脚本会清空 build/install，并生成 ci 打包产物；禁止跳转到其他目录。
+    # Build/install and upstream packaging outputs must stay in this checkout.
     for name in ("build", "install", "ci", "3rdparty"):
         path = source / name
         if path.resolve() != path:
@@ -97,6 +103,7 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
             "target": lock["target"],
             "source_patches": patches,
             "rdma_backend": rdma_backend,
+            **mode_info,
         }
         # SDKs recorded before the RoCE option are MTE-only builds.
         recorded_build = dict(identity.get("build", {}))
@@ -120,8 +127,25 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
             "SHMEM build/install already exists; reuse its SDK, or stop users of that SDK "
             "and pass --rebuild to regenerate it (then rebuild dependent wheels)"
         )
+    if rebuild:
+        # Upstream now installs incrementally. Remove generated outputs so old
+        # headers and an old SDK manifest cannot survive a revision change.
+        for name in ("build", "install"):
+            generated = source / name
+            if generated.resolve() != source / name:
+                raise RuntimeError(f"Refusing to clear SHMEM output outside its checkout: {generated}")
+            if generated.exists():
+                shutil.rmtree(generated)
+    if mode_info:
+        # build.sh offers no -D passthrough, but preserves this non-script-managed
+        # CMake cache entry. Seed only the explicit option, then let it configure.
+        cache = source / "build/CMakeCache.txt"
+        cache.parent.mkdir(exist_ok=True)
+        cache.write_text(f"ACLSHMEMI_HNS_1825_PI_ON_CHIP:STRING={doorbell}\n", encoding="utf-8")
     print(
-        f"[SHMEM] source={revision} CANN={version['Version']} target={lock['target']} RDMA={rdma_backend}", flush=True
+        f"[SHMEM] source={revision} CANN={version['Version']} target={lock['target']} "
+        f"RDMA={rdma_backend} doorbell={mode_info}",
+        flush=True,
     )
     if patches:
         print(f"[SHMEM] Building local source modifications: {json.dumps(patches)}", flush=True)
@@ -160,6 +184,7 @@ def prepare(root=ROOT, *, rebuild=False, if_needed=False, allow_local_changes=Fa
             "target": lock["target"],
             "source_patches": patches,
             "rdma_backend": rdma_backend,
+            **mode_info,
         },
     )
     print(f"[SHMEM] SDK identity: {manifest}", flush=True)

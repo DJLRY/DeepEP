@@ -13,6 +13,13 @@ import json
 from pathlib import Path
 
 
+def validate_doorbell(build_info):
+    if build_info and build_info.get("rdma_backend") == "HNS_1825":
+        value = build_info.get("hns_1825_pi_on_chip")
+        if type(value) is not int or value not in (0, 1):
+            raise ValueError("HNS_1825 SDK must record hns_1825_pi_on_chip as integer 0 or 1")
+
+
 def record(sdk, revision, *, build_info=None):
     sdk = Path(sdk).resolve()
     lock = json.loads((Path(__file__).resolve().parents[1] / "dependencies.lock.json").read_text())
@@ -26,6 +33,7 @@ def record(sdk, revision, *, build_info=None):
             raise ValueError(f"SDK public header mismatch: {relative}")
     if build_info is not None and build_info.get("rdma_backend", "NONE") not in {"NONE", "XSCALE", "HNS_1825"}:
         raise ValueError("SDK rdma_backend must be NONE, XSCALE or HNS_1825")
+    validate_doorbell(build_info)
     files = sorted(
         path
         for directory in ("include", "src")
@@ -57,6 +65,7 @@ def check(sdk):
         raise ValueError("SDK source revision must match dependencies.lock.json")
     if recorded.get("build", {}).get("rdma_backend", "NONE") not in {"NONE", "XSCALE", "HNS_1825"}:
         raise ValueError("SDK rdma_backend must be NONE, XSCALE or HNS_1825")
+    validate_doorbell(recorded.get("build"))
     for relative, expected in lock["header_sha256_lf"].items():
         data = (sdk / "include" / relative).read_bytes().replace(b"\r\n", b"\n")
         if hashlib.sha256(data).hexdigest() != expected:
@@ -86,11 +95,13 @@ if __name__ == "__main__":
         default="NONE",
         help="SDK provider's RoCE backend attestation when recording an SDK",
     )
+    parser.add_argument("--hns-1825-pi-on-chip", type=int, choices=(0, 1), help="HNS_1825 SDK build setting")
     args = parser.parse_args()
-    if args.check and args.rdma_backend != "NONE":
-        parser.error("--rdma-backend is only used with --revision")
-    print(
-        check(args.sdk)
-        if args.check
-        else record(args.sdk, args.revision, build_info={"rdma_backend": args.rdma_backend})
-    )
+    if args.check and (args.rdma_backend != "NONE" or args.hns_1825_pi_on_chip is not None):
+        parser.error("SDK build settings are only used with --revision")
+    build_info = {"rdma_backend": args.rdma_backend}
+    if args.hns_1825_pi_on_chip is not None:
+        if args.rdma_backend != "HNS_1825":
+            parser.error("--hns-1825-pi-on-chip requires --rdma-backend HNS_1825")
+        build_info["hns_1825_pi_on_chip"] = args.hns_1825_pi_on_chip
+    print(check(args.sdk) if args.check else record(args.sdk, args.revision, build_info=build_info))
