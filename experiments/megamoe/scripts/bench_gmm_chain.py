@@ -14,6 +14,7 @@ import json
 import math
 from pathlib import Path
 import statistics
+import subprocess
 import sys
 import tempfile
 import traceback
@@ -34,14 +35,28 @@ from deep_ep_experimental.megamoe.reference import (  # noqa: E402
 )
 
 
+def positive_values(value):
+    try:
+        values = [int(part.strip()) for part in value.split(",")]
+        if not values or min(values) < 1 or len(set(values)) != len(values):
+            raise ValueError
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("Use distinct positive integers separated by commas") from error
+    return values
+
+
 def arguments(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--device", type=int, default=0, help="Physical NPU index in this process")
     parser.add_argument(
         "--rank", type=int, default=0, help="Logical expert-owner rank whose inputs/weights to reproduce"
     )
-    parser.add_argument("--ep-size", type=int, default=32)
-    parser.add_argument("--bs", type=int, default=32, help="Original tokens per source rank, NOT the GMM row count")
+    ep = parser.add_mutually_exclusive_group()
+    ep.add_argument("--ep-size", type=int, default=32)
+    ep.add_argument("--ep-sizes", type=positive_values, help="Sweep logical EP sizes, e.g. 16,32,64")
+    bs = parser.add_mutually_exclusive_group()
+    bs.add_argument("--bs", type=int, default=32, help="Original tokens per source rank, NOT the GMM row count")
+    bs.add_argument("--bs-values", type=positive_values, help="Sweep source BS values, e.g. 1,8,16,32,256")
     parser.add_argument("--hidden", type=int, default=3584)
     parser.add_argument("--intermediate", type=int, default=1280)
     parser.add_argument(
@@ -70,9 +85,10 @@ def arguments(argv=None):
         help="Print real routing counts/shapes without importing Torch or allocating weights",
     )
     args = parser.parse_args(argv)
-    if args.ep_size < 1 or args.experts < 1 or args.experts % args.ep_size:
+    ep_sizes = args.ep_sizes or [args.ep_size]
+    if args.experts < 1 or any(ep < 1 or args.experts % ep for ep in ep_sizes):
         parser.error("experts must be divisible by a positive ep-size")
-    if not 0 <= args.rank < args.ep_size or not 1 <= args.experts // args.ep_size <= 128:
+    if any(not 0 <= args.rank < ep or not 1 <= args.experts // ep <= 128 for ep in ep_sizes):
         parser.error("rank must be in [0,ep-size), with 1..128 local experts")
     if args.bs < 1 or not 1 <= args.topk <= args.experts:
         parser.error("bs must be positive and topk must be in [1,experts]")
@@ -81,6 +97,15 @@ def arguments(argv=None):
     if args.device < 0 or args.seed < 0 or args.warmup < 1 or args.iters < 1 or args.check_rows_per_expert < 0:
         parser.error("device/seed/check-rows-per-expert must be nonnegative; warmup/iters positive")
     return args
+
+
+def sweep_cases(args):
+    """Keep single-case defaults; plural arguments select the Cartesian product."""
+    return [
+        argparse.Namespace(**(vars(args) | dict(ep_size=ep, bs=bs, ep_sizes=None, bs_values=None)))
+        for ep in args.ep_sizes or [args.ep_size]
+        for bs in args.bs_values or [args.bs]
+    ]
 
 
 def case_config(args):
@@ -462,8 +487,200 @@ def run(args, config, routed, counts, coordinates, directory, report):
     print(summary_text, end="", flush=True)
 
 
+def case_command(args, output):
+    command = [sys.executable, "-I", str(Path(__file__).resolve())]
+    for name in (
+        "device",
+        "rank",
+        "ep_size",
+        "bs",
+        "hidden",
+        "intermediate",
+        "experts",
+        "topk",
+        "seed",
+        "routing",
+        "warmup",
+        "iters",
+        "mode",
+        "check_rows_per_expert",
+    ):
+        command.extend(["--" + name.replace("_", "-"), str(getattr(args, name))])
+    return command + ["--output", str(output)]
+
+
+def execute_case(command, log_path):
+    """Use a fresh process per shape to retire profiler/graph state and NPU memory."""
+    with log_path.open("w", encoding="utf-8") as log:
+        with subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+        ) as process:
+            try:
+                for line in process.stdout:
+                    log.write(line)
+                    log.flush()
+                    print(line, end="", flush=True)
+                return process.wait()
+            except BaseException:
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait()
+                raise
+
+
+def write_sweep_summary(directory, entries):
+    columns = [
+        "ep_size",
+        "source_bs",
+        "logical_rank",
+        "device",
+        "mode",
+        "status",
+        "local_experts",
+        "routed_rows",
+        "accuracy_passed",
+        "accuracy_policy",
+        "recorded_rounds",
+        "rounds",
+    ]
+    timings = [f"{metric}_{stat}" for metric in METRICS for stat in ("mean", "median", "min", "max")]
+    with (directory / "summary.csv").open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.DictWriter(stream, fieldnames=columns + timings + ["results_file", "log_file", "error"])
+        writer.writeheader()
+        for entry in entries:
+            writer.writerow({key: entry.get(key, "") for key in writer.fieldnames})
+    write_json(directory / "summary.json", dict(scope="single_npu_logical_expert_owner", cases=entries))
+    lines = [
+        "[GMM CHAIN SWEEP] Single NPU; logical EP shapes; mean kernel times in us (tail half).",
+        "EP   BS    M     Experts Status      GMM1+SwiGLU   GMM2       Sum        Span       Gap",
+    ]
+    for entry in entries:
+        values = [f"{entry[f'{metric}_mean']:.3f}" if f"{metric}_mean" in entry else "-" for metric in METRICS]
+        lines.append(
+            f"{entry['ep_size']:<4} {entry['source_bs']:<5} {entry.get('routed_rows', '-'):<5} "
+            f"{entry.get('local_experts', '-'):<7} {entry['status']:<11} "
+            + " ".join(f"{value:<10}" for value in values)
+        )
+    lines.extend(
+        [
+            "GMM1 includes SwiGLU and MX quantization; Span includes the gap between the two kernels.",
+            "No Dispatch/Combine; EP does not request that many physical devices.",
+            f"Full per-case status, validation, logs and timings: {directory / 'summary.json'}",
+        ]
+    )
+    (directory / "summary.txt").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def run_sweep(args):
+    cases = sweep_cases(args)
+    if args.dry_run:
+        plans = []
+        for case in cases:
+            config = case_config(case)
+            _, counts, _ = routed_input(config, case.ep_size, case.rank, case.bs, case.routing)
+            plans.append(dict(config=config, plan=describe(case, counts)))
+        print(json.dumps(dict(case_count=len(plans), cases=plans), indent=2))
+        return 0
+    args.output.mkdir(parents=True, exist_ok=True)
+    directory = Path(tempfile.mkdtemp(prefix="sweep_", dir=args.output)).resolve()
+    entries = [
+        dict(
+            ep_size=case.ep_size,
+            source_bs=case.bs,
+            logical_rank=case.rank,
+            device=case.device,
+            mode=case.mode,
+            local_experts=case.experts // case.ep_size,
+            status="pending",
+            log_file=str(directory / f"ep{case.ep_size}_bs{case.bs}" / "console.log"),
+        )
+        for case in cases
+    ]
+    write_json(
+        directory / "manifest.json",
+        dict(
+            arguments={key: str(value) if isinstance(value, Path) else value for key, value in vars(args).items()},
+            source_sha256=hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+            case_count=len(cases),
+            scope="single_npu_logical_expert_owner",
+        ),
+    )
+    write_sweep_summary(directory, entries)
+    print(f"[SWEEP] {len(cases)} cases; output={directory}", flush=True)
+    for index, (case, entry) in enumerate(zip(cases, entries), start=1):
+        case_dir = Path(entry["log_file"]).parent
+        case_dir.mkdir()
+        entry.update(status="running", command=case_command(case, case_dir))
+        write_sweep_summary(directory, entries)
+        print(f"[CASE {index}/{len(cases)}] EP{case.ep_size} BS{case.bs}; log={entry['log_file']}", flush=True)
+        try:
+            code = execute_case(entry["command"], Path(entry["log_file"]))
+            entry["returncode"] = code
+            reports = list(case_dir.glob("rank_*/results.json"))
+            if len(reports) != 1:
+                raise ValueError(f"Expected one case report, found {len(reports)}; process exit={code}")
+            entry["results_file"] = str(reports[0])
+            report = json.loads(reports[0].read_text(encoding="utf-8"))
+            if code != 0 or report.get("status") != "complete":
+                raise ValueError(f"Case failed (exit={code}); inspect {reports[0]} and console.log")
+            plan, summary = report["plan"], report["summary"]
+            if (plan["ep_size"], plan["source_bs"], plan["logical_rank"], plan["mode"]) != (
+                case.ep_size,
+                case.bs,
+                case.rank,
+                case.mode,
+            ) or summary["recorded_rounds"] != case.iters:
+                raise ValueError("Case report does not match the requested scenario/iterations")
+            accuracy = report["accuracy"]["passed"]
+            if accuracy is False:
+                raise ValueError("Case numerical validation failed")
+            timings = {
+                f"{metric}_{stat}": summary[metric][stat]
+                for metric in METRICS
+                for stat in ("mean", "median", "min", "max")
+            }
+            if any(not math.isfinite(value) or value < 0 for value in timings.values()):
+                raise ValueError("Case report contains invalid timings")
+            entry.update(
+                status="complete",
+                routed_rows=plan["routed_rows"],
+                expert_counts=plan["expert_counts"],
+                accuracy_passed=accuracy,
+                accuracy_policy=report["accuracy"]["policy"],
+                recorded_rounds=summary["recorded_rounds"],
+                rounds=summary["rounds"],
+                **timings,
+            )
+        except Exception as error:
+            entry.update(status="failed", error=f"{type(error).__name__}: {error}")
+            print(f"[FAILED] EP{case.ep_size} BS{case.bs}: {error}", flush=True)
+        except KeyboardInterrupt:
+            entry.update(status="interrupted", error="User interrupted the sweep")
+            raise
+        finally:
+            write_sweep_summary(directory, entries)
+    print((directory / "summary.txt").read_text(encoding="utf-8"), end="", flush=True)
+    failures = sum(entry["status"] != "complete" for entry in entries)
+    print(
+        f"[{'FAILED' if failures else 'DONE'}] {len(cases) - failures}/{len(cases)} cases completed: {directory}",
+        flush=True,
+    )
+    return 1 if failures else 0
+
+
 def main(argv=None):
     args = arguments(argv)
+    if args.ep_sizes is not None or args.bs_values is not None:
+        return run_sweep(args)
     config = case_config(args)
     routed, counts, coordinates = routed_input(config, args.ep_size, args.rank, args.bs, args.routing)
     plan = describe(args, counts)
@@ -496,4 +713,4 @@ def main(argv=None):
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

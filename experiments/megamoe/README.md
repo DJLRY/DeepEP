@@ -818,7 +818,7 @@ python -m deep_ep_experimental.megamoe.timer /实际结果目录/bs_96/bs_96/tim
 
 所有 BS 执行成功后，终端输出 `[DONE] all nodes completed`；执行或报告校验失败时返回非零退出码。
 
-### 融合 GMM1 → GMM2 的独立性能测试（当前 BS32 场景）
+### 融合 GMM1 → GMM2 的独立性能测试（单场景与 EP/BS 扫参）
 
 [`scripts/bench_gmm_chain.py`](scripts/bench_gmm_chain.py) 在单张 Ascend950 上测试：
 `npu_grouped_matmul_swiglu_quant_v2`（GMM1 + SwiGLU + MX 量化）→ `npu_grouped_matmul`（GMM2）。
@@ -846,13 +846,43 @@ python experiments/megamoe/scripts/bench_gmm_chain.py --device 0 --mode graph
 
 # 复现逻辑 rank30 的输入和权重，仍只需一张物理卡。
 python experiments/megamoe/scripts/bench_gmm_chain.py --device 0 --rank 30 --iters 200
+
+# 一次跑完 EP16/32/64 × BS1/8/16/32/256，共15个场景。
+python experiments/megamoe/scripts/bench_gmm_chain.py \
+  --device 0 --ep-sizes 16,32,64 --bs-values 1,8,16,32,256 \
+  --warmup 20 --iters 100
+
+# 同一批场景使用 NPUGraph replay；也可加 --dry-run 只预览形状。
+python experiments/megamoe/scripts/bench_gmm_chain.py \
+  --device 0 --ep-sizes 16,32,64 --bs-values 1,8,16,32,256 --mode graph
 ```
 
 `--device` 选择进程可见的 NPU，`--rank` 选择逻辑专家归属，两者互不绑定。
 可通过 `--ep-size/--bs/--hidden/--intermediate/--experts/--topk/--routing/--seed` 调整场景。
 此脚本只测路由专家，S固定为0。测试期间应让所选设备空闲。
 
-每次创建独立的 `benchmark-runs/gmm-chain/rank_<r>_<随机编号>/`，可通过 `--output` 更改父目录。
+`--ep-sizes` 和 `--bs-values` 执行笛卡尔积，也可以只传其中一项，例如
+`--ep-size 16 --bs-values 1,8,16,32,256`。复数参数与对应单数参数互斥；所有场景在启动前验证专家整除和逻辑 rank 范围。
+未传复数参数时，保持原来的 EP32/BS32 单场景行为。
+默认 balanced 路由下，各逻辑 rank 的专家行数分布相同；默认 `--rank 0` 即复现这种计算形状。
+每卡专家数分别为 `384/EP = 24/12/6`，GMM 总行数为 `BS × TopK`：
+
+| 每个源 rank 的 BS | 1 | 8 | 16 | 32 | 256 |
+| --- | --- | --- | --- | --- | --- |
+| 每卡 GMM 总行数 M（TopK8） | 8 | 64 | 128 | 256 | 2048 |
+
+每个专家有 `floor(M / 本卡专家数)` 或多1行。BS1/EP16 有16个空专家，BS1/EP32 有4个空专家；
+group list 保留这些0，不删除专家或扩充 token 数。
+
+批量测试在同一张卡上顺序启动独立子进程，每个场景结束后释放设备、graph和profiler资源。
+父目录为 `benchmark-runs/gmm-chain/sweep_<随机编号>/`，每个场景的结果放在
+`ep<EP>_bs<BS>/rank_<r>_<随机编号>/`，同级 `console.log` 保留该场景完整日志。
+顶层 `summary.txt` 提供15场景对比表；`summary.csv` 提供全部5项计时的 mean/median/min/max，
+以及EP、BS、M、专家数、精度状态、采样轮次、结果路径；`summary.json` 另保存逐专家行数、命令和失败原因。
+每完成一个场景即更新汇总。单场景失败会保留日志、继续后续场景，最后返回非零退出码；
+失败或未完成场景的计时留空，不参与性能比较。每次扫参都会创建新目录，避免读到上次的结果。
+
+单场景每次创建独立的 `benchmark-runs/gmm-chain/rank_<r>_<随机编号>/`，可通过 `--output` 更改父目录。
 其中 `results.json` 保存场景、精度报告、输入/权重摘要、软件版本、全部采样及汇总；
 `summary.txt` 是可读摘要，`profiler/` 保留原始 trace 和 `kernel_details*.csv`。
 按现有性能测试口径取正式采样的后半段（奇数向上取整），每项报告 mean/median/min/max，单位均为微秒：
@@ -875,7 +905,7 @@ python experiments/megamoe/scripts/bench_gmm_chain.py --device 0 --rank 30 --ite
 跳过结果会标为 `explicitly_skipped`，不能视作精度已验证。Graph 模式还会在计时前检查 replay 与 eager 输出一致。
 
 计时排除 Dispatch、Combine、路由权重乘法、输入量化、权重转换和 CPU 校验。
-这里得到的是单卡计算链基线，不是32卡同时运行的统计；与已有 Dispatch/Combine 数据相加可作分段估算，
+这里得到的是单卡计算链基线，不是 EP16/32/64 张卡同时运行的统计；与已有 Dispatch/Combine 数据相加可作分段估算，
 实际端到端 MoE 耗时仍需用一致的数据、执行模式和计时范围另行测量。
 
 ## 4. 测试与验证范围

@@ -6,6 +6,7 @@ import csv
 import importlib.util
 import json
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import numpy as np
@@ -40,6 +41,183 @@ def test_default_routing_reproduces_actual_dispatch_rows(rank):
     plan = chain.describe(args, counts)
     assert plan["gmm1"] == dict(m=256, k=3584, n=2560)
     assert plan["gmm2"] == dict(m=256, k=1280, n=3584)
+
+
+@pytest.mark.parametrize("ep", [16, 32, 64])
+@pytest.mark.parametrize("bs", [1, 8, 16, 32, 256])
+def test_requested_scenarios_keep_real_row_counts_and_empty_experts(ep, bs):
+    local, rows = 384 // ep, bs * 8
+    for rank in (0, ep - 1):
+        args = chain.arguments(["--ep-size", str(ep), "--bs", str(bs), "--rank", str(rank), "--hidden", "64"])
+        x, counts, coords = chain.routed_input(chain.case_config(args), ep, rank, bs, "balanced")
+        expected = [rows // local + (expert < rows % local) for expert in range(local)]
+        assert counts.tolist() == expected
+        assert x.shape == (rows, 64) and coords.shape == (rows, 3)
+        assert len(set(map(tuple, coords))) == rows
+        plan = chain.describe(args, counts)
+        assert plan["local_experts"] == local and plan["routed_rows"] == rows
+        assert plan["group_list"] == expected
+        if bs == 1 and ep in (16, 32):
+            assert np.count_nonzero(counts == 0) == local - 8
+
+
+def test_sweep_dry_run_covers_cartesian_product_without_writes(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(chain, "make_weights", lambda *a: pytest.fail("dry-run allocated weights"))
+    monkeypatch.setattr(chain, "execute_case", lambda *a: pytest.fail("dry-run launched a process"))
+    output = tmp_path / "must-not-exist"
+    assert (
+        chain.main(
+            [
+                "--ep-sizes",
+                "16,32,64",
+                "--bs-values",
+                "1,8,16,32,256",
+                "--dry-run",
+                "--hidden",
+                "64",
+                "--output",
+                str(output),
+            ]
+        )
+        == 0
+    )
+    report = json.loads(capsys.readouterr().out)
+    assert report["case_count"] == 15
+    assert [(case["plan"]["ep_size"], case["plan"]["source_bs"]) for case in report["cases"]] == [
+        (ep, bs) for ep in (16, 32, 64) for bs in (1, 8, 16, 32, 256)
+    ]
+    assert not output.exists()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        ["--ep-sizes", "16,0"],
+        ["--ep-sizes", "16,16"],
+        ["--ep-sizes", "16,31"],
+        ["--ep-sizes", "16,32", "--rank", "16"],
+        ["--bs-values", "1,-8"],
+        ["--bs-values", "1,,8"],
+        ["--bs-values", ""],
+        ["--bs-values", "1,1"],
+        ["--ep-size", "16", "--ep-sizes", "32,64"],
+        ["--bs", "32", "--bs-values", "1,8"],
+    ],
+)
+def test_invalid_sweep_fails_before_any_device_work(options):
+    with pytest.raises(SystemExit):
+        chain.arguments(options)
+
+
+@pytest.mark.parametrize("failure", [None, "child", "missing", "mismatch", "accuracy", "timing"])
+def test_sweep_runs_every_case_and_keeps_failures_out_of_timings(tmp_path, monkeypatch, failure):
+    calls = []
+
+    def execute(command, log_path):
+        args = chain.arguments(command[3:])
+        calls.append((args.ep_size, args.bs))
+        assert args.mode == "graph" and args.rank == 3 and args.device == 2
+        assert args.warmup == 3 and args.iters == 5 and args.check_rows_per_expert == 1
+        assert args.seed == 7 and args.hidden == 64 and args.intermediate == 128
+        assert args.experts == 384 and args.topk == 8 and args.routing == "balanced"
+        assert args.ep_sizes is None and args.bs_values is None
+        log_path.write_text("child console\n", encoding="utf-8")
+        bad = args.ep_size == 16 and args.bs == 8
+        if bad and failure == "missing":
+            return 0
+        directory = args.output / "rank_3_fresh"
+        directory.mkdir()
+        local, rows = args.experts // args.ep_size, args.bs * args.topk
+        counts = np.array([rows // local + (e < rows % local) for e in range(local)])
+        plan = chain.describe(args, counts)
+        pairs = [{metric: float(i + 1) for metric in chain.METRICS} for i in range(args.iters)]
+        report = dict(
+            status="complete", plan=plan, summary=chain.summarize(pairs), accuracy=dict(passed=True, policy="sampled")
+        )
+        if bad:
+            if failure == "child":
+                report["status"] = "failed"
+            elif failure == "mismatch":
+                plan["source_bs"] = 999
+            elif failure == "accuracy":
+                report["accuracy"]["passed"] = False
+            elif failure == "timing":
+                report["summary"]["gmm2_us"]["mean"] = -1
+        chain.write_json(directory / "results.json", report)
+        return 7 if bad and failure == "child" else 0
+
+    monkeypatch.setattr(chain, "execute_case", execute)
+    options = [
+        "--ep-sizes",
+        "16,32",
+        "--bs-values",
+        "1,8",
+        "--output",
+        str(tmp_path),
+        "--mode",
+        "graph",
+        "--rank",
+        "3",
+        "--device",
+        "2",
+        "--warmup",
+        "3",
+        "--iters",
+        "5",
+        "--check-rows-per-expert",
+        "1",
+        "--seed",
+        "7",
+        "--hidden",
+        "64",
+        "--intermediate",
+        "128",
+    ]
+    assert chain.main(options) == (0 if failure is None else 1)
+    assert calls == [(16, 1), (16, 8), (32, 1), (32, 8)]
+    directory = next(tmp_path.glob("sweep_*"))
+    report = json.loads((directory / "summary.json").read_text(encoding="utf-8"))
+    with (directory / "summary.csv").open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    assert len(rows) == len(report["cases"]) == 4
+    for index, (row, entry) in enumerate(zip(rows, report["cases"])):
+        if index == 1 and failure is not None:
+            assert entry["status"] == "failed" and entry["error"]
+            assert row["gmm2_us_mean"] == ""  # Never turn a failed scenario into a zero timing.
+        else:
+            assert entry["status"] == "complete" and entry["rounds"] == 3
+            assert entry["accuracy_passed"] is True
+            assert float(row["gmm2_us_mean"]) == 4
+            assert Path(entry["results_file"]).is_file()
+    # A second invocation gets independent directories; no stale reports are reused.
+    chain.main(options)
+    assert len(list(tmp_path.glob("sweep_*"))) == 2
+
+
+def test_interrupted_sweep_records_unfinished_cases(tmp_path, monkeypatch):
+    def interrupt(*args):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(chain, "execute_case", interrupt)
+    with pytest.raises(KeyboardInterrupt):
+        chain.main(["--ep-sizes", "16,32", "--output", str(tmp_path)])
+    report = json.loads(next(tmp_path.glob("sweep_*/summary.json")).read_text(encoding="utf-8"))
+    assert [entry["status"] for entry in report["cases"]] == ["interrupted", "pending"]
+
+
+@pytest.mark.parametrize("code", [0, 7])
+def test_child_console_streaming_preserves_output_and_exit_code(tmp_path, capsys, code):
+    log = tmp_path / "console.log"
+    command = [
+        sys.executable,
+        "-I",
+        "-c",
+        "import sys; print('child stdout', flush=True); "
+        f"print('child stderr', file=sys.stderr, flush=True); sys.exit({code})",
+    ]
+    assert chain.execute_case(command, log) == code
+    assert log.read_text(encoding="utf-8") == "child stdout\nchild stderr\n"
+    assert capsys.readouterr().out == log.read_text(encoding="utf-8")
 
 
 @pytest.mark.parametrize("routing", ["random", "skewed"])
