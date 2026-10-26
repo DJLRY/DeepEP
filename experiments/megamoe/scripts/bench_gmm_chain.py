@@ -9,6 +9,7 @@ not a distributed process. All data preparation and validation precede profiling
 
 import argparse
 import csv
+from decimal import Decimal, InvalidOperation
 import hashlib
 import json
 import math
@@ -283,10 +284,19 @@ def read_pairs(directory, iterations):
                 if kind is None:
                     raise ValueError(f"Unexpected kernel in two-op capture: {path}:{line}: {name}")
                 try:
-                    start, duration = (float(row[key]) for key in ("Start Time(us)", "Duration(us)"))
-                except (KeyError, ValueError) as error:
+                    # Epoch timestamps in microseconds can have a float ULP of
+                    # 0.25 us, exceeding our 0.01 us overlap tolerance. Keep the
+                    # CSV decimals intact until all differences are calculated.
+                    start, duration = (Decimal(row[key]) for key in ("Start Time(us)", "Duration(us)"))
+                except (KeyError, TypeError, InvalidOperation) as error:
                     raise ValueError(f"Invalid kernel timing at {path}:{line}") from error
-                if not math.isfinite(start) or not math.isfinite(duration) or duration <= 0:
+                if (
+                    not start.is_finite()
+                    or not duration.is_finite()
+                    or not math.isfinite(float(start))
+                    or not math.isfinite(float(duration))
+                    or duration <= 0
+                ):
                     raise ValueError(f"Non-finite/nonpositive kernel timing at {path}:{line}")
                 device = row.get("Device_id", row.get("Device ID"))
                 stream_id = row.get("Stream ID")
@@ -312,27 +322,40 @@ def read_pairs(directory, iterations):
     if len({k["start_us"] for k in kernels}) != len(kernels):
         raise ValueError("Duplicate kernel timestamps/exports")
     for previous, current in zip(kernels, kernels[1:]):
-        if current["start_us"] < previous["start_us"] + previous["duration_us"] - 0.01:
-            raise ValueError("Overlapping kernels on the captured stream")
+        gap = current["start_us"] - previous["start_us"] - previous["duration_us"]
+        if gap < Decimal("-0.01"):
+            raise ValueError(
+                f"Overlapping kernels on the captured stream: gap={gap} us (tolerance=0.01 us), "
+                f"device={current['device']}, stream={current['stream']}; "
+                f"{previous['file']}:{previous['row']} {previous['kind']} "
+                f"start={previous['start_us']} duration={previous['duration_us']} -> "
+                f"{current['file']}:{current['row']} {current['kind']} "
+                f"start={current['start_us']} duration={current['duration_us']}"
+            )
     pairs = []
     for index in range(iterations):
         first, second = kernels[2 * index : 2 * index + 2]
         if first["kind"] != "fused_gmm1" or second["kind"] != "gmm2":
             raise ValueError(f"Unexpected kernel ordering in round {index}: {first['name']} -> {second['name']}")
         gap = second["start_us"] - first["start_us"] - first["duration_us"]
-        if gap < -0.01:
-            raise ValueError(f"Overlapping dependent kernels in round {index}")
         pairs.append(
             dict(
                 iteration=index,
-                fused_gmm1_us=first["duration_us"],
-                gmm2_us=second["duration_us"],
-                kernel_sum_us=first["duration_us"] + second["duration_us"],
-                chain_span_us=second["start_us"] + second["duration_us"] - first["start_us"],
-                inter_kernel_gap_us=max(0.0, gap),
+                fused_gmm1_us=float(first["duration_us"]),
+                gmm2_us=float(second["duration_us"]),
+                kernel_sum_us=float(first["duration_us"] + second["duration_us"]),
+                chain_span_us=float(second["start_us"] - first["start_us"] + second["duration_us"]),
+                inter_kernel_gap_us=max(0.0, float(gap)),
+                inter_kernel_gap_raw_us=float(gap),
                 kernels=[first, second],
             )
         )
+    # Preserve numeric fields for existing consumers and exact strings for
+    # auditing. Never use the rounded absolute start_us for timing arithmetic.
+    for kernel in kernels:
+        for key in ("start_us", "duration_us"):
+            kernel[f"{key}_exact"] = str(kernel[key])
+            kernel[key] = float(kernel[key])
     return pairs
 
 

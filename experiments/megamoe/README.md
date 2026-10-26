@@ -897,6 +897,9 @@ group list 保留这些0，不删除专家或扩充 token 数。
 
 两个算子之间及正式轮次之间不插入 synchronize、Event、CPU 拷贝或额外量化。
 统计要求每轮恰好两个匹配的 kernel、处于同一设备同一 stream；发现额外 kernel、重复导出、缺失样本或时序异常会报错，保留原始数据供排查。
+时间差使用 CSV 十进制原值计算，避免大绝对时间戳转为 `float` 后丢失亚微秒精度。
+采样中的 `start_us_exact` / `duration_us_exact` 字符串保留精确值；`inter_kernel_gap_raw_us` 保留有符号间隙。
+重叠容差仍为0.01微秒，超过时报告具体间隙、设备/stream及两条记录的 CSV 行号；容差内的负间隙仅在 `inter_kernel_gap_us` 中记为0。
 若所用版本把一个算子展开为多个 kernel，需要根据该版本的 trace 调整归属解析后再统计。
 
 默认在计时前按每个非空专家抽取最多2行，与现有 NumPy `expert_forward` 比较；

@@ -3,6 +3,7 @@
 """CPU checks for benchmark inputs, actual tensor chaining, and timing boundaries."""
 
 import csv
+from decimal import Decimal
 import importlib.util
 import json
 from pathlib import Path
@@ -371,12 +372,69 @@ def test_capture_distinguishes_kernel_sum_from_chain_span(tmp_path):
     assert chain.summarize(pairs + [pairs[0]])["rounds"] == 2
 
 
+@pytest.mark.parametrize("offset", ["0", "1793000000000000"])
+def test_capture_preserves_small_gaps_at_large_absolute_timestamps(tmp_path, offset):
+    rows = capture_rows()
+    # Both within-pair and cross-round boundaries caused false overlap errors
+    # with absolute float timestamps. Sorting must also retain the CSV precision.
+    for row, start, duration in zip(
+        rows, ("0.126", "10.253", "15.380", "25.507"), ("10.126", "5.126", "10.126", "5.126")
+    ):
+        row["Start Time(us)"] = str(Decimal(offset) + Decimal(start))
+        row["Duration(us)"] = duration
+    save_capture(tmp_path, list(reversed(rows)))
+    pairs = chain.read_pairs(tmp_path, 2)
+    for pair in pairs:
+        assert pair["inter_kernel_gap_us"] == 0.001
+        assert pair["inter_kernel_gap_raw_us"] == 0.001
+        assert pair["kernel_sum_us"] == 15.252
+        assert pair["chain_span_us"] == 15.253
+    assert pairs[0]["kernels"][0]["start_us_exact"] == rows[0]["Start Time(us)"]
+    assert pairs[0]["kernels"][0]["duration_us_exact"] == "10.126"
+    chain.write_json(tmp_path / "results.json", dict(samples=pairs, summary=chain.summarize(pairs)))
+    assert json.loads((tmp_path / "results.json").read_text(encoding="utf-8"))["samples"] == pairs
+
+
+def test_capture_does_not_merge_distinct_sub_float_timestamps(tmp_path):
+    rows = capture_rows()[:2]
+    for row, start in zip(rows, ("1793000000000000.001", "1793000000000000.021")):
+        row["Start Time(us)"], row["Duration(us)"] = start, "0.010"
+    save_capture(tmp_path, rows)
+    pair = chain.read_pairs(tmp_path, 1)[0]
+    assert pair["inter_kernel_gap_us"] == 0.01
+    assert pair["chain_span_us"] == 0.03
+
+
+@pytest.mark.parametrize("gap", ["-0.009", "-0.010", "-0.011", "-5"])
+def test_capture_keeps_overlap_tolerance_and_diagnoses_exact_rows(tmp_path, gap):
+    rows = capture_rows()[:2]
+    rows[0]["Start Time(us)"] = "1793000000000000.126"
+    rows[1]["Start Time(us)"] = str(Decimal(rows[0]["Start Time(us)"]) + 10 + Decimal(gap))
+    save_capture(tmp_path, rows)
+    if Decimal(gap) >= Decimal("-0.01"):
+        pair = chain.read_pairs(tmp_path, 1)[0]
+        assert pair["inter_kernel_gap_us"] == 0
+        assert pair["inter_kernel_gap_raw_us"] == float(gap)
+        assert pair["chain_span_us"] == float(15 + Decimal(gap))
+    else:
+        with pytest.raises(ValueError, match="Overlapping kernels") as error:
+            chain.read_pairs(tmp_path, 1)
+        message = str(error.value)
+        assert f"gap={Decimal(gap):.3f} us" in message
+        assert "device=0, stream=4" in message
+        assert "kernel_details.csv:2 fused_gmm1" in message
+        assert "kernel_details.csv:3 gmm2" in message
+        assert "start=1793000000000000.126 duration=10" in message
+
+
 @pytest.mark.parametrize(
     "index,key,value,error",
     [
         (0, "Name", "Copy", "Unexpected kernel"),
         (0, "Name", "GroupedMatmul", "ordering"),
         (0, "Duration(us)", "nan", "Non-finite"),
+        (0, "Duration(us)", "sNaN", "Non-finite"),
+        (0, "Start Time(us)", "inf", "Non-finite"),
         (0, "Duration(us)", 0, "Non-finite"),
         (0, "Start Time(us)", "bad", "Invalid kernel timing"),
         (1, "Start Time(us)", 100, "Duplicate"),
