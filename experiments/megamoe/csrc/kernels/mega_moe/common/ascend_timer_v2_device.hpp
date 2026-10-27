@@ -334,6 +334,12 @@ public:
         WriteEnd(timing, end);
     }
 
+    __aicore__ inline GM_ADDR CountSnapshotAddress() const
+    {
+        return timerAddr_ + sizeof(int64_t) * (AscendTimer::COUNT_SNAPSHOT_OFFSET +
+                                               coreId_ * AscendTimer::COUNT_SNAPSHOT_SLOTS_PER_CORE);
+    }
+
     __aicore__ inline void WriteCountDiagnostics(const uint64_t* values)
     {
         if (!Enabled()) {

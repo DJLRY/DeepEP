@@ -86,6 +86,9 @@ COUNT_DIAGNOSTIC_NAMES = [
     "COUNT_DIAGNOSTIC_CYCLES",
     "COUNT_SNAPSHOT_BYTES",
     "COUNT_SOURCE_MASK_OVERFLOW",
+    "COUNT_SNAPSHOT_SOURCES",
+    "COUNT_SNAPSHOT_EXPERTS",
+    "COUNT_CAPTURED_SNAPSHOT_WORDS",
 ]
 
 # W4 动态槽保存 tile/slice；其他路径保持原有区间协议。
@@ -102,7 +105,53 @@ NO_WAVE = -1
 WAVE_ID_OFFSET = TASK_METADATA_OFFSET + TASK_METADATA_SIZE
 WAVE_ID_PER_CORE = (len(FIXED_NAMES) + len(DYNAMIC_NAMES) * MAX_DYNAMIC_ITER + 15) // 16 * 16
 COUNT_DIAGNOSTIC_OFFSET = WAVE_ID_OFFSET + WAVE_ID_PER_CORE * N_CORE_COUNT
-TOTAL_BUFFER_SIZE = COUNT_DIAGNOSTIC_OFFSET + N_CORE_COUNT * len(COUNT_DIAGNOSTIC_NAMES)
+COUNT_SNAPSHOT_MAX_WORDS = 4096
+COUNT_SNAPSHOT_OFFSET = (COUNT_DIAGNOSTIC_OFFSET + N_CORE_COUNT * len(COUNT_DIAGNOSTIC_NAMES) + 3) // 4 * 4
+COUNT_SNAPSHOT_SLOTS_PER_CORE = COUNT_SNAPSHOT_MAX_WORDS // 2
+TOTAL_BUFFER_SIZE = COUNT_SNAPSHOT_OFFSET + N_CORE_COUNT * COUNT_SNAPSHOT_SLOTS_PER_CORE
+
+
+def failed_count_snapshot(raw, core_id, values):
+    words = values["COUNT_CAPTURED_SNAPSHOT_WORDS"]
+    result = dict(
+        failed_snapshot_available=bool(words),
+        last_failed_source_mask=None,
+        last_failed_sources=None,
+        last_failed_source_rank=None,
+        last_failed_local_expert_id=None,
+        last_failed_observed_epoch=None,
+        source_mask_overflow=None,
+    )
+    if not words:
+        return result
+    sources, experts = values["COUNT_SNAPSHOT_SOURCES"], values["COUNT_SNAPSHOT_EXPERTS"]
+    stride = (experts + 7) // 8 * 8
+    if sources < 1 or experts < 1 or words != sources * stride or words > COUNT_SNAPSHOT_MAX_WORDS:
+        raise ValueError(f"invalid failed count snapshot geometry: core={core_id}")
+    offset = COUNT_SNAPSHOT_OFFSET + core_id * COUNT_SNAPSHOT_SLOTS_PER_CORE
+    failed_sources, stale_words = [], 0
+    for source in range(sources):
+        for expert in range(experts):
+            index = source * stride + expert
+            word = (int(raw[offset + index // 2]) >> (32 * (index % 2))) & 0xFFFFFFFF
+            epoch = word >> 24
+            if epoch == values["COUNT_EXPECTED_EPOCH"]:
+                continue
+            stale_words += 1
+            if not failed_sources or failed_sources[-1] != source:
+                failed_sources.append(source)
+            if result["last_failed_source_rank"] is None:
+                result.update(
+                    last_failed_source_rank=source, last_failed_local_expert_id=expert, last_failed_observed_epoch=epoch
+                )
+    if stale_words != values["COUNT_LAST_STALE_WORDS"] or not stale_words:
+        raise ValueError(f"invalid failed count snapshot contents: core={core_id}")
+    result.update(
+        last_failed_sources=failed_sources,
+        last_failed_source_mask=sum(1 << source for source in failed_sources if source < 64),
+        source_mask_overflow=any(source >= 64 for source in failed_sources),
+    )
+    return result
 
 
 def count_diagnostics(raw, core_id):
@@ -127,6 +176,10 @@ def count_diagnostics(raw, core_id):
         expected_epoch=values["COUNT_EXPECTED_EPOCH"],
         source_mask_overflow=bool(values["COUNT_SOURCE_MASK_OVERFLOW"]),
     )
+    if values["COUNT_SNAPSHOT_SOURCES"]:
+        result["failed_snapshot_available"] = False
+        if failures:
+            result.update(failed_count_snapshot(raw, core_id, values))
     for field, label in (
         ("COUNT_DMA_CYCLES", "snapshot_dma"),
         ("COUNT_CHECK_CYCLES", "snapshot_check"),

@@ -286,6 +286,7 @@ def write_startup_breakdown(raw_by_rank, path: Path):
         "successful_snapshot_check_us",
         "diagnostic_us",
         "last_failed_stale_words",
+        "failed_snapshot_available",
         "last_failed_sources",
         "last_failed_source_rank",
         "last_failed_local_expert_id",

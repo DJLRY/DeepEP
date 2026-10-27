@@ -21,7 +21,6 @@
 #include "../common/mega_moe_utils.hpp"
 #include "../common/mega_moe_peer_rows.hpp"
 #include "../common/ascend_timer_v2_device.hpp"
-#include "../common/mega_moe_count_profile.hpp"
 #include "mega_moe_token_quant.hpp"
 #include "mega_moe_count_arrival.hpp"
 #include "mega_moe_gateway_readiness.hpp"
@@ -591,9 +590,12 @@ __aicore__ inline void LoadMteExpertCounts(const MoeStageCommonConfig& common, c
         stats[COUNT_PROFILE_VALID] = 1;
         stats[COUNT_EXPECTED_EPOCH] = expectedEpoch;
         stats[COUNT_SNAPSHOT_BYTES] = wireWords * sizeof(int32_t);
+        stats[COUNT_SNAPSHOT_SOURCES] = common.worldSize;
+        stats[COUNT_SNAPSHOT_EXPERTS] = common.moeExpertPerRank;
         // Reuse the idle Dispatch copy buffers. Alternating snapshots preserves
         // the last failed poll without extra DMA, vector calls or barriers.
-        const bool preserveFailure = profile && 2U * stats[COUNT_SNAPSHOT_BYTES] <= availableBytes;
+        const bool preserveFailure =
+            profile && wireWords <= COUNT_SNAPSHOT_MAX_WORDS && 2U * stats[COUNT_SNAPSHOT_BYTES] <= availableBytes;
         uint32_t failedAddr = stagingAddr;
 #else
         (void)timer;
@@ -633,13 +635,6 @@ __aicore__ inline void LoadMteExpertCounts(const MoeStageCommonConfig& common, c
                     if (preserveFailure) {
                         snapshotAddr =
                             snapshotAddr == stagingAddr ? stagingAddr + wireWords * sizeof(int32_t) : stagingAddr;
-                    } else {
-                        // Rare small-UB shapes retain the last failure by
-                        // decoding before overwrite; report this observer cost.
-                        const int64_t captureStart = AscendC::GetSystemCycle();
-                        CaptureFailedCountSnapshot(snapshot, common.worldSize, common.moeExpertPerRank, stride,
-                                                   expectedEpoch, stats);
-                        stats[COUNT_DIAGNOSTIC_CYCLES] += AscendC::GetSystemCycle() - captureStart;
                     }
                 }
             }
@@ -660,8 +655,13 @@ __aicore__ inline void LoadMteExpertCounts(const MoeStageCommonConfig& common, c
             if (preserveFailure && stats[COUNT_SNAPSHOT_FAILURES] != 0U) {
                 const int64_t captureStart = AscendC::GetSystemCycle();
                 LocalTensor<int32_t> failed(TPosition::VECCALC, failedAddr, wireWords);
-                CaptureFailedCountSnapshot(failed, common.worldSize, common.moeExpertPerRank, stride, expectedEpoch,
-                                           stats);
+                GlobalTensor<int32_t> captured;
+                captured.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(timer->CountSnapshotAddress()));
+                SyncFuncStatic<AscendC::HardEvent::V_MTE3, SYNC_EVENT_ID2>();
+                DataCopyPad(captured, failed, {1U, static_cast<uint32_t>(stats[COUNT_SNAPSHOT_BYTES]), 0U, 0U, 0U});
+                // Complete the one diagnostic copy before Dispatch reuses this UB.
+                SyncFuncStatic<AscendC::HardEvent::MTE3_S, SYNC_EVENT_ID2>();
+                stats[COUNT_CAPTURED_SNAPSHOT_WORDS] = wireWords;
                 stats[COUNT_DIAGNOSTIC_CYCLES] += AscendC::GetSystemCycle() - captureStart;
             }
             timer->WriteCountDiagnostics(stats);

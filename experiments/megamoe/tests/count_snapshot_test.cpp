@@ -10,19 +10,19 @@
 #define __aicore__
 #define __gm__
 #define __ubuf__
-#include "mega_moe_count_profile.hpp"
+#include "ascend_timer_v2.hpp"
 
 inline std::array<int32_t, 8192> ub;
 inline std::vector<std::vector<int32_t>> samples;
 inline std::vector<uint32_t> addresses;
-inline uint32_t copies = 0, checks = 0, syncs = 0, writes = 0;
+inline uint32_t copies = 0, checks = 0, syncs = 0, writes = 0, captures = 0, scalarReads = 0;
 inline int64_t cycle = 100;
 namespace AscendC {
 int64_t GetSystemCycle()
 {
     return ++cycle;
 }
-enum class HardEvent { V_MTE2, MTE2_V, V_S };
+enum class HardEvent { V_MTE2, MTE2_V, V_S, V_MTE3, MTE3_S };
 }  // namespace AscendC
 constexpr uint32_t SYNC_EVENT_ID2 = 2;
 constexpr int64_t GM_FLAG_POLL_BACKOFF_CYCLES = 5;
@@ -35,6 +35,7 @@ struct LocalTensor {
     T GetValue(uint32_t i) const
     {
         ++cycle;
+        ++scalarReads;
         return reinterpret_cast<T*>(ub.data())[addr / sizeof(T) + i];
     }
     void SetValue(uint32_t i, T value)
@@ -72,6 +73,14 @@ void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T>, CopyParams params, PadPara
     std::copy(sample.begin(), sample.end(), ub.begin() + dst.addr / sizeof(T));
     addresses.push_back(dst.addr);
     cycle += 50;
+}
+template <typename T>
+void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, CopyParams params)
+{
+    ++captures;
+    assert(params.blocks == 1U);
+    std::copy_n(ub.data() + src.addr / sizeof(T), params.bytes / sizeof(T), dst.data);
+    cycle += 12;
 }
 template <AscendC::HardEvent, uint32_t>
 void SyncFuncStatic()
@@ -133,6 +142,7 @@ uint32_t CalcMteExpertCountRankStride(uint32_t n)
 struct AscendTimerDevice {
     bool enabled = true;
     std::array<uint64_t, AscendTimer::COUNT_DIAGNOSTIC_COUNT> values{};
+    std::array<int32_t, AscendTimer::COUNT_SNAPSHOT_MAX_WORDS> snapshot{};
     bool Enabled() const
     {
         return enabled;
@@ -142,15 +152,18 @@ struct AscendTimerDevice {
         ++writes;
         std::copy_n(data, values.size(), values.begin());
     }
+    uint8_t* CountSnapshotAddress()
+    {
+        return reinterpret_cast<uint8_t*>(snapshot.data());
+    }
 };
-using MegaMoeImpl::CaptureFailedCountSnapshot;
 
 /* PRODUCTION_COUNT_SNAPSHOT */
 
 void Run(bool doubleBuffer, bool failed, bool enabled)
 {
     using namespace AscendTimer;
-    copies = checks = syncs = writes = 0;
+    copies = checks = syncs = writes = captures = scalarReads = 0;
     addresses.clear();
     ub.fill(-1);
     MoeStageCommonConfig common;
@@ -173,7 +186,8 @@ void Run(bool doubleBuffer, bool failed, bool enabled)
     AscendTimerDevice timer;
     timer.enabled = enabled;
     LoadMteExpertCounts(common, params, scratch, 0x81U, &timer);
-    assert(copies == samples.size() && checks == copies && syncs == copies * 3U);
+    assert(copies == samples.size() && checks == copies && syncs == copies * 3U + captures * 2U);
+    assert(scalarReads == copies);  // Only the VF status, never a scalar scan of the snapshot.
     for (uint32_t s = 0; s < 32; ++s)
         for (uint32_t e = 0; e < 12; ++e)
             assert(scratch.cumsumInfoTensor.GetValue(e * 32 + s) == static_cast<int32_t>(s + e + 1U));
@@ -186,11 +200,13 @@ void Run(bool doubleBuffer, bool failed, bool enabled)
         assert(timer.values[COUNT_EXPECTED_EPOCH] == 0x81U && timer.values[COUNT_SNAPSHOT_BYTES] == 2048U);
         if (failed) {
             assert(timer.values[COUNT_LAST_STALE_WORDS] == 2U);
-            assert(timer.values[COUNT_LAST_STALE_SOURCE_MASK] == ((1ULL << 7) | (1ULL << 23)));
-            assert(timer.values[COUNT_LAST_STALE_SOURCE_PLUS_ONE] == 8U);
-            assert(timer.values[COUNT_LAST_STALE_EXPERT_PLUS_ONE] == 6U);
-            assert(timer.values[COUNT_LAST_OBSERVED_EPOCH] == 0x80U);
-            assert(timer.values[COUNT_DIAGNOSTIC_CYCLES] > 0U && timer.values[COUNT_BACKOFF_CYCLES] >= 10U);
+            assert(captures == (doubleBuffer ? 1U : 0U));
+            assert(timer.values[COUNT_CAPTURED_SNAPSHOT_WORDS] == (doubleBuffer ? 512U : 0U));
+            if (doubleBuffer) {
+                assert(std::equal(samples[1].begin(), samples[1].end(), timer.snapshot.begin()));
+                assert(timer.values[COUNT_DIAGNOSTIC_CYCLES] > 0U);
+            }
+            assert(timer.values[COUNT_BACKOFF_CYCLES] >= 10U);
             assert(addresses[1] == (doubleBuffer ? 2048U : 0U));
         } else {
             assert(timer.values[COUNT_LAST_STALE_SOURCE_MASK] == 0U && timer.values[COUNT_DIAGNOSTIC_CYCLES] == 0U);
@@ -198,7 +214,7 @@ void Run(bool doubleBuffer, bool failed, bool enabled)
     } else
 #endif
     {
-        assert(writes == 0U);
+        assert(writes == 0U && captures == 0U);
         assert(std::all_of(addresses.begin(), addresses.end(), [](uint32_t p) { return p == 0U; }));
     }
 }

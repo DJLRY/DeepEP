@@ -440,11 +440,18 @@ JSON 隐藏 WAIT 时也隐藏 `packet_wait` 和 `route_complete`；`startup_brea
 `AIV_COUNT_METADATA_WAIT` 的 task/args 及 `startup_breakdown.csv` 新增快照次数、重试次数、快照字节数、
 DMA/校验转置/退避累计耗时、成功快照耗时，以及最后失败快照的未就绪 source 列表和代表性本卡局部 expert 编号/epoch。
 这些字段只覆盖 DMA 快照路径；不具备诊断数据的旧采样或逐槽回退路径留空，不作为0次重试解释。
-每次成功获取只写一次诊断汇总。UB 空间足够时交替使用两份现有空闲 Dispatch 缓冲，保留最后失败快照，
-成功后才解码来源；空间不足时在每次失败后解码。`diagnostic_us` 单独报告这项额外观测开销。
-此记录不新增 DMA、VF 调用或屏障；计时与记录本身仍有开销。最后失败快照描述的是一次采样，
-不能推断真实的网络到达先后顺序。来源位图覆盖0～63，超出时 `source_mask_overflow=true`，EP32 不受影响。
+每次成功获取只写一次诊断汇总。UB 空间足够时交替使用两份现有空闲 Dispatch 缓冲，保留最后失败快照；
+成功后用一次 MTE3 批量复制到 timer GM，由主机解析 source/expert/epoch，设备不再逐槽解码。
+`diagnostic_us` 报告这次复制及其完成同步的开销；不再包含原来的标量解码开销。无重试时不复制。
+快照上限为4096个 int32；超过上限或 UB 不够保留双份快照时，仍保留次数及耗时统计，
+`failed_snapshot_available=false`，失败来源字段留空。新 buffer 布局需两节点重新构建并使用同版本解析器。
+最后失败快照描述的是一次采样，不能推断真实的网络到达先后顺序。
+来源位图覆盖0～63，超出时 `source_mask_overflow=true`，来源列表仍保留完整快照中解出的 source。
 上述累计子耗时已经包含在父区间中，不能再与父区间相加。
+
+Relay 的主机容量按完整512 B包计算，包含每包的末尾标记，并按有效 payload 计算批次数。
+BS32/K8 的256个 top-k 条目需要3个包，UB 配置为512个槽（有效容量508），
+避免原来256槽仅有254个有效位置而产生“254＋2”两批回退；同时满足单批 route 快路径的输出缓冲要求。
 
 跨机 Combine 的推进开销在 `/COMBINE_PROGRESS` 子轨道单独记录：
 

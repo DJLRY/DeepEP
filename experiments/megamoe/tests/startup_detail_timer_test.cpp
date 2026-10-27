@@ -10,6 +10,10 @@ int main()
     std::vector<int64_t> buffer(TOTAL_BUFFER_SIZE, 0);
     AscendTimerDevice timer;
     timer.Init(reinterpret_cast<uint8_t*>(buffer.data()));
+#ifdef DEEPEP_MEGAMOE_TIMER
+    assert(timer.CountSnapshotAddress() ==
+           reinterpret_cast<uint8_t*>(buffer.data() + COUNT_SNAPSHOT_OFFSET + COUNT_SNAPSHOT_SLOTS_PER_CORE));
+#endif
     constexpr int core = 1;
     const int counters = N_TIMING_COUNTER + core * DYNAMIC_ITER_PER_CORE_ALIGN;
     const int diagnostic = COUNT_DIAGNOSTIC_OFFSET + core * COUNT_DIAGNOSTIC_COUNT;

@@ -82,9 +82,15 @@ MegaMoeSendMaskBufferConfig SendMaskConfig(const MegaMoeTilingData& t, uint32_t 
 {
     MegaMoeSendMaskBufferConfig c{};
     const uint64_t total = static_cast<uint64_t>(t.numMaxTokensPerRank) * t.topK;
-    const uint64_t aligned = AlignUp(total, uint64_t{256});
+    const bool rail = MegaMoeImpl::UseDecodeRailRouting(&t);
+    const uint64_t storage =
+        rail ? CeilDiv<uint64_t>(total, MegaMoeImpl::RAIL_PACKET_DATA_WORDS) * MegaMoeImpl::RAIL_PACKET_WORDS : total;
+    const uint64_t aligned = AlignUp(storage, uint64_t{256});
+    const auto payload_capacity = [rail](uint64_t slots) {
+        return rail ? slots / MegaMoeImpl::RAIL_PACKET_WORDS * MegaMoeImpl::RAIL_PACKET_DATA_WORDS : slots;
+    };
     c.routeItemsPerBatch = static_cast<int32_t>(std::min<uint64_t>(aligned, BASE_SEND_ROUTE_ITEMS_PER_BATCH));
-    c.routeBatchCount = static_cast<int32_t>(CeilDiv(total, static_cast<uint64_t>(c.routeItemsPerBatch)));
+    c.routeBatchCount = static_cast<int32_t>(CeilDiv(total, payload_capacity(c.routeItemsPerBatch)));
     auto route_slot_bytes = [&](uint32_t route_items) {
         // A batch can begin in the middle of a token's top-k segment.  Reserve
         // one matched index per covered token, including both boundary tokens.
@@ -102,7 +108,7 @@ MegaMoeSendMaskBufferConfig SendMaskConfig(const MegaMoeTilingData& t, uint32_t 
         c.bufferCount = static_cast<int32_t>(pushes);
     }
     c.bufferCount = std::max(c.bufferCount, MIN_SEND_MASK_BUFFER_COUNT);
-    if (static_cast<uint64_t>(c.routeItemsPerBatch) < total) {
+    if (payload_capacity(c.routeItemsPerBatch) < total) {
         const uint64_t fixed_with_padding =
             static_cast<uint64_t>(fixed) + static_cast<uint64_t>(c.bufferCount) * (32U + 2U * sizeof(int32_t));
         const uint64_t route_budget = ub > fixed_with_padding ? ub - fixed_with_padding : 0U;
@@ -114,7 +120,7 @@ MegaMoeSendMaskBufferConfig SendMaskConfig(const MegaMoeTilingData& t, uint32_t 
         expanded = std::min<uint64_t>(expanded, aligned);
         if (expanded > static_cast<uint64_t>(c.routeItemsPerBatch)) {
             c.routeItemsPerBatch = static_cast<int32_t>(expanded);
-            c.routeBatchCount = static_cast<int32_t>(CeilDiv(total, static_cast<uint64_t>(expanded)));
+            c.routeBatchCount = static_cast<int32_t>(CeilDiv(total, payload_capacity(expanded)));
             c.bufferBytes = route_slot_bytes(static_cast<uint32_t>(expanded));
         }
     }

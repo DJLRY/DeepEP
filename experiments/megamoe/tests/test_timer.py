@@ -31,10 +31,11 @@ def test_device_schema_and_extended_size():
 
     assert names("FixedTiming", "FIXED_TIMING_COUNT") == p.FIXED_NAMES
     assert names("DynamicTimingType", "DYNAMIC_TYPE_COUNT_ENUM") == p.DYNAMIC_NAMES
-    for name in ("MAX_DYNAMIC_ITER", "N_CORE_COUNT"):
+    for name in ("MAX_DYNAMIC_ITER", "N_CORE_COUNT", "COUNT_SNAPSHOT_MAX_WORDS"):
         assert int(re.search(rf"{name}\s*=\s*(\d+)", header)[1]) == getattr(p, name)
     assert names("CountDiagnostic", "COUNT_DIAGNOSTIC_COUNT") == p.COUNT_DIAGNOSTIC_NAMES
-    assert p.TOTAL_BUFFER_SIZE == p.COUNT_DIAGNOSTIC_OFFSET + len(p.COUNT_DIAGNOSTIC_NAMES) * p.N_CORE_COUNT
+    assert p.COUNT_SNAPSHOT_OFFSET % 4 == 0
+    assert p.TOTAL_BUFFER_SIZE == p.COUNT_SNAPSHOT_OFFSET + p.COUNT_SNAPSHOT_SLOTS_PER_CORE * p.N_CORE_COUNT
     assert p.TASK_METADATA_SIZE == p.N_CORE_COUNT * len(p.DYNAMIC_NAMES) * p.MAX_DYNAMIC_ITER * 2
 
 
@@ -122,7 +123,15 @@ def test_startup_details_and_combine_decisions_round_trip(raw_file, tmp_path):
             COUNT_EXPECTED_EPOCH=129,
             COUNT_DIAGNOSTIC_CYCLES=700,
             COUNT_SNAPSHOT_BYTES=2048,
+            COUNT_SNAPSHOT_SOURCES=32,
+            COUNT_SNAPSHOT_EXPERTS=12,
+            COUNT_CAPTURED_SNAPSHOT_WORDS=512,
         )
+        snapshot = [129 << 24 if i % 16 < 12 else 0 for i in range(512)]
+        snapshot[7 * 16 + 5] = 128 << 24
+        snapshot[23 * 16 + 11] = 130 << 24
+        stream.seek((p.COUNT_SNAPSHOT_OFFSET + core * p.COUNT_SNAPSHOT_SLOTS_PER_CORE) * 8)
+        stream.write(struct.pack("<512I", *snapshot))
         put(
             p.COUNT_DIAGNOSTIC_OFFSET + core * len(p.COUNT_DIAGNOSTIC_NAMES),
             *(stats.get(name, 0) for name in p.COUNT_DIAGNOSTIC_NAMES),
@@ -145,6 +154,7 @@ def test_startup_details_and_combine_decisions_round_trip(raw_file, tmp_path):
     count = next(e for e in visible if e["args"].get("event_family") == "AIV_COUNT_METADATA_WAIT")
     assert count["args"]["snapshot_retries"] == 2
     assert count["args"]["last_failed_sources"] == [7, 23]
+    assert count["args"]["failed_snapshot_available"] is True
     assert count["args"]["last_failed_local_expert_id"] == 5
     assert count["args"]["snapshot_dma_us"] == 6 and count["args"]["diagnostic_us"] == 0.7
     relay = [e for e in visible if e["args"].get("granularity") == "relay_step"]
@@ -168,6 +178,13 @@ def test_startup_details_and_combine_decisions_round_trip(raw_file, tmp_path):
 def test_sync_alignment_is_explicit_and_requires_anchor():
     with pytest.raises(ValueError, match="missing"):
         synchronized_rank_bases({0: [{"name": "AIC_GMM1", "start_cycle": 100, "end_cycle": 200}]})
+
+
+def test_unavailable_failed_snapshot_does_not_report_an_empty_source_set():
+    result = p.failed_count_snapshot([], 2, {"COUNT_CAPTURED_SNAPSHOT_WORDS": 0})
+    assert result["failed_snapshot_available"] is False
+    assert result["last_failed_sources"] is None
+    assert result["last_failed_source_mask"] is None
 
 
 def test_rdma_binary_metadata_and_wait_visibility(raw_file):
