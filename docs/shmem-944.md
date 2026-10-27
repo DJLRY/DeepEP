@@ -4,13 +4,16 @@
 [!944](https://gitcode.com/cann/shmem/pull/944) 合入提交。它支持新 HNS1825 固件的 PI-on-chip doorbell。
 锁文件、公有头文件校验和与子模块 gitlink 一起更新；不跟随上游 master 自动升级。
 
+本分支保留 split-RDMA 的三条 QP：QP0 用于 SDK 集合通信，QP1 用于 payload/Combine，QP2 用于 Dispatch metadata。
+PI-on-chip 模式由同一 SDK 配置传入上述 RoCE 内核，不改变 metadata 与 payload 独立提交和完成的协议。
+
 ## 当前分支：两台机器分别重建
 
 停止使用原 SDK 的作业后，在原 checkout 执行：
 
 ```bash
-git switch codex/megamoe-hierarchical-roce
-git pull --ff-only origin codex/megamoe-hierarchical-roce
+git switch codex/megamoe-split-rdma
+git pull --ff-only origin codex/megamoe-split-rdma
 git submodule update --init -- third-party/shmem
 
 # HNS1825 新固件使用 1；SDK 与消费它的 Device 内核会使用同一个设置。
@@ -39,6 +42,10 @@ bash experiments/megamoe/scripts/run_bs32.sh perf --perf-method legacy --warmup 
 新 SHMEM 的内部 WQE 构造接口会转换对称堆地址；Dispatch 的 live VA 通过专用适配保留原值，
 Combine 则向 SDK 传入本地对称地址，由 SDK 转换到对端 MR。更新当前分支后运行
 `build --errors-only` 即可复用已成功构建的新 SHMEM SDK。
+
+此分支也包含两项 Bisheng 编译修复：对称堆指针先转为 `uint64_t` 再恢复 `__gm__` 地址空间，
+避免跨地址空间直接 `reinterpret_cast`；UDMA 适配器仅在 `__CCE_AICORE__` 或 `__CCE_KT_TEST__` 下定义，
+避免 Host 编译阶段访问未声明的 Device UDMA 类型。这些修复已随分支提供，无需手工修改。
 
 ## 历史 commit：保留原 SHA，应用依赖适配
 
@@ -89,3 +96,15 @@ worktree 的 HEAD 仍是 `OLD_REF`；兼容修改保留为可查看的工作区�
   资源需求和性能可能变化，需要单独验证。BS32 MegaMoE RoCE 路径不使用这个接口。
 
 本地检查覆盖依赖锁、doorbell 模式传递与历史迁移，不代表各历史版本已在新驱动上通过设备编译、精度和性能测试。
+
+## split-RDMA 分支本地校验（2026-10-27）
+
+- 已验证固定 SHMEM 提交及锁文件中的六个公有头文件校验和。
+- 相关检查累计 290 项通过，覆盖 PI 模式与 SDK 复用、CMake 宏传递、架构检测污染、
+  真实 SHMEM UDMA WQE 构造、Device 地址空间、Host 编译隔离及 split-RDMA 通信协议。
+- `csrc/runtime/session.cpp` 对固定 SHMEM 的真实公有头文件编译通过；只替代本机缺失的 CANN 接口声明。
+- Windows 上有 8 项既有 Host 编译器选择测试依赖 Linux shell 或符号链接权限，未通过；
+  这部分仍须在 Linux 上执行。CMake 3.31.6 的 MinGW 配置在本机崩溃，相关两项使用 3.25.2 复核通过；
+  其余 PI 模式及 SHMEM 架构修复的 CMake 检查使用 3.31.6 通过。
+- 本机没有 CANN/Bisheng 和 Ascend 设备，未执行完整 wheel 构建、两机精度或性能测试。
+  上述结果不替代两台构建机上的 `build --rebuild-shmem` 与后续精度测试。
