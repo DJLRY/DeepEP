@@ -5,6 +5,7 @@
 #define MEGA_MOE_SEND_MASK_H
 
 #include "../common/mega_moe_utils.hpp"
+#include "../common/ascend_timer_v2_device.hpp"
 #include "mega_moe_route_compact.hpp"
 
 namespace MegaMoeImpl {
@@ -351,7 +352,8 @@ __aicore__ inline void RelayExpertCompactRouteBatch(const MoeStageCommonConfig& 
                                                     GlobalTensor<int32_t>& topkIdsGm,
                                                     GlobalTensor<int32_t>& dstRouteIndexGm, int32_t ownedExpertBegin,
                                                     int32_t ownedExpertNum, int32_t sourceRank, int32_t srcTokenNum,
-                                                    int32_t realSendTotalNum, int32_t batchIdx)
+                                                    int32_t realSendTotalNum, int32_t batchIdx,
+                                                    AscendTimerDevice* timer = nullptr)
 {
     const MegaMoeSendMaskBufferConfig& bufferConfig = config.bufferConfig;
     const uint32_t compareMaskBytes = static_cast<uint32_t>(bufferConfig.routeItemsPerBatch) / BITS_PER_BYTE;
@@ -362,10 +364,14 @@ __aicore__ inline void RelayExpertCompactRouteBatch(const MoeStageCommonConfig& 
         validLen = realRemain > 0 ? realRemain : 0;
     }
 
-    SyncFuncStatic<AscendC::HardEvent::V_MTE2, SYNC_EVENT_ID1>();
-    if (validLen > 0) {
-        LoadRailTopkIdsBatch(config, scratch, topkIdsGm, batchIdx, validLen);
-        CreateVecIndex(scratch.topkIndexTensor, batchStart, validLen);
+    {
+        AscendTimerRelayScope load(timer, AscendTimer::RelayStep::TopkLoad, sourceRank, ownedExpertBegin,
+                                   ownedExpertNum);
+        SyncFuncStatic<AscendC::HardEvent::V_MTE2, SYNC_EVENT_ID1>();
+        if (validLen > 0) {
+            LoadRailTopkIdsBatch(config, scratch, topkIdsGm, batchIdx, validLen);
+            CreateVecIndex(scratch.topkIndexTensor, batchStart, validLen);
+        }
     }
 
     int32_t batchRingBegin = batchIdx * ownedExpertNum;
@@ -381,15 +387,22 @@ __aicore__ inline void RelayExpertCompactRouteBatch(const MoeStageCommonConfig& 
         LocalTensor<int32_t> tokValidIndexTensor =
             scratch.routeRingTensor[slotOffset + compareMaskBytes].template ReinterpretCast<int32_t>();
 
-        WaitFlag<AscendC::HardEvent::MTE3_V>(eventId);
-        uint64_t batchMatchedRouteCount = 0U;
-        if (validLen > 0) {
-            CompareScalar(compareMaskTensor, scratch.topkIdsTensor, globalExpertId, AscendC::CMPMODE::EQ, validLen);
-            GatherMask(tokValidIndexTensor, scratch.topkIndexTensor, compareMaskU32Tensor, true,
-                       static_cast<uint32_t>(validLen), {1, 1, 0, 0}, batchMatchedRouteCount);
+        {
+            AscendTimerRelayScope complete(timer, AscendTimer::RelayStep::RouteComplete, sourceRank, globalExpertId,
+                                           1U);
+            WaitFlag<AscendC::HardEvent::MTE3_V>(eventId);
         }
-        SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
-
+        uint64_t batchMatchedRouteCount = 0U;
+        {
+            AscendTimerRelayScope build(timer, AscendTimer::RelayStep::RouteBuild, sourceRank, globalExpertId, 1U);
+            if (validLen > 0) {
+                CompareScalar(compareMaskTensor, scratch.topkIdsTensor, globalExpertId, AscendC::CMPMODE::EQ, validLen);
+                GatherMask(tokValidIndexTensor, scratch.topkIndexTensor, compareMaskU32Tensor, true,
+                           static_cast<uint32_t>(validLen), {1, 1, 0, 0}, batchMatchedRouteCount);
+            }
+            SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
+        }
+        AscendTimerRelayScope post(timer, AscendTimer::RelayStep::RoutePost, sourceRank, globalExpertId, 1U);
         int32_t previousCount = scratch.sendCntAccTensor.GetValue(ownedIdx);
         int32_t remainingCapacity = srcTokenNum - previousCount;
         int32_t copiedCount = static_cast<int32_t>(batchMatchedRouteCount);
@@ -548,7 +561,7 @@ __aicore__ inline bool TryRelayCompactRoutes(const MoeStageCommonConfig& common,
                                              const SendMaskConfig& config, SendMaskScratch& scratch,
                                              GlobalTensor<int32_t>& topkIdsGm, int32_t ownedExpertBegin,
                                              int32_t ownedExpertNum, int32_t sourceRank, int32_t srcTokenNum,
-                                             int32_t realSendTotalNum)
+                                             int32_t realSendTotalNum, AscendTimerDevice* timer = nullptr)
 {
     const MegaMoeSendMaskBufferConfig& bufferConfig = config.bufferConfig;
     if (realSendTotalNum <= 0 || realSendTotalNum > RailItemsPerBatch(bufferConfig)) {
@@ -565,32 +578,48 @@ __aicore__ inline bool TryRelayCompactRoutes(const MoeStageCommonConfig& common,
         }
         routeTensor = scratch.topkIndexTensor;
     }
-    LoadRailTopkIdsBatch(config, scratch, topkIdsGm, 0, realSendTotalNum);
-    RelayCompactRoutesVF(reinterpret_cast<__ubuf__ int32_t*>(scratch.topkIdsTensor.GetPhyAddr()),
-                         reinterpret_cast<__ubuf__ int32_t*>(routeTensor.GetPhyAddr()),
-                         reinterpret_cast<__ubuf__ int32_t*>(scratch.sendCntAccTensor.GetPhyAddr()),
-                         static_cast<uint32_t>(realSendTotalNum), common.topK, ownedExpertBegin,
-                         static_cast<uint32_t>(ownedExpertNum), routeStrideItems);
-    SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
-    SyncFuncStatic<AscendC::HardEvent::V_MTE3, SYNC_EVENT_ID3>();
-    GlobalTensor<int32_t> dstRouteGm;
-    for (int32_t ownedIdx = 0; ownedIdx < ownedExpertNum; ++ownedIdx) {
-        const int32_t routeCount = scratch.sendCntAccTensor.GetValue(ownedIdx);
-        if (routeCount == 0) {
-            continue;
+    {
+        AscendTimerRelayScope load(timer, AscendTimer::RelayStep::TopkLoad, sourceRank, ownedExpertBegin,
+                                   ownedExpertNum);
+        LoadRailTopkIdsBatch(config, scratch, topkIdsGm, 0, realSendTotalNum);
+    }
+    {
+        AscendTimerRelayScope build(timer, AscendTimer::RelayStep::RouteBuild, sourceRank, ownedExpertBegin,
+                                    ownedExpertNum);
+        RelayCompactRoutesVF(reinterpret_cast<__ubuf__ int32_t*>(scratch.topkIdsTensor.GetPhyAddr()),
+                             reinterpret_cast<__ubuf__ int32_t*>(routeTensor.GetPhyAddr()),
+                             reinterpret_cast<__ubuf__ int32_t*>(scratch.sendCntAccTensor.GetPhyAddr()),
+                             static_cast<uint32_t>(realSendTotalNum), common.topK, ownedExpertBegin,
+                             static_cast<uint32_t>(ownedExpertNum), routeStrideItems);
+        SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
+    }
+    {
+        AscendTimerRelayScope post(timer, AscendTimer::RelayStep::RoutePost, sourceRank, ownedExpertBegin,
+                                   ownedExpertNum);
+        SyncFuncStatic<AscendC::HardEvent::V_MTE3, SYNC_EVENT_ID3>();
+        GlobalTensor<int32_t> dstRouteGm;
+        for (int32_t ownedIdx = 0; ownedIdx < ownedExpertNum; ++ownedIdx) {
+            const int32_t routeCount = scratch.sendCntAccTensor.GetValue(ownedIdx);
+            if (routeCount == 0) {
+                continue;
+            }
+            const uint32_t globalExpertId = static_cast<uint32_t>(ownedExpertBegin + ownedIdx);
+            const uint64_t dstOffset =
+                config.routeIndexWinOffset +
+                (static_cast<uint64_t>(globalExpertId % common.moeExpertPerRank) * common.worldSize + sourceRank) *
+                    config.routeIndexAlignSize;
+            dstRouteGm.SetGlobalBuffer(
+                reinterpret_cast<__gm__ int32_t*>(winRankAddr[globalExpertId / common.moeExpertPerRank] + dstOffset));
+            DataCopyPad(dstRouteGm, routeTensor[static_cast<uint32_t>(ownedIdx) * routeStrideItems],
+                        {1U, static_cast<uint32_t>(routeCount * sizeof(int32_t)), 0U, 0U, 0U});
         }
-        const uint32_t globalExpertId = static_cast<uint32_t>(ownedExpertBegin + ownedIdx);
-        const uint64_t dstOffset =
-            config.routeIndexWinOffset +
-            (static_cast<uint64_t>(globalExpertId % common.moeExpertPerRank) * common.worldSize + sourceRank) *
-                config.routeIndexAlignSize;
-        dstRouteGm.SetGlobalBuffer(
-            reinterpret_cast<__gm__ int32_t*>(winRankAddr[globalExpertId / common.moeExpertPerRank] + dstOffset));
-        DataCopyPad(dstRouteGm, routeTensor[static_cast<uint32_t>(ownedIdx) * routeStrideItems],
-                    {1U, static_cast<uint32_t>(routeCount * sizeof(int32_t)), 0U, 0U, 0U});
     }
     // count 发布可能复用 topkIndex，必须等 route DMA 完成后才能改写它。
-    SyncFuncStatic<AscendC::HardEvent::MTE3_S, SYNC_EVENT_ID3>();
+    {
+        AscendTimerRelayScope complete(timer, AscendTimer::RelayStep::RouteComplete, sourceRank, ownedExpertBegin,
+                                       ownedExpertNum);
+        SyncFuncStatic<AscendC::HardEvent::MTE3_S, SYNC_EVENT_ID3>();
+    }
     return true;
 }
 
@@ -602,7 +631,8 @@ __aicore__ inline bool TryRelayCompactRoutes(const MoeStageCommonConfig& common,
 __aicore__ inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig& common, GM_ADDR* winRankAddr,
                                                  const SendMaskConfig& config, const Params& params,
                                                  SendMaskScratch& scratch, uint32_t relayIdx, uint32_t aivCoreIdx,
-                                                 int32_t ownedExpertBegin, int32_t ownedExpertNum)
+                                                 int32_t ownedExpertBegin, int32_t ownedExpertNum,
+                                                 AscendTimerDevice* timer = nullptr)
 {
     const MegaMoeSendMaskBufferConfig& bufferConfig = config.bufferConfig;
     // railTopkIdsRecvPtr 已是本卡 rail 区绝对基址（见 peermem.h PeermemInfo 布局），
@@ -617,15 +647,22 @@ __aicore__ inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig& com
         reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.rankSyncInWorldPtr + RANK_SYNC_COUNTER_OFFSET_BYTES +
                                           static_cast<uint64_t>(aivCoreIdx) * RANK_SYNC_COUNTER_SLOT_BYTES);
     int32_t expectEpoch = ((ReadGmByPassDCache(launchCountSlot) + 1) & 0x7F) | 0x80;
-    const int32_t realSendTotalNum = WaitRailPacketArrival(railSlotBase, expectEpoch);
-    const int32_t srcTokenNum = realSendTotalNum / static_cast<int32_t>(common.topK);
     const int32_t sourceRank =
         static_cast<int32_t>(relayIdx * config.ranksPerServer + common.rankId % config.ranksPerServer);
+    int32_t realSendTotalNum;
+    {
+        AscendTimerRelayScope packet(timer, AscendTimer::RelayStep::PacketWait, sourceRank, ownedExpertBegin,
+                                     ownedExpertNum);
+        realSendTotalNum = WaitRailPacketArrival(railSlotBase, expectEpoch);
+    }
+    const int32_t srcTokenNum = realSendTotalNum / static_cast<int32_t>(common.topK);
 
     GlobalTensor<int32_t> topkIdsGm;
     topkIdsGm.SetGlobalBuffer(railSlotBase);
     if (TryRelayCompactRoutes(common, winRankAddr, config, scratch, topkIdsGm, ownedExpertBegin, ownedExpertNum,
-                              sourceRank, srcTokenNum, realSendTotalNum)) {
+                              sourceRank, srcTokenNum, realSendTotalNum, timer)) {
+        AscendTimerRelayScope publish(timer, AscendTimer::RelayStep::CountPublish, sourceRank, ownedExpertBegin,
+                                      ownedExpertNum);
         PublishRailExpertCounts(common, winRankAddr, config, scratch, ownedExpertBegin, ownedExpertNum, sourceRank,
                                 expectEpoch);
         return;
@@ -641,13 +678,19 @@ __aicore__ inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig& com
     const int32_t actualBatchCount = (realSendTotalNum + itemsPerBatch - 1) / itemsPerBatch;
     for (int32_t batchIdx = 0; batchIdx < actualBatchCount; ++batchIdx) {
         RelayExpertCompactRouteBatch(common, winRankAddr, config, scratch, topkIdsGm, dstRouteIndexGm, ownedExpertBegin,
-                                     ownedExpertNum, sourceRank, srcTokenNum, realSendTotalNum, batchIdx);
+                                     ownedExpertNum, sourceRank, srcTokenNum, realSendTotalNum, batchIdx, timer);
     }
-    for (int32_t bufferIdx = 0; bufferIdx < bufferConfig.bufferCount; ++bufferIdx) {
-        WaitFlag<AscendC::HardEvent::MTE3_V>(static_cast<TEventID>(bufferIdx));
+    {
+        AscendTimerRelayScope complete(timer, AscendTimer::RelayStep::RouteComplete, sourceRank, ownedExpertBegin,
+                                       ownedExpertNum);
+        for (int32_t bufferIdx = 0; bufferIdx < bufferConfig.bufferCount; ++bufferIdx) {
+            WaitFlag<AscendC::HardEvent::MTE3_V>(static_cast<TEventID>(bufferIdx));
+        }
     }
 
     int32_t arrivalEpoch = expectEpoch;
+    AscendTimerRelayScope publish(timer, AscendTimer::RelayStep::CountPublish, sourceRank, ownedExpertBegin,
+                                  ownedExpertNum);
     PublishRailExpertCounts(common, winRankAddr, config, scratch, ownedExpertBegin, ownedExpertNum, sourceRank,
                             arrivalEpoch);
 }

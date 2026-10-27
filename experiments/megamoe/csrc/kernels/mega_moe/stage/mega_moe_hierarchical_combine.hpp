@@ -21,6 +21,7 @@ namespace MegaMoeImpl {
 // only this private pending mask changes as rows are submitted to the NIC.
 struct HierarchicalCombineProgress {
     uint32_t pendingTopkMasks[HIERARCHICAL_MAX_TOKENS + 1U]{};
+    uint32_t deferredTopkMasks[HIERARCHICAL_MAX_TOKENS + 1U]{};
     uint32_t expectedRows = 0U;
     uint32_t sentRows = 0U;
     uint32_t nextRow = 0U;
@@ -32,6 +33,10 @@ struct HierarchicalCombineProgress {
 struct HierarchicalCombineProgressBudget {
     uint32_t maxPosts = 0xffffffffU;
     uint32_t maxScannedRows = 0xffffffffU;
+    // Zero disables coalescing, including the final producer-complete drain.
+    // A short run with a still-pending neighbour is deferred at most once per
+    // start row. Never wait inside a call: the owner may be its next producer.
+    uint32_t minRunRows = 0U;
 };
 
 // The caller has already acquired the paired source's metadata during Dispatch.
@@ -57,6 +62,7 @@ __aicore__ inline void InitializeHierarchicalCombineProgress(const MoeStageCommo
     progress.expectedRows = 0U;
     for (uint32_t token = 0U; token < common.tokenNum; ++token) {
         progress.pendingTopkMasks[token] = 0U;
+        progress.deferredTopkMasks[token] = 0U;
     }
     // Dispatch transferred whole 512B packets. Read each in two aligned chunks
     // using the owner's reserved 256B UB; the last word is a marker, not an ID.
@@ -235,6 +241,7 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
             continue;
         }
         const uint32_t runStart = cursor.row;
+        const int64_t runCycle = timer != nullptr && timer->Enabled() ? GetSystemCycle() : 0;
         const uint32_t runToken = cursor.token;
         const uint32_t runTopk = cursor.topk;
         cursor.Advance(common, progress);
@@ -250,16 +257,39 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
             cursor.Advance(common, progress);
         }
         const uint32_t runRows = cursor.row - runStart;
-        const uint64_t byteOffset = static_cast<uint64_t>(runStart) * rowBytes;
-        timing.StopScan();
-        RocePutBytes(params.peermemInfo.combineSendPtr + byteOffset, params.peermemInfo.gatewayCombinePtr + byteOffset,
-                     runRows * rowBytes, destination, roceScratch, timer, AscendTimer::RdmaPhase::Combine);
-        timing.StartScan();
-        ClearHierarchicalCombineRun(progress, common.topK, runToken, runTopk, runRows);
-        // The cached bits begin at cursor.row, beyond the cleared run. A wrap
-        // reloads token zero so previously submitted rows cannot reappear.
-        progress.sentRows += runRows;
-        ++posts;
+        const bool nextPending = cursor.row < rowCount && (cursor.pending & 1U) != 0U;
+        const bool alreadyDeferred = (progress.deferredTopkMasks[runToken] & (uint32_t(1) << runTopk)) != 0U;
+        // 0=tensor end, 1=route/sent gap, 2=producer not ready, 3=scan budget.
+        const uint32_t stopReason = cursor.row == rowCount ? 0U : (skippedHole ? (nextPending ? 2U : 1U) : 3U);
+        bool defer = false;
+        if (runRows < budget.minRunRows && !alreadyDeferred) {
+            const uint32_t previous = runStart == 0U ? 0U : runStart - 1U;
+            const bool previousPending = runStart != 0U && (progress.pendingTopkMasks[previous / common.topK] &
+                                                            (uint32_t(1) << (previous % common.topK))) != 0U;
+            defer = nextPending || previousPending;
+        }
+        if (defer) {
+            progress.deferredTopkMasks[runToken] |= uint32_t(1) << runTopk;
+        } else {
+            const uint64_t byteOffset = static_cast<uint64_t>(runStart) * rowBytes;
+            timing.StopScan();
+            RocePutBytes(params.peermemInfo.combineSendPtr + byteOffset,
+                         params.peermemInfo.gatewayCombinePtr + byteOffset, runRows * rowBytes, destination,
+                         roceScratch, timer, AscendTimer::RdmaPhase::Combine);
+            timing.StartScan();
+            ClearHierarchicalCombineRun(progress, common.topK, runToken, runTopk, runRows);
+            // The cached bits begin at cursor.row, beyond the cleared run. A
+            // wrap reloads token zero so sent rows cannot reappear.
+            progress.sentRows += runRows;
+            ++posts;
+        }
+        if (timer != nullptr && timer->Enabled()) {
+            timer->RecordDetail(AscendTimer::AIV_COMBINE_RUN, runCycle, GetSystemCycle(),
+                                (static_cast<uint64_t>(runStart) << 32) | runRows,
+                                stopReason | (static_cast<uint64_t>(defer) << 8) |
+                                    (static_cast<uint64_t>(nextPending) << 9) |
+                                    (static_cast<uint64_t>(alreadyDeferred) << 10));
+        }
         if (skippedHole) {
             cursor.Advance(common, progress);
         }

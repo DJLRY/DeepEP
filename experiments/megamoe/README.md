@@ -431,6 +431,21 @@ python -I -m deep_ep_experimental.megamoe.timer.trace_parser \
 `scope=envelope` 是父区间，各核和父子区间不可累计当作端到端耗时。
 新启动打点再次扩展了 buffer 布局，旧 BIN 需使用采集时的解析器；旧采样无法补出此前未记录的阶段。
 
+头开销细分版本在 `/RELAY` 轨道新增 `AIV_RELAY_STEP`，包含 `packet_wait`、`topk_load`、
+`route_build`、`route_post`、`route_complete`、`count_publish` 六类步骤，附带原 source rank 和专家范围。
+其中 `route_post` 测量 DMA 提交及相关标量工作，`route_complete` 测量既有完成等待；二者不是链路传输时间。
+`count_publish` 是 gateway 向专家卡发布计数，与本卡的 `AIV_COUNT_TABLE_PUBLISH` 含义不同。
+JSON 隐藏 WAIT 时也隐藏 `packet_wait` 和 `route_complete`；`startup_breakdown.csv` 始终保留这些步骤。
+
+`AIV_COUNT_METADATA_WAIT` 的 task/args 及 `startup_breakdown.csv` 新增快照次数、重试次数、快照字节数、
+DMA/校验转置/退避累计耗时、成功快照耗时，以及最后失败快照的未就绪 source 列表和代表性本卡局部 expert 编号/epoch。
+这些字段只覆盖 DMA 快照路径；不具备诊断数据的旧采样或逐槽回退路径留空，不作为0次重试解释。
+每次成功获取只写一次诊断汇总。UB 空间足够时交替使用两份现有空闲 Dispatch 缓冲，保留最后失败快照，
+成功后才解码来源；空间不足时在每次失败后解码。`diagnostic_us` 单独报告这项额外观测开销。
+此记录不新增 DMA、VF 调用或屏障；计时与记录本身仍有开销。最后失败快照描述的是一次采样，
+不能推断真实的网络到达先后顺序。来源位图覆盖0～63，超出时 `source_mask_overflow=true`，EP32 不受影响。
+上述累计子耗时已经包含在父区间中，不能再与父区间相加。
+
 跨机 Combine 的推进开销在 `/COMBINE_PROGRESS` 子轨道单独记录：
 
 | 事件 | 测量范围 |
@@ -439,6 +454,7 @@ python -I -m deep_ep_experimental.megamoe.timer.trace_parser \
 | `AIV_COMBINE_PROGRESS` | 初始化后的单次扫描和提交；记录进入/退出时待发的行数、POST 数、扫描槽位数及扫描/控制累计周期 |
 | `AIV_HOST_COMBINE_BARRIER_WAIT` | 已有16卡机内完成屏障的完整调用，包含发布、轮询及本卡同步 |
 | `AIV_COMBINE_DRAIN` | 屏障后最终 drain 的父区间，包含子 progress 和退避；记录进入/退出时待发行数 |
+| `AIV_COMBINE_RUN` | `/COMBINE_RUN` 轨道记录每个连续段的起点、行数、发送或延后决策、终止原因以及是否曾延后 |
 
 `scan_control_us` 包含游标扫描、ready flag 检查和私有 pending 状态维护，排除初始化、
 `RocePutBytes` 调用和 drain 退避；它仍包含测量边界的开销，不能当作纯 GM 访存耗时。
@@ -446,9 +462,11 @@ progress/drain 的父区间不能与内部 RDMA 或子 progress 相加。初始�
 已全部发送的 progress 快返不产生扫描记录；零待发的最终 drain 仍记录0行，便于确认完成。
 这些观测不新增流水排空、跨核同步或通信，不以计时结果决定调度。
 
-解析另输出 `combine_progress_breakdown.csv`，始终保留上述四类数据，即使 JSON 隐藏 WAIT。
+解析另输出 `combine_progress_breakdown.csv`，始终保留上述数据，即使 JSON 隐藏 WAIT。
 其中 `pending_before` / `pending_after` 是行数；`posts` / `scanned_rows` 只属于 progress，
 drain 行的这些字段留空。通过它比较单次推进耗时与最终剩余行数，判断缩减预算是否把工作移到了尾部。
+run 的 `stop_reason` 区分 `tensor_end`、`route_gap`（无路由或已发送）、`producer_not_ready` 和 `scan_budget`；
+其区间嵌套在 progress 中，并可能包含 RDMA POST，不能重复累计。
 完整 parsed CSV 的文本导出会保留新记录，恢复时自动重建此报告，无需额外附件。
 
 包含 Combine 推进诊断的版本扩展了 timer buffer 布局：两节点均须重新 `build --timer` 并使用同版本解析器采集新 trace；
@@ -578,7 +596,8 @@ WQE 可直接跟在数据之后，Dispatch 不执行显式 quiet；SHMEM 无需�
 接收就绪不等待本卡反方向的 CQ 完成。接收侧仍保留 DCache 失效和 scalar→MTE2 acquire。
 公共输入 barrier 保留，统一 commit 和接收就绪仍须在它之前发布。
 HNS1825 的 Dispatch、Combine 发送源以及完整32位 `Sequence` 在本轮保持不变；
-Unpermute 只读独立的接收区，结束后由 AIV1 统一 quiet 一次并发布 `TxDone`，再允许 kernel 返回。
+Unpermute 只读独立的接收区。输出就绪屏障之后，通信 owner 统一 quiet 一次并发布 `TxDone`，
+其他 AIV 同时执行 Unpermute；kernel 完成等待两部分工作全部结束。
 下一轮沿用同一 runtime stream，不能在这个完成边界前覆盖源区或 epoch。
 XSCALE 没有使用上述 SO 合同，仍保留每阶段 `quiet → commit → quiet`；该优化不依赖 PI-on-chip 开关。
 这会放弃 metadata 提前到达时的 relay 重叠机会，整体收益以关闭打点的 perf 为准。
@@ -599,8 +618,9 @@ gateway 检查调用由448次降为16次；这些是依赖检查调用数，未�
 [`DataSyncBarrier<DDR>`](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/basic_api/sync_control/intra_core_sync/DataSyncBarrier_ISASI.md)，
 消费者保留 scalar→MTE2 顺序保障。A8W4/A8W8 共用此协议。
 
-A8W4 的跨机 Combine 在 AIV1 的计算间隙分批推进：两台机器均每次最多提交2个 Put、
-扫描64个 `[token, top-k]` 槽位。扫描游标跨调用保留，已发送槽位不再参与就绪判定；
+A8W4 的跨机 Combine 在 AIV1 的计算间隙分批推进：仍有本核路由或共享 activation 时，每次最多提交2个 Put、
+扫描64个 `[token, top-k]` 槽位；这些前台工作完成后扩大为最多8个 Put和一个完整槽位扫描。
+输出 export 前的最后一次推进也使用扩大后的预算。扫描游标跨调用保留，已发送槽位不再参与就绪判定；
 全部发送后立即返回。固定物理 AIV1 保留 activation、dispatch 和远端推进，
 本地 Combine 搬运交给其余 AIV1：28个 AIC 时由剩余27个 AIV1 均衡分配完整行，
 在27个 consumer 的空间内按 Combine wave 和全局行前缀轮换，确保每行只搬运一次。
@@ -610,12 +630,17 @@ owner 对每个 Combine slice 保留非阻塞生产完成检查，就绪后推�
 这避免 owner 因无本地行而立即跳完所有 slice、提前进入 SyncAll。非 RoCE、A8W8 路径
 及仅一个 AIC 的回退路径沿用原本地 Combine 分工；QP1 始终由固定物理 AIV1 独占。
 最终 host barrier 后完整 drain，HNS1825 直接提交 Combine commit，再等待对端 commit、执行 acquire
-和全 AIV 同步，然后 Unpermute，最后统一 quiet。两端都必须先提交再等待；没有远端行也不能省略
+和全 AIV 同步。随后 owner 执行 quiet，其他 AIV 同时 Unpermute。主机配置和设备分工统一排除物理 owner，
+例如56个 AIV 时由55个消费核完整分配输出行，owner 不再承担输出 token；不新增同步屏障。
+两端都必须先提交再等待；没有远端行也不能省略
 Dispatch/Combine commit。host barrier 关闭本机的生产者和旧 Dispatch 读取，双向 commit 继续保护跨轮复用。
 单次 Put 内部仍可能因队列回压等待，这些计数预算并非硬性时间上限。
 扫描在单次调用内缓存当前 token 的 pending mask，通过递增槽位推进，避免逐行除模；
 连续发送段在 Put 返回后按 token 清除对应位。扫描仍逐槽计数，保留洞、游标绕回、
-预算截断和相邻行合并的原有语义；恢复 A 的扫描行为，完成当次扫描或达到 Put 预算后返回，
+预算截断和相邻行合并。少于4行且前后仍有待发行的短段，允许同一起点最多延后一次，
+继续扫描其他位置并返回计算；再次遇到该起点就允许发送，不等待邻行的生产者。
+没有相邻待发行的孤立段立即发送。最终 drain 关闭延后和预算限制，立即提交所有已就绪段。
+这些规则不以 timer 结果决定调度。完成当次扫描或达到 Put 预算后返回，
 后续调用在全部行已提交时直接返回。提交完成不代表传输完成，后者仍由后续 quiet 保证。
 
 HNS1825 每轮显式 quiet 从4次减为1次，包含在 kernel 总计时内；不能将 quiet 的耗时简单乘以
@@ -637,7 +662,7 @@ ready 探测通过一次跨步 DMA，将最多8个512 B flag 槽的首32 B收集
 
 Combine 路由首次初始化使用 owner 专用256 B UB 分块 DMA 读取已接收的 rail 元数据；
 BS32、K8 时为5次256 B DMA，跳过每个512 B packet 的末尾 marker。
-该初始化优化也适用于 A8W8，其 Combine 仍由 AIV1 每次完整扫描。
+该初始化优化也适用于 A8W8，其 Combine 使用最多8个 Put、一次完整扫描和相同的短段合并规则。
 更新后两台均需重新构建安装 timer OFF 版本；按上述 BS32 流程先执行 `run` 校验精度，
 再执行一次 `perf`（默认20次 warmup、100次采样，统计后50次），将两个指标与前一版本比较。
 本轮 ready 批量探测的比较基线为 owner 搬运卸载版本的241.830/281.499 μs

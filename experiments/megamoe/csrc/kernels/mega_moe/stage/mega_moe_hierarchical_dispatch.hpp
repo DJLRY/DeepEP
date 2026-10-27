@@ -114,7 +114,7 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
         if (expertCount != 0U) {
             RelayRailTopkIdsToExperts(common, winRankAddr, config, params, scratch, sourceHost, job.jobIndex,
                                       static_cast<int32_t>(myHost * expertsPerHost + firstExpert),
-                                      static_cast<int32_t>(expertCount));
+                                      static_cast<int32_t>(expertCount), timer);
         }
     }
 }

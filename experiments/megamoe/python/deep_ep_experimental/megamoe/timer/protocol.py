@@ -61,9 +61,32 @@ DYNAMIC_NAMES = [
     "AIV_GATEWAY_PAYLOAD_WAIT",
     "AIV_COMBINE_PROGRESS",
     "AIV_COMBINE_DRAIN",
+    "AIV_RELAY_STEP",
+    "AIV_COMBINE_RUN",
 ]
 
 RDMA_PHASES = ("dispatch_meta", "dispatch_payload", "combine")
+RELAY_STEPS = ("packet_wait", "topk_load", "route_build", "route_post", "route_complete", "count_publish")
+COMBINE_RUN_STOPS = ("tensor_end", "route_gap", "producer_not_ready", "scan_budget")
+COUNT_DIAGNOSTIC_NAMES = [
+    "COUNT_PROFILE_VALID",
+    "COUNT_SNAPSHOT_ATTEMPTS",
+    "COUNT_SNAPSHOT_FAILURES",
+    "COUNT_DMA_CYCLES",
+    "COUNT_CHECK_CYCLES",
+    "COUNT_BACKOFF_CYCLES",
+    "COUNT_SUCCESS_DMA_CYCLES",
+    "COUNT_SUCCESS_CHECK_CYCLES",
+    "COUNT_LAST_STALE_WORDS",
+    "COUNT_LAST_STALE_SOURCE_MASK",
+    "COUNT_LAST_STALE_SOURCE_PLUS_ONE",
+    "COUNT_LAST_STALE_EXPERT_PLUS_ONE",
+    "COUNT_LAST_OBSERVED_EPOCH",
+    "COUNT_EXPECTED_EPOCH",
+    "COUNT_DIAGNOSTIC_CYCLES",
+    "COUNT_SNAPSHOT_BYTES",
+    "COUNT_SOURCE_MASK_OVERFLOW",
+]
 
 # W4 动态槽保存 tile/slice；其他路径保持原有区间协议。
 MAX_DYNAMIC_ITER = 4096
@@ -78,18 +101,82 @@ TASK_METADATA_SIZE = N_CORE_COUNT * len(DYNAMIC_NAMES) * MAX_DYNAMIC_ITER * 2
 NO_WAVE = -1
 WAVE_ID_OFFSET = TASK_METADATA_OFFSET + TASK_METADATA_SIZE
 WAVE_ID_PER_CORE = (len(FIXED_NAMES) + len(DYNAMIC_NAMES) * MAX_DYNAMIC_ITER + 15) // 16 * 16
-TOTAL_BUFFER_SIZE = WAVE_ID_OFFSET + WAVE_ID_PER_CORE * N_CORE_COUNT
+COUNT_DIAGNOSTIC_OFFSET = WAVE_ID_OFFSET + WAVE_ID_PER_CORE * N_CORE_COUNT
+TOTAL_BUFFER_SIZE = COUNT_DIAGNOSTIC_OFFSET + N_CORE_COUNT * len(COUNT_DIAGNOSTIC_NAMES)
+
+
+def count_diagnostics(raw, core_id):
+    offset = COUNT_DIAGNOSTIC_OFFSET + core_id * len(COUNT_DIAGNOSTIC_NAMES)
+    values = dict(zip(COUNT_DIAGNOSTIC_NAMES, raw[offset : offset + len(COUNT_DIAGNOSTIC_NAMES)], strict=True))
+    if not values["COUNT_PROFILE_VALID"]:
+        return {}
+    attempts, failures = values["COUNT_SNAPSHOT_ATTEMPTS"], values["COUNT_SNAPSHOT_FAILURES"]
+    if attempts < 1 or failures != attempts - 1:
+        raise ValueError(f"invalid count snapshot diagnostics: core={core_id}, attempts/failures")
+    source_mask = int(values["COUNT_LAST_STALE_SOURCE_MASK"]) & ((1 << 64) - 1)
+    result = dict(
+        snapshot_attempts=attempts,
+        snapshot_retries=failures,
+        snapshot_bytes=values["COUNT_SNAPSHOT_BYTES"],
+        last_failed_stale_words=values["COUNT_LAST_STALE_WORDS"],
+        last_failed_source_mask=source_mask,
+        last_failed_sources=[source for source in range(64) if source_mask & (1 << source)],
+        last_failed_source_rank=values["COUNT_LAST_STALE_SOURCE_PLUS_ONE"] - 1 if failures else None,
+        last_failed_local_expert_id=values["COUNT_LAST_STALE_EXPERT_PLUS_ONE"] - 1 if failures else None,
+        last_failed_observed_epoch=values["COUNT_LAST_OBSERVED_EPOCH"] if failures else None,
+        expected_epoch=values["COUNT_EXPECTED_EPOCH"],
+        source_mask_overflow=bool(values["COUNT_SOURCE_MASK_OVERFLOW"]),
+    )
+    for field, label in (
+        ("COUNT_DMA_CYCLES", "snapshot_dma"),
+        ("COUNT_CHECK_CYCLES", "snapshot_check"),
+        ("COUNT_BACKOFF_CYCLES", "snapshot_backoff"),
+        ("COUNT_SUCCESS_DMA_CYCLES", "successful_snapshot_dma"),
+        ("COUNT_SUCCESS_CHECK_CYCLES", "successful_snapshot_check"),
+        ("COUNT_DIAGNOSTIC_CYCLES", "diagnostic"),
+    ):
+        cycles = int(values[field])
+        if cycles < 0:
+            raise ValueError(f"negative count snapshot cycles: core={core_id}, field={field}")
+        result[label + "_cycles"] = cycles
+        result[label + "_us"] = cycles / CYCLE_TO_US
+    return result
 
 
 def task_metadata(raw, core_id, logical_index):
     """坐标直接来自设备，不根据 shape 或耗时猜测任务身份。"""
     dynamic_index = logical_index - len(FIXED_NAMES)
     if dynamic_index < 0:
-        return {}
+        return count_diagnostics(raw, core_id) if FIXED_NAMES[logical_index] == "AIV_COUNT_METADATA_WAIT" else {}
     offset = TASK_METADATA_OFFSET + (core_id * len(DYNAMIC_NAMES) * MAX_DYNAMIC_ITER + dynamic_index) * 2
     first, second = raw[offset : offset + 2]
     family = DYNAMIC_NAMES[dynamic_index // MAX_DYNAMIC_ITER]
     mask = (1 << 32) - 1
+    if family == "AIV_RELAY_STEP":
+        step, source = ((first >> 32) & mask), (first & mask) - 1
+        if step >= len(RELAY_STEPS) or source < 0:
+            raise ValueError(f"invalid relay metadata: core={core_id}, slot={dynamic_index}")
+        return dict(
+            granularity="relay_step",
+            relay_step=RELAY_STEPS[step],
+            source_rank=source,
+            first_expert=(second >> 32) & mask,
+            expert_count=second & mask,
+        )
+    if family == "AIV_COMBINE_RUN":
+        start, rows = (first >> 32) & mask, first & mask
+        reason = second & 0xFF
+        if reason >= len(COMBINE_RUN_STOPS) or not 0 < rows <= 1024 or start + rows > 1024 or second & ~0x703:
+            raise ValueError(f"invalid combine run metadata: core={core_id}, slot={dynamic_index}")
+        return dict(
+            granularity="combine_run",
+            run_start=start,
+            run_rows=rows,
+            decision="defer" if second & 0x100 else "post",
+            stop_reason=COMBINE_RUN_STOPS[reason],
+            next_pending=bool(second & 0x200),
+            already_deferred=bool(second & 0x400),
+        )
     if family in ("AIV_COMBINE_PROGRESS", "AIV_COMBINE_DRAIN"):
         # Raw storage is signed int64; these two metadata words are uint64.
         first = int(first) & ((1 << 64) - 1)

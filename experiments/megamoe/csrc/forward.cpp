@@ -216,7 +216,7 @@ MegaMoeUnpermuteBufferConfig UnpermuteConfig(const MegaMoeTilingData& t, uint32_
 
 void SetUnpermuteConfigs(MegaMoeTilingData& t, uint32_t ub)
 {
-    const uint32_t full = CeilDiv(t.bs, t.blockAivNum);
+    const uint32_t full = CeilDiv(t.bs, MegaMoeImpl::UnpermuteJobCount(&t));
     const uint32_t active = CeilDiv(t.bs, full);
     const uint32_t tail = t.bs - (active - 1U) * full;
     const bool tail_full = tail == full;

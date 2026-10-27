@@ -91,6 +91,7 @@ struct Fixture {
     uint32_t activationAdvances = 0;
     uint32_t combineAdvances = 0;
     uint32_t remoteCalls = 0;
+    std::vector<bool> remoteForeground;
     uint32_t operationCount = 0;
     int64_t clock = 0;
     std::vector<std::string> events;
@@ -192,10 +193,11 @@ struct Fixture {
         cursor.done = ++cursor.tile == sharedTiles;
         return true;
     }
-    bool TryProgressRemoteCombine()
+    bool TryProgressRemoteCombine(bool foregroundPending = true)
     {
         Guard();
         ++remoteCalls;
+        remoteForeground.push_back(foregroundPending);
         if (!UseHierarchicalRoce(params_.tilingData) || aivJob_.jobIndex != HierarchicalSendJob()) {
             events.push_back("R:noop");
             return false;
@@ -250,6 +252,7 @@ void CombineReleasesMultipleTilesAndSlices()
     };
     f.Run(5);
     f.Expect({"C0", "R:init", "A0:1", "A0:3", "A0:5", "A1:0", "A1:2", "C1", "R:scan"});
+    assert(f.remoteForeground == std::vector<bool>({true, false}));
     assert(f.clock == 0);
 }
 
@@ -266,6 +269,7 @@ void RemoteProgressRunsAfterEveryCombine()
             f.Expect({"C0", "R:init", "C1", "R:scan", "C2", "R:scan"});
         }
         assert(f.remoteCalls == slices);
+        assert(f.remoteForeground == std::vector<bool>(slices, false));
         assert(f.clock == 0);
     }
 }
@@ -279,6 +283,7 @@ void SharedActivationReleasedByCombineFollowsRemoteProgress()
     f.afterCombine = [](Fixture& fixture, uint32_t) { fixture.sharedReady = true; };
     f.Run(0);
     f.Expect({"C0", "R:init", "S0", "S1", "C1", "R:scan"});
+    assert(f.remoteForeground == std::vector<bool>({true, false}));
 }
 
 void ExistingActivationDispatchSharedPriorityIsPreserved()
@@ -324,6 +329,7 @@ void FallbackRemoteProgressCanReleaseActivation()
     };
     f.Run(1);
     f.Expect({"R:init", "A0:1"});
+    assert(f.remoteForeground == std::vector<bool>({true}));
     assert(f.clock == 0);
 }
 

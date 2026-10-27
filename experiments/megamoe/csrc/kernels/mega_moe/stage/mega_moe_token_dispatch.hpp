@@ -21,6 +21,7 @@
 #include "../common/mega_moe_utils.hpp"
 #include "../common/mega_moe_peer_rows.hpp"
 #include "../common/ascend_timer_v2_device.hpp"
+#include "../common/mega_moe_count_profile.hpp"
 #include "mega_moe_token_quant.hpp"
 #include "mega_moe_count_arrival.hpp"
 #include "mega_moe_gateway_readiness.hpp"
@@ -568,7 +569,8 @@ __aicore__ inline void DispatchTokenRange(const TokenDispatchConfig& context, co
 
 template <typename ActivationType>
 __aicore__ inline void LoadMteExpertCounts(const MoeStageCommonConfig& common, const Params& params,
-                                           TokenDispatchScratch<ActivationType>& scratch, uint32_t expectedEpoch)
+                                           TokenDispatchScratch<ActivationType>& scratch, uint32_t expectedEpoch,
+                                           AscendTimerDevice* timer = nullptr)
 {
     const uint32_t stride = static_cast<uint32_t>(CalcMteExpertCountRankStride(common.moeExpertPerRank));
     const uint32_t wireWords = common.worldSize * stride;
@@ -578,15 +580,36 @@ __aicore__ inline void LoadMteExpertCounts(const MoeStageCommonConfig& common, c
     __gm__ int32_t* wire = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.expertCountRecvPtr);
     if (static_cast<uint64_t>(wireWords) * sizeof(int32_t) <= availableBytes) {
         const uint32_t stagingAddr = static_cast<uint32_t>(scratch.validTopkIndexTensor.GetPhyAddr());
-        LocalTensor<int32_t> snapshot(TPosition::VECCALC, stagingAddr, wireWords);
         GlobalTensor<int32_t> global;
         global.SetGlobalBuffer(wire);
         uint32_t stale = 0;
+        uint32_t snapshotAddr = stagingAddr;
+#ifdef DEEPEP_MEGAMOE_TIMER
+        using namespace AscendTimer;
+        const bool profile = timer != nullptr && timer->Enabled();
+        uint64_t stats[COUNT_DIAGNOSTIC_COUNT]{};
+        stats[COUNT_PROFILE_VALID] = 1;
+        stats[COUNT_EXPECTED_EPOCH] = expectedEpoch;
+        stats[COUNT_SNAPSHOT_BYTES] = wireWords * sizeof(int32_t);
+        // Reuse the idle Dispatch copy buffers. Alternating snapshots preserves
+        // the last failed poll without extra DMA, vector calls or barriers.
+        const bool preserveFailure = profile && 2U * stats[COUNT_SNAPSHOT_BYTES] <= availableBytes;
+        uint32_t failedAddr = stagingAddr;
+#else
+        (void)timer;
+#endif
         do {
+            LocalTensor<int32_t> snapshot(TPosition::VECCALC, snapshotAddr, wireWords);
+#ifdef DEEPEP_MEGAMOE_TIMER
+            const int64_t dmaStart = profile ? AscendC::GetSystemCycle() : 0;
+#endif
             SyncFuncStatic<AscendC::HardEvent::V_MTE2, SYNC_EVENT_ID2>();
             DataCopyPad(snapshot, global, {1U, static_cast<uint32_t>(wireWords * sizeof(int32_t)), 0U, 0U, 0U},
                         {false, 0U, 0U, 0U});
             SyncFuncStatic<AscendC::HardEvent::MTE2_V, SYNC_EVENT_ID2>();
+#ifdef DEEPEP_MEGAMOE_TIMER
+            const int64_t dmaEnd = profile ? AscendC::GetSystemCycle() : 0;
+#endif
             asc_vf_call<CheckTransposeExpertCountsVF>(
                 reinterpret_cast<__ubuf__ uint32_t*>(snapshot.GetPhyAddr()),
                 reinterpret_cast<__ubuf__ uint32_t*>(scratch.cumsumInfoTensor.GetPhyAddr()),
@@ -594,12 +617,56 @@ __aicore__ inline void LoadMteExpertCounts(const MoeStageCommonConfig& common, c
                 common.moeExpertPerRank, stride, expectedEpoch);
             SyncFuncStatic<AscendC::HardEvent::V_S, SYNC_EVENT_ID2>();
             stale = static_cast<uint32_t>(scratch.expertTokenNumsOutTensor.GetValue(0));
+#ifdef DEEPEP_MEGAMOE_TIMER
+            if (profile) {
+                const int64_t checkEnd = AscendC::GetSystemCycle();
+                ++stats[COUNT_SNAPSHOT_ATTEMPTS];
+                stats[COUNT_DMA_CYCLES] += dmaEnd - dmaStart;
+                stats[COUNT_CHECK_CYCLES] += checkEnd - dmaEnd;
+                if (stale == 0U) {
+                    stats[COUNT_SUCCESS_DMA_CYCLES] = dmaEnd - dmaStart;
+                    stats[COUNT_SUCCESS_CHECK_CYCLES] = checkEnd - dmaEnd;
+                } else {
+                    ++stats[COUNT_SNAPSHOT_FAILURES];
+                    stats[COUNT_LAST_STALE_WORDS] = stale;
+                    failedAddr = snapshotAddr;
+                    if (preserveFailure) {
+                        snapshotAddr =
+                            snapshotAddr == stagingAddr ? stagingAddr + wireWords * sizeof(int32_t) : stagingAddr;
+                    } else {
+                        // Rare small-UB shapes retain the last failure by
+                        // decoding before overwrite; report this observer cost.
+                        const int64_t captureStart = AscendC::GetSystemCycle();
+                        CaptureFailedCountSnapshot(snapshot, common.worldSize, common.moeExpertPerRank, stride,
+                                                   expectedEpoch, stats);
+                        stats[COUNT_DIAGNOSTIC_CYCLES] += AscendC::GetSystemCycle() - captureStart;
+                    }
+                }
+            }
+#endif
             if (stale != 0U) {
                 int64_t startCycle = AscendC::GetSystemCycle();
                 while (AscendC::GetSystemCycle() - startCycle < GM_FLAG_POLL_BACKOFF_CYCLES) {
                 }
+#ifdef DEEPEP_MEGAMOE_TIMER
+                if (profile) {
+                    stats[COUNT_BACKOFF_CYCLES] += AscendC::GetSystemCycle() - startCycle;
+                }
+#endif
             }
         } while (stale != 0U);
+#ifdef DEEPEP_MEGAMOE_TIMER
+        if (profile) {
+            if (preserveFailure && stats[COUNT_SNAPSHOT_FAILURES] != 0U) {
+                const int64_t captureStart = AscendC::GetSystemCycle();
+                LocalTensor<int32_t> failed(TPosition::VECCALC, failedAddr, wireWords);
+                CaptureFailedCountSnapshot(failed, common.worldSize, common.moeExpertPerRank, stride, expectedEpoch,
+                                           stats);
+                stats[COUNT_DIAGNOSTIC_CYCLES] += AscendC::GetSystemCycle() - captureStart;
+            }
+            timer->WriteCountDiagnostics(stats);
+        }
+#endif
         return;
     }
     // Unusual small-token-buffer / large-expert-table shapes retain a bounded-UB path.
@@ -646,7 +713,7 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
             // Includes DMA snapshots, epoch validation and any poll/backoff;
             // it is readiness acquisition time, not pure network latency.
             AscendTimerFixedScope counts(timer, AscendTimer::AIV_COUNT_METADATA_WAIT);
-            LoadMteExpertCounts(common, params, scratch, static_cast<uint32_t>(expectEpoch));
+            LoadMteExpertCounts(common, params, scratch, static_cast<uint32_t>(expectEpoch), timer);
         }
     } else {
         AscendTimerFixedScope counts(timer, AscendTimer::AIV_COUNT_METADATA_WAIT);

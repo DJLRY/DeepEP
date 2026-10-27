@@ -59,10 +59,39 @@ enum DynamicTimingType {
     AIV_GATEWAY_PAYLOAD_WAIT,
     AIV_COMBINE_PROGRESS,
     AIV_COMBINE_DRAIN,
+    AIV_RELAY_STEP,
+    AIV_COMBINE_RUN,
     DYNAMIC_TYPE_COUNT_ENUM
 };
 
 enum class RdmaPhase : uint32_t { DispatchMeta = 0, DispatchPayload = 1, Combine = 2 };
+
+enum class RelayStep : uint32_t { PacketWait = 0, TopkLoad, RouteBuild, RoutePost, RouteComplete, CountPublish };
+
+// One summary per count-table acquisition, not one GM trace write per poll.
+// Source coordinates describe the last observed FAILED snapshot, never an
+// inferred network arrival order. A zero COUNT_LAST_STALE_WORDS means no failed
+// poll. The representative expert index is local to the receiving rank.
+enum CountDiagnostic {
+    COUNT_PROFILE_VALID = 0,
+    COUNT_SNAPSHOT_ATTEMPTS,
+    COUNT_SNAPSHOT_FAILURES,
+    COUNT_DMA_CYCLES,
+    COUNT_CHECK_CYCLES,
+    COUNT_BACKOFF_CYCLES,
+    COUNT_SUCCESS_DMA_CYCLES,
+    COUNT_SUCCESS_CHECK_CYCLES,
+    COUNT_LAST_STALE_WORDS,
+    COUNT_LAST_STALE_SOURCE_MASK,
+    COUNT_LAST_STALE_SOURCE_PLUS_ONE,
+    COUNT_LAST_STALE_EXPERT_PLUS_ONE,
+    COUNT_LAST_OBSERVED_EPOCH,
+    COUNT_EXPECTED_EPOCH,
+    COUNT_DIAGNOSTIC_CYCLES,
+    COUNT_SNAPSHOT_BYTES,
+    COUNT_SOURCE_MASK_OVERFLOW,
+    COUNT_DIAGNOSTIC_COUNT
+};
 
 // W4 tile 事件按真实任务编号；WAIT 复用对应计算任务的编号。
 // 为大 BS 的 tile 依赖等待预留空间，超限由主机校验明确报错。
@@ -90,7 +119,8 @@ static constexpr int NO_WAVE = -1;
 static constexpr int WAVE_ID_OFFSET = TASK_METADATA_OFFSET + TASK_METADATA_SIZE;
 static constexpr int WAVE_ID_PER_CORE_ALIGN = (N_TIMING_ITEM_PER_CORE + 15) / 16 * 16;
 static constexpr int WAVE_ID_TOTAL_SIZE = WAVE_ID_PER_CORE_ALIGN * N_CORE_COUNT;
-static constexpr int TOTAL_BUFFER_SIZE = WAVE_ID_OFFSET + WAVE_ID_TOTAL_SIZE;
+static constexpr int COUNT_DIAGNOSTIC_OFFSET = WAVE_ID_OFFSET + WAVE_ID_TOTAL_SIZE;
+static constexpr int TOTAL_BUFFER_SIZE = COUNT_DIAGNOSTIC_OFFSET + N_CORE_COUNT * COUNT_DIAGNOSTIC_COUNT;
 
 }  // namespace AscendTimer
 

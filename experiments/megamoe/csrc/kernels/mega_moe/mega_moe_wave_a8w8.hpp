@@ -100,7 +100,8 @@ private:
             // safely owns the RDMA scratch.
             if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
                 return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_,
-                                                      HierarchicalRoceScratch(params_));
+                                                      HierarchicalRoceScratch(params_), nullptr,
+                                                      {8U, HIERARCHICAL_MAX_TOKENS * commonConfig_.topK, 4U});
             }
         }
         return false;
@@ -229,7 +230,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::InitTok
     if constexpr (CombineQuantMode != COMBINE_NO_QUANT && g_coreType == AIV) {
         quantTokenSizeBytes = CreateQuantTokenBufferConfig(k_).quantTokenSizeBytes;
     }
-    tokenUnpermuteConfig_ = {.job = {.jobIndex = aivCoreIdx_, .totalJobs = blockAivNum_},
+    tokenUnpermuteConfig_ = {.job = {.jobIndex = UnpermuteJobIndex(params_.tilingData, aivCoreIdx_),
+                                     .totalJobs = UnpermuteJobCount(params_.tilingData)},
                              .quantTokenSizeBytes = quantTokenSizeBytes,
                              .fullTokenChunkJobCount = params_.tilingData->unpermuteFullTokenChunkCoreCount,
                              .fullTokenChunkConfig = params_.tilingData->unpermuteConfigForFullTokenChunk,
@@ -1098,15 +1100,16 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
             CrossRankSyncInWorldSize(params_.peermemInfo.rankSyncInWorldPtr, rankId_, worldSize_, aivJob_);
         }
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::UNPERMUTE);
-        UnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();
-        UnpermuteTokens<CombineQuantMode, TopkWeightsType, TopkWeightsPrefetch, GMM1_TILE_M>(
-            tokenUnpermuteConfig_, commonConfig_, params_, tokenUnpermuteScratch_, unpermuteBufferConfig);
         if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
-            // Unpermute reads the incoming combineSend region, never the
-            // outbound gatewayCombine rows or Sequence protected by this drain.
+            // Output readiness is already acquired. Other AIVs own all output
+            // rows and overlap their Unpermute with this owner's final quiet.
             RoceFinishOutstanding(HierarchicalGateway(rankId_), HierarchicalRoceScratch(params_), nullptr,
                                   AscendTimer::RdmaPhase::Combine);
             PublishHierarchicalLocalSignal(params_, HierarchicalSignal::TxDone);
+        } else {
+            UnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();
+            UnpermuteTokens<CombineQuantMode, TopkWeightsType, TopkWeightsPrefetch, GMM1_TILE_M>(
+                tokenUnpermuteConfig_, commonConfig_, params_, tokenUnpermuteScratch_, unpermuteBufferConfig);
         }
     }
     // 恢复入口时保存的溢出模式。

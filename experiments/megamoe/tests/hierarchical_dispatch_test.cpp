@@ -108,7 +108,7 @@ inline void CalcRailRelayExpertRange(uint32_t, uint32_t, uint32_t, uint32_t, uin
     count = 1U;
 }
 inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig&, GM_ADDR*, const SendMaskConfig&, const Params&,
-                                      SendMaskScratch&, uint32_t, uint32_t, int32_t, int32_t)
+                                      SendMaskScratch&, uint32_t, uint32_t, int32_t, int32_t, AscendTimerDevice*)
 {
     using namespace DispatchTest;
     Check(RoceTest::blockIndex != 1 && ReadWord(local, metaReady) == sequence && RoceTest::mteCanRead,

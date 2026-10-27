@@ -95,6 +95,24 @@ HOST_DEVICE uint32_t HierarchicalSendJob()
     return 1U;
 }
 
+// Reserve the physical QP owner for completion after the output-ready barrier.
+// Host buffer sizing and device token partitioning must use the same job count.
+HOST_DEVICE uint32_t UnpermuteJobCount(const MegaMoeTilingData* t)
+{
+    return UseHierarchicalRoce(t) && t->blockAivNum > HierarchicalSendJob() ? t->blockAivNum - 1U : t->blockAivNum;
+}
+
+HOST_DEVICE uint32_t UnpermuteJobIndex(const MegaMoeTilingData* t, uint32_t physicalJob)
+{
+    if (UnpermuteJobCount(t) == t->blockAivNum) {
+        return physicalJob;
+    }
+    if (physicalJob == HierarchicalSendJob()) {
+        return UnpermuteJobCount(t);  // Invalid logical job: owns no output rows.
+    }
+    return physicalJob > HierarchicalSendJob() ? physicalJob - 1U : physicalJob;
+}
+
 HOST_DEVICE uint64_t HierarchicalSignalOffset(HierarchicalSignal signal)
 {
     return static_cast<uint64_t>(signal) * HIERARCHICAL_FLAG_BYTES;

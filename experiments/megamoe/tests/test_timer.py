@@ -33,7 +33,8 @@ def test_device_schema_and_extended_size():
     assert names("DynamicTimingType", "DYNAMIC_TYPE_COUNT_ENUM") == p.DYNAMIC_NAMES
     for name in ("MAX_DYNAMIC_ITER", "N_CORE_COUNT"):
         assert int(re.search(rf"{name}\s*=\s*(\d+)", header)[1]) == getattr(p, name)
-    assert p.TOTAL_BUFFER_SIZE == p.WAVE_ID_OFFSET + p.WAVE_ID_PER_CORE * p.N_CORE_COUNT
+    assert names("CountDiagnostic", "COUNT_DIAGNOSTIC_COUNT") == p.COUNT_DIAGNOSTIC_NAMES
+    assert p.TOTAL_BUFFER_SIZE == p.COUNT_DIAGNOSTIC_OFFSET + len(p.COUNT_DIAGNOSTIC_NAMES) * p.N_CORE_COUNT
     assert p.TASK_METADATA_SIZE == p.N_CORE_COUNT * len(p.DYNAMIC_NAMES) * p.MAX_DYNAMIC_ITER * 2
 
 
@@ -92,6 +93,76 @@ def test_truncated_and_overflow_rejected(raw_file):
         stream.truncate(8)
     with pytest.raises(ValueError, match="size"):
         load_raw(raw_file)
+
+
+def test_startup_details_and_combine_decisions_round_trip(raw_file, tmp_path):
+    core = 2
+    with raw_file.open("r+b") as stream:
+
+        def put(index, *values):
+            stream.seek(index * 8)
+            stream.write(struct.pack("<" + "q" * len(values), *values))
+
+        fixed = p.FIXED_NAMES.index("AIV_COUNT_METADATA_WAIT")
+        put(core * p.COUNTERS_PER_CORE + fixed * 2, 100000, 120000)
+        stats = dict(
+            COUNT_PROFILE_VALID=1,
+            COUNT_SNAPSHOT_ATTEMPTS=3,
+            COUNT_SNAPSHOT_FAILURES=2,
+            COUNT_DMA_CYCLES=6000,
+            COUNT_CHECK_CYCLES=9000,
+            COUNT_BACKOFF_CYCLES=400,
+            COUNT_SUCCESS_DMA_CYCLES=2000,
+            COUNT_SUCCESS_CHECK_CYCLES=3000,
+            COUNT_LAST_STALE_WORDS=2,
+            COUNT_LAST_STALE_SOURCE_MASK=(1 << 7) | (1 << 23),
+            COUNT_LAST_STALE_SOURCE_PLUS_ONE=8,
+            COUNT_LAST_STALE_EXPERT_PLUS_ONE=6,
+            COUNT_LAST_OBSERVED_EPOCH=128,
+            COUNT_EXPECTED_EPOCH=129,
+            COUNT_DIAGNOSTIC_CYCLES=700,
+            COUNT_SNAPSHOT_BYTES=2048,
+        )
+        put(
+            p.COUNT_DIAGNOSTIC_OFFSET + core * len(p.COUNT_DIAGNOSTIC_NAMES),
+            *(stats.get(name, 0) for name in p.COUNT_DIAGNOSTIC_NAMES),
+        )
+        for family, records in (
+            ("AIV_RELAY_STEP", [((0 << 32) | 31, (168 << 32) | 12), ((5 << 32) | 31, (168 << 32) | 12)]),
+            ("AIV_COMBINE_RUN", [((7 << 32) | 1, 0x302), ((7 << 32) | 16, 0x401)]),
+        ):
+            type_id = p.DYNAMIC_NAMES.index(family)
+            put(p.N_TIMING_COUNTER + core * p.DYNAMIC_ITER_PER_CORE + type_id, len(records))
+            for index, words in enumerate(records):
+                slot = type_id * p.MAX_DYNAMIC_ITER + index
+                logical = len(p.FIXED_NAMES) + slot
+                put(core * p.COUNTERS_PER_CORE + logical * 2, 110000 + index * 1000, 110500 + index * 1000)
+                put(p.TASK_METADATA_OFFSET + (core * len(p.DYNAMIC_NAMES) * p.MAX_DYNAMIC_ITER + slot) * 2, *words)
+    parsed = raw_file.with_suffix(".parsed.csv")
+    decode(raw_file, parsed)
+    raw = raw_events_for_rank(parsed, 0)
+    visible = trace_events(raw, "keep", first_start_cycle(raw), include_wait=True)
+    count = next(e for e in visible if e["args"].get("event_family") == "AIV_COUNT_METADATA_WAIT")
+    assert count["args"]["snapshot_retries"] == 2
+    assert count["args"]["last_failed_sources"] == [7, 23]
+    assert count["args"]["last_failed_local_expert_id"] == 5
+    assert count["args"]["snapshot_dma_us"] == 6 and count["args"]["diagnostic_us"] == 0.7
+    relay = [e for e in visible if e["args"].get("granularity") == "relay_step"]
+    assert [e["args"]["relay_step"] for e in relay] == ["packet_wait", "count_publish"]
+    assert relay[0]["args"]["source_rank"] == 30 and relay[0]["args"]["first_expert"] == 168
+    runs = [e["args"] for e in visible if e["args"].get("granularity") == "combine_run"]
+    assert runs[0]["decision"] == "defer" and runs[0]["stop_reason"] == "producer_not_ready"
+    assert runs[1]["run_rows"] == 16 and runs[1]["already_deferred"]
+    hidden = trace_events(raw, "keep", first_start_cycle(raw), include_wait=False)
+    assert not any(e["args"].get("relay_step") == "packet_wait" for e in hidden)
+    assert any(e["args"].get("relay_step") == "count_publish" for e in hidden)
+    report = tmp_path / "startup.csv"
+    write_startup_breakdown({0: raw}, report)
+    with report.open(newline="", encoding="utf-8") as stream:
+        rows = list(csv.DictReader(stream))
+    count_row = next(row for row in rows if row["event_family"] == "AIV_COUNT_METADATA_WAIT")
+    assert json.loads(count_row["last_failed_sources"]) == [7, 23]
+    assert count_row["snapshot_retries"] == "2"
 
 
 def test_sync_alignment_is_explicit_and_requires_anchor():

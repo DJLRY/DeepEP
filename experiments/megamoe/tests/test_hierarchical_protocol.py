@@ -355,9 +355,9 @@ def lifecycle_dependencies(*, backend, whole_host=True, wait_before_send=False, 
         graph["unpermute", rank] = {("receive", rank)}
         retired = ("unpermute", rank)
         if backend == "HNS_1825" and tail_quiet:
-            graph["tail-quiet", rank] = {("unpermute", rank), ("commit-complete", rank)}
+            graph["tail-quiet", rank] = {("receive", rank), ("commit-complete", rank)}
             retired = ("tail-quiet", rank)
-        graph["reuse", rank] = {retired, ("host", host(rank))}
+        graph["reuse", rank] = {retired, ("unpermute", rank), ("host", host(rank))}
         if wait_before_send:
             graph["post", rank].add(("receive", rank))
     return graph
@@ -597,8 +597,8 @@ def a8w8_qp_phase_dependencies(*, backend, combine_owner=1, input_barrier=True):
                 "input-finish-aiv1": {"dispatch-commit"},
                 "combine-commit": {"combine-final-drain"},
                 "combine-receive": {"combine-commit", "incoming-combine-commit"},
-                "tail-quiet": {"unpermute"},
-                "return": {"tail-quiet"},
+                "tail-quiet": {"output-aiv-barrier"},
+                "return": {"tail-quiet", "unpermute"},
             }
         )
     else:
@@ -668,7 +668,9 @@ def test_a8w8_fixed_qp_owner_and_aiv1_scratch_allow_next_wave_fix_overlap(backen
     assert not unordered_resource_conflicts(graph, actions)
     if backend == "HNS_1825":
         assert "tail-quiet" in ancestors(graph, "return")
-        assert "unpermute" in ancestors(graph, "tail-quiet")
+        assert "unpermute" not in ancestors(graph, "tail-quiet")
+        assert "unpermute" in ancestors(graph, "return")
+        assert "output-aiv-barrier" in ancestors(graph, "tail-quiet")
         assert "tail-quiet" not in ancestors(graph, "unpermute")
         assert "dispatch-payload-quiet" not in graph and "combine-payload-quiet" not in graph
     # FIX may continue on AIV0's UB while the communication owner progresses.
@@ -711,7 +713,7 @@ def cpp_function_body(path, signature):
         ("mega_moe_wave_a8w8.hpp", "::Process()", False),
     ],
 )
-def test_real_kernel_entrypoints_retire_sources_after_unpermute_before_return(header, signature, timed):
+def test_real_kernel_entrypoints_overlap_owner_retirement_after_output_ready(header, signature, timed):
     kernels = Path(__file__).resolve().parents[1] / "csrc/kernels/mega_moe"
     body = cpp_function_body(kernels / header, signature)
     expected = (
@@ -719,9 +721,9 @@ def test_real_kernel_entrypoints_retire_sources_after_unpermute_before_return(he
         "DrainHierarchicalCombine(",
         "RocePublishCommit(",
         "RoceWaitCommit(",
-        "UnpermuteTokens<",
         "RoceFinishOutstanding(",
         "HierarchicalSignal::TxDone",
+        "UnpermuteTokens<",
         "Stage::COMPLETE",
     )
     positions = [body.index(token) for token in expected]
@@ -729,11 +731,14 @@ def test_real_kernel_entrypoints_retire_sources_after_unpermute_before_return(he
     assert body.count("RoceFinishOutstanding(") == 1
     # The final retirement remains on the designated communication owner and is
     # reached on empty-route calls too; it must not be guarded by sentRows.
-    tail_begin = body.index("UnpermuteTokens<")
+    tail_begin = body.index("Stage::UNPERMUTE")
     tail = body[tail_begin : body.index("Stage::COMPLETE")]
     assert "UseHierarchicalRoce(params_.tilingData)" in tail
     assert "aivJob_.jobIndex == HierarchicalSendJob()" in tail
     assert "expectedRows" not in tail and "sentRows" not in tail
+    assert "} else {" in tail[tail.index("HierarchicalSignal::TxDone") : tail.index("UnpermuteTokens<")]
+    assert "SyncAll<true>()" in body[body.index("RoceWaitCommit(") : tail_begin]
+    assert "SyncAll" not in tail, "The owner must not gate other AIVs behind its final quiet"
     if timed:
         assert positions[-2] < body.index("timer_.End(AscendTimer::KERNEL_TIMING)")
         assert positions[-2] < body.index("timer_.FlushDynamicCounts()")

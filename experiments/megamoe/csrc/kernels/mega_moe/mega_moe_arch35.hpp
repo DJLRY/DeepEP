@@ -93,13 +93,16 @@ protected:
     __aicore__ inline void InitQuantTokenBufferConfig();
     __aicore__ inline UnpermuteBufferConfig InitTokenUnpermuteBuffers();
     __aicore__ inline void ProcessInputPreparationStage();
-    __aicore__ inline bool TryProgressRemoteCombine()
+    __aicore__ inline bool TryProgressRemoteCombine(bool foregroundPending = true)
     {
         if constexpr (g_coreType == AIV) {
             if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
                 // Bound both posting and flag scans before returning to the
                 // next activation/dispatch task on the fixed AIV1 owner.
-                const HierarchicalCombineProgressBudget budget{2U, 64U};
+                const HierarchicalCombineProgressBudget budget =
+                    foregroundPending
+                        ? HierarchicalCombineProgressBudget{2U, 64U, 4U}
+                        : HierarchicalCombineProgressBudget{8U, HIERARCHICAL_MAX_TOKENS * commonConfig_.topK, 4U};
                 return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_,
                                                       HierarchicalRoceScratch(params_),
                                                       timer_.Enabled() ? &timer_ : nullptr, budget);
@@ -236,7 +239,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::InitGmmConfigs()
 template <TemplateMegaMoeTypeClass>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::InitTokenUnpermuteConfig()
 {
-    tokenUnpermuteConfig_ = {.job = {.jobIndex = aivCoreIdx_, .totalJobs = blockAivNum_},
+    tokenUnpermuteConfig_ = {.job = {.jobIndex = UnpermuteJobIndex(params_.tilingData, aivCoreIdx_),
+                                     .totalJobs = UnpermuteJobCount(params_.tilingData)},
                              .quantTokenSizeBytes = quantTokenBufferConfig_.quantTokenSizeBytes,
                              .fullTokenChunkJobCount = params_.tilingData->unpermuteFullTokenChunkCoreCount,
                              .fullTokenChunkConfig = params_.tilingData->unpermuteConfigForFullTokenChunk,
@@ -1009,7 +1013,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
     if constexpr (g_coreType == AIV) {
         timer_.Start(AscendTimer::AIV_EXPORT_SYNC);
         ExportCompactExpertTokenCounts(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
-        TryProgressRemoteCombine();
+        TryProgressRemoteCombine(false);
         PipeBarrier<PIPE_ALL>();
         SyncAll<true>();
         timer_.End(AscendTimer::AIV_EXPORT_SYNC);
@@ -1053,18 +1057,19 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         }
         timer_.End(AscendTimer::AIV_FINAL_CROSS_RANK_WAIT);
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::UNPERMUTE);
-        MegaMoeUnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();
-        timer_.Start(AscendTimer::AIV_UNPERMUTE);
-        UnpermuteTokens<CombineQuantMode, TopkWeightsType, TopkWeightsPrefetch, GMM1_TILE_M>(
-            tokenUnpermuteConfig_, commonConfig_, params_, tokenUnpermuteScratch_, unpermuteBufferConfig);
-        timer_.End(AscendTimer::AIV_UNPERMUTE);
         if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
-            // HNS ordered commits permit receive consumption before local CQ
-            // retirement. Keep every outbound GM source and Sequence immutable
-            // until this final drain, after Unpermute but before kernel return.
+            // The existing output barrier has released every consumer. Retire
+            // outgoing sources while the other AIVs unpermute disjoint output
+            // rows; kernel completion still waits for both groups of work.
             RoceFinishOutstanding(HierarchicalGateway(rankId_), HierarchicalRoceScratch(params_),
                                   timer_.Enabled() ? &timer_ : nullptr, AscendTimer::RdmaPhase::Combine);
             PublishHierarchicalLocalSignal(params_, HierarchicalSignal::TxDone);
+        } else {
+            MegaMoeUnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();
+            timer_.Start(AscendTimer::AIV_UNPERMUTE);
+            UnpermuteTokens<CombineQuantMode, TopkWeightsType, TopkWeightsPrefetch, GMM1_TILE_M>(
+                tokenUnpermuteConfig_, commonConfig_, params_, tokenUnpermuteScratch_, unpermuteBufferConfig);
+            timer_.End(AscendTimer::AIV_UNPERMUTE);
         }
     }
 

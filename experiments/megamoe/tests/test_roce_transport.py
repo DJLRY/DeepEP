@@ -47,6 +47,11 @@ def test_combine_progress_timer_preserves_state_and_excludes_paused_work(tmp_pat
     compile_and_run(tmp_path, None, "combine_progress_timer_test.cpp", timer)
 
 
+@pytest.mark.parametrize("timer", [False, True], ids=["timer-off", "timer-on"])
+def test_startup_detail_timer_preserves_spans_and_does_not_add_barriers(tmp_path, timer):
+    compile_and_run(tmp_path, None, "startup_detail_timer_test.cpp", timer)
+
+
 def compile_and_run(tmp_path, backend, source_name, timer=False, stub_directories=("roce_stubs",)):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:

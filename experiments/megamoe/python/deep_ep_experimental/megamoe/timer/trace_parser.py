@@ -81,7 +81,12 @@ def apply_input_sync_mode(events, mode):
 def apply_wait_mode(events, include_wait):
     if include_wait:
         return events
-    return [event for event in events if "WAIT" not in event["name"]]
+    return [
+        event
+        for event in events
+        if "WAIT" not in event["name"]
+        and event.get("task", {}).get("relay_step") not in ("packet_wait", "route_complete")
+    ]
 
 
 def raw_events_for_rank(path: Path, rank: int):
@@ -208,6 +213,18 @@ def trace_events(
             if granularity == "startup_dependency":
                 display_name += f"_source{task['source_rank']}_gateway{task['gateway_rank']}_seq{task['sequence']}"
             wave_metadata["display_index_semantics"] = "per_core_startup_phase_or_dependency"
+        if granularity == "relay_step":
+            lane += "/RELAY"
+            category = "relay_wait" if task["relay_step"] in ("packet_wait", "route_complete") else "relay"
+            display_name = f"RELAY_{task['relay_step']}_source{task['source_rank']}_experts{task['first_expert']}+{task['expert_count']}"
+            wave_metadata["display_index_semantics"] = "per_core_relay_step"
+        if granularity == "combine_run":
+            lane += "/COMBINE_RUN"
+            category = "combine_run"
+            display_name = (
+                f"COMBINE_{task['decision']}_rows{task['run_start']}+{task['run_rows']}_{task['stop_reason']}"
+            )
+            wave_metadata["display_index_semantics"] = "per_core_combine_run"
         if family in COMBINE_PROGRESS_FIXED_NAMES or granularity in ("combine_progress", "combine_drain"):
             lane += "/COMBINE_PROGRESS"
             category = "combine_wait" if "WAIT" in family else "combine_progress"
@@ -255,6 +272,27 @@ def event_family(name: str) -> str:
 
 def write_startup_breakdown(raw_by_rank, path: Path):
     """Retain WAIT and parent envelopes; overlapping rows must not be summed."""
+    detail_fields = [
+        "relay_step",
+        "first_expert",
+        "expert_count",
+        "snapshot_attempts",
+        "snapshot_retries",
+        "snapshot_bytes",
+        "snapshot_dma_us",
+        "snapshot_check_us",
+        "snapshot_backoff_us",
+        "successful_snapshot_dma_us",
+        "successful_snapshot_check_us",
+        "diagnostic_us",
+        "last_failed_stale_words",
+        "last_failed_sources",
+        "last_failed_source_rank",
+        "last_failed_local_expert_id",
+        "last_failed_observed_epoch",
+        "expected_epoch",
+        "source_mask_overflow",
+    ]
     fields = [
         "rank",
         "group_id",
@@ -267,7 +305,7 @@ def write_startup_breakdown(raw_by_rank, path: Path):
         "source_rank",
         "gateway_rank",
         "sequence",
-    ]
+    ] + detail_fields
     parents = {"AIC_MOE_STARTUP", "AIV_MOE_STARTUP", "AIV_COUNT_TABLE_PREPARE", "AIV_GATEWAY_PAYLOAD_CHECK"}
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -279,6 +317,7 @@ def write_startup_breakdown(raw_by_rank, path: Path):
                 if family not in STARTUP_FIXED_NAMES and family not in (
                     "AIC_WAIT_INPUT_PREP",
                     "AIV_GATEWAY_PAYLOAD_WAIT",
+                    "AIV_RELAY_STEP",
                 ):
                     continue
                 task = event.get("task", {})
@@ -293,6 +332,10 @@ def write_startup_breakdown(raw_by_rank, path: Path):
                         start_us=f"{(event['start_cycle'] - base) / CYCLE_TO_US:.6f}",
                         duration_us=f"{(event['end_cycle'] - event['start_cycle']) / CYCLE_TO_US:.6f}",
                         **{key: task.get(key, "") for key in ("source_rank", "gateway_rank", "sequence")},
+                        **{
+                            key: json.dumps(task[key]) if isinstance(task.get(key), list) else task.get(key, "")
+                            for key in detail_fields
+                        },
                     )
                 )
 
@@ -304,6 +347,7 @@ def write_combine_progress_breakdown(raw_by_rank, path: Path):
         "AIV_HOST_COMBINE_BARRIER_WAIT": "host_barrier_wait",
         "AIV_COMBINE_PROGRESS": "progress",
         "AIV_COMBINE_DRAIN": "drain",
+        "AIV_COMBINE_RUN": "run",
     }
     fields = [
         "rank",
@@ -322,6 +366,12 @@ def write_combine_progress_breakdown(raw_by_rank, path: Path):
         "pending_after",
         "posts",
         "scanned_rows",
+        "run_start",
+        "run_rows",
+        "decision",
+        "stop_reason",
+        "next_pending",
+        "already_deferred",
     ]
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -341,6 +391,20 @@ def write_combine_progress_breakdown(raw_by_rank, path: Path):
                         {
                             key: task.get(key, "")
                             for key in ("scan_control_cycles", "scan_control_us", "posts", "scanned_rows")
+                        }
+                    )
+                if family == "AIV_COMBINE_RUN":
+                    metrics.update(
+                        {
+                            key: task.get(key, "")
+                            for key in (
+                                "run_start",
+                                "run_rows",
+                                "decision",
+                                "stop_reason",
+                                "next_pending",
+                                "already_deferred",
+                            )
                         }
                     )
                 writer.writerow(

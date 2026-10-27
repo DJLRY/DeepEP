@@ -145,8 +145,10 @@ inline uint64_t GetExpertCountWorkspaceOffset(const BlockWorkspaceContext& w, ui
 {
     return w.blockIdx * experts;
 }
+class AscendTimerDevice;
 template <typename T>
-void LoadMteExpertCounts(const MoeStageCommonConfig&, const Params&, TokenDispatchScratch<T>& s, uint32_t epoch)
+void LoadMteExpertCounts(const MoeStageCommonConfig&, const Params&, TokenDispatchScratch<T>& s, uint32_t epoch,
+                         AscendTimerDevice*)
 {
     assert(epoch == 0x81U);
     std::copy(raw.begin(), raw.end(), s.cumsumInfoTensor.data);

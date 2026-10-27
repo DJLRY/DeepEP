@@ -48,6 +48,10 @@ public:
         for (int typeId = 0; typeId < AscendTimer::DYNAMIC_TYPE_COUNT; ++typeId) {
             dynamicCounts_[typeId] = 0;
         }
+        if (Enabled()) {
+            WriteValue(AscendTimer::COUNT_DIAGNOSTIC_OFFSET + coreId_ * AscendTimer::COUNT_DIAGNOSTIC_COUNT,
+                       0);  // A later launch may take a non-snapshot count path.
+        }
     }
 
     __aicore__ inline bool Enabled() const
@@ -295,16 +299,50 @@ public:
         }
         // Scheduler counters are bounded by 1024. Masks keep the wire fields
         // independent even if a caller supplies an invalid wider value.
-        uint64_t counts = static_cast<uint64_t>(pendingBefore & 0xffffU) |
-                          (static_cast<uint64_t>(pendingAfter & 0xffffU) << 16) |
-                          (static_cast<uint64_t>(posts & 0xffffU) << 32) |
-                          (static_cast<uint64_t>(scannedRows & 0xffffU) << 48);
+        uint64_t counts =
+            static_cast<uint64_t>(pendingBefore & 0xffffU) | (static_cast<uint64_t>(pendingAfter & 0xffffU) << 16) |
+            (static_cast<uint64_t>(posts & 0xffffU) << 32) | (static_cast<uint64_t>(scannedRows & 0xffffU) << 48);
         int typeId = static_cast<int>(type);
         int offset = AscendTimer::TASK_METADATA_OFFSET +
                      ((coreId_ * AscendTimer::DYNAMIC_TYPE_COUNT + typeId) * AscendTimer::MAX_DYNAMIC_ITER + index) * 2;
         WriteValue(offset, static_cast<int64_t>(counts));
         WriteValue(offset + 1, static_cast<int64_t>(scanControlCycles));
         EndRaw(typeId, index, cycle);
+    }
+
+    // Deferred writes keep detailed timing out of active tile/wait state and
+    // add no synchronization. The caller samples only existing phase edges.
+    __aicore__ inline void RecordDetail(AscendTimer::DynamicTimingType type, int64_t start, int64_t end, uint64_t first,
+                                        uint64_t second)
+    {
+        if (!Enabled() || end <= start) {
+            return;
+        }
+        const int typeId = static_cast<int>(type);
+        const int index = dynamicCounts_[typeId]++;
+        if (index >= AscendTimer::MAX_DYNAMIC_ITER) {
+            return;
+        }
+        const int offset =
+            AscendTimer::TASK_METADATA_OFFSET +
+            ((coreId_ * AscendTimer::DYNAMIC_TYPE_COUNT + typeId) * AscendTimer::MAX_DYNAMIC_ITER + index) * 2;
+        WriteValue(offset, static_cast<int64_t>(first));
+        WriteValue(offset + 1, static_cast<int64_t>(second));
+        const int timing = DynamicTimingIndex(typeId, index);
+        WriteWave(timing, waveId_);
+        WriteStart(timing, start);
+        WriteEnd(timing, end);
+    }
+
+    __aicore__ inline void WriteCountDiagnostics(const uint64_t* values)
+    {
+        if (!Enabled()) {
+            return;
+        }
+        for (int i = 0; i < AscendTimer::COUNT_DIAGNOSTIC_COUNT; ++i) {
+            WriteValue(AscendTimer::COUNT_DIAGNOSTIC_OFFSET + coreId_ * AscendTimer::COUNT_DIAGNOSTIC_COUNT + i,
+                       static_cast<int64_t>(values[i]));
+        }
     }
 
     __aicore__ inline void FlushDynamicCounts()
@@ -337,7 +375,7 @@ private:
     uint32_t rows_ = 0;
 
     __aicore__ inline int BeginIndependent(AscendTimer::DynamicTimingType type, uint64_t first, uint64_t second,
-                                            int64_t waveId = AscendTimer::NO_WAVE)
+                                           int64_t waveId = AscendTimer::NO_WAVE)
     {
         if (!Enabled()) {
             return -1;
@@ -424,6 +462,33 @@ private:
             WriteValue(index + 1, cycle);
         }
     }
+};
+
+class AscendTimerRelayScope {
+public:
+    __aicore__ inline AscendTimerRelayScope(AscendTimerDevice* timer, AscendTimer::RelayStep step, uint32_t source,
+                                            uint32_t firstExpert, uint32_t expertCount)
+        : timer_(timer && timer->Enabled() ? timer : nullptr),
+          first_((static_cast<uint64_t>(step) << 32) | (source + 1U)),
+          second_((static_cast<uint64_t>(firstExpert) << 32) | expertCount)
+    {
+        if (timer_) {
+            start_ = AscendC::GetSystemCycle();
+        }
+    }
+    __aicore__ inline ~AscendTimerRelayScope()
+    {
+        if (timer_) {
+            const int64_t end = AscendC::GetSystemCycle();
+            timer_->RecordDetail(AscendTimer::AIV_RELAY_STEP, start_, end, first_, second_);
+        }
+    }
+
+private:
+    AscendTimerDevice* timer_;
+    uint64_t first_;
+    uint64_t second_;
+    int64_t start_ = 0;
 };
 
 class AscendTimerFixedScope {

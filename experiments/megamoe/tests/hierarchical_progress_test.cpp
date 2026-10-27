@@ -31,7 +31,7 @@ enum class CacheMode { CATLASS_TEST_VALUE };
 namespace AscendTimer {
 enum class RdmaPhase { Combine };
 enum FixedTiming { AIV_COMBINE_INIT };
-enum DynamicTimingType { AIV_COMBINE_PROGRESS, AIV_COMBINE_DRAIN };
+enum DynamicTimingType { AIV_COMBINE_PROGRESS, AIV_COMBINE_DRAIN, AIV_COMBINE_RUN };
 }  // namespace AscendTimer
 
 // The timer itself has a separate production-header test. This double checks
@@ -46,6 +46,20 @@ public:
         uint32_t scanned;
     };
     std::vector<Record> records;
+    struct RunRecord {
+        uint64_t first;
+        uint64_t second;
+    };
+    std::vector<RunRecord> runs;
+    bool Enabled() const
+    {
+        return true;
+    }
+    void RecordDetail(AscendTimer::DynamicTimingType type, int64_t start, int64_t end, uint64_t first, uint64_t second)
+    {
+        if (type != AscendTimer::AIV_COMBINE_RUN || end <= start) std::abort();
+        runs.push_back({first, second});
+    }
     uint32_t initializations = 0U;
     uint32_t scanStarts = 0U;
     uint32_t scanStops = 0U;
@@ -1099,6 +1113,61 @@ void CursorOracle()
         crossing.CheckPayload();
     }
 }
+void Coalescing()
+{
+    {
+        Fixture f(2U, 8U);
+        f.Routes("all");
+        f.Publish(0U, f.s.sequence);
+        AscendTimerDevice timer;
+        Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {2U, 16U, 4U}),
+              "short growable run was submitted before its bounded deferral");
+        Check(f.s.posts.empty() && f.progress.sentRows == 0U && timer.runs.size() == 1U &&
+                  (timer.runs[0].second & 0x100U) != 0U && (timer.runs[0].second & 0xffU) == 2U,
+              "deferral changed payload or lost its producer-not-ready reason");
+        ReleaseAll();
+        Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {8U, 16U, 4U}),
+              "coalesced run did not progress");
+        Check(f.s.posts.size() == 1U && f.s.posts[0].rowCount == 16U, "late neighbouring rows were not coalesced");
+        f.CheckPayload();
+    }
+    {
+        Fixture f(2U, 8U);
+        f.Routes("all");
+        f.Publish(0U, f.s.sequence);
+        Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {2U, 16U, 4U}),
+              "first short-run visit should defer");
+        Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {2U, 16U, 4U}),
+              "an unfinished neighbour starved an already-deferred row");
+        Check(f.s.sent[0] == 1U && f.progress.sentRows == 1U, "bounded retry submitted an unready row");
+        ReleaseAll();
+        DrainHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data());
+        f.CheckPayload();
+    }
+    for (uint32_t topk : {1U, 8U, 32U}) {
+        Fixture f(32U, topk);
+        f.Routes("all");
+        ReleaseAll();
+        // Even a one-row scan budget must terminate: each start may be held
+        // only once, with no wait on a producer inside the progress call.
+        for (uint32_t calls = 0; f.progress.sentRows != f.Expected(); ++calls) {
+            Check(calls <= 2U * f.s.rows, "coalescing exceeded its per-start retry bound");
+            TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {1U, 1U, 4U});
+        }
+        f.CheckPayload();
+    }
+    {
+        Fixture f(2U, 8U);
+        f.Routes("all");
+        f.Publish(0U, f.s.sequence);
+        TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {1U, 16U, 4U});
+        ReleaseAll();
+        DrainHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data());
+        Check(f.s.posts.size() == 1U && f.s.posts[0].rowCount == 16U,
+              "final drain inherited foreground coalescing or fragmented a ready run");
+        f.CheckPayload();
+    }
+}
 }  // namespace ProgressTest
 
 int main(int argc, char** argv)
@@ -1134,6 +1203,8 @@ int main(int argc, char** argv)
         CursorOracle();
     else if (std::strcmp(scenario, "ready-snapshot") == 0)
         ReadySnapshot();
+    else if (std::strcmp(scenario, "coalescing") == 0)
+        Coalescing();
     else
         Check(false, "unknown test scenario");
     return 0;
