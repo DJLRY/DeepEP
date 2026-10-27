@@ -17,6 +17,10 @@ def test_roce_transport_resource_and_completion_contract(tmp_path, backend):
     compile_and_run(tmp_path, backend, "roce_transport_test.cpp")
 
 
+def test_hns_transport_host_pass_uses_compatible_signal_api(tmp_path):
+    compile_and_run(tmp_path, "HNS_1825", "roce_host_pass_test.cpp")
+
+
 @pytest.mark.parametrize("backend", ["XSCALE", "HNS_1825"])
 def test_hierarchical_dispatch_full_batch_and_completion_contract(tmp_path, backend):
     compile_and_run(

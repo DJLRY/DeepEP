@@ -9,6 +9,11 @@ int main()
     using namespace AscendTimer;
     using namespace MegaMoeImpl;
     using namespace RoceTest;
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+    constexpr int quietsPerPhase = 1;
+#else
+    constexpr int quietsPerPhase = 2;
+#endif
     std::vector<int64_t> buffer(TOTAL_BUFFER_SIZE, 0);
     AscendTimerDevice timer;
     timer.Init(reinterpret_cast<uint8_t*>(buffer.data()));
@@ -43,15 +48,25 @@ int main()
         RocePutBytes(nullptr, nullptr, 0, kPeer, scratch.data(), &timer, stage);
         RocePutBytes(local.data(), local.data() + 2048, 32, kPeer, scratch.data(), &timer, stage);
         RocePublishCommit(local.data() + kCommitOffset, local.data() + 3072, kPeer, scratch.data(), &timer, stage);
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+        assert(queued.size() == 2U);
+        DeliverPosted();
+#endif
         RoceWaitCommit(reinterpret_cast<int32_t*>(remote.data() + kCommitOffset), sequence, &timer, stage, kPeer);
+        RoceFinishOutstanding(kPeer, scratch.data(), &timer, stage);
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+        assert((operations == std::vector<int>{1, 1, 2}));
+#else
         assert((operations == std::vector<int>{1, 2, 1, 2}));
+#endif
         assert(pipelineBarriers == barriers);  // No timer-induced pipeline drain.
         timer.EndWait();
         timer.EndTile();
     }
     timer.FlushDynamicCounts();
 #ifdef DEEPEP_MEGAMOE_TIMER
-    assert(count(AIV_RDMA_POST) == 6 && count(AIV_RDMA_QUIET_WAIT) == 6 && count(AIV_RDMA_RECV_WAIT) == 3);
+    assert(count(AIV_RDMA_POST) == 6 && count(AIV_RDMA_QUIET_WAIT) == 3 * quietsPerPhase &&
+           count(AIV_RDMA_RECV_WAIT) == 3);
     assert(count(AIV_COMBINE) == 3 && count(AIV_COMBINE_WAIT) == 3);
     for (int phase = 0; phase < 3; ++phase) {
         assert(end(AIV_COMBINE, phase) > start(AIV_COMBINE, phase));
@@ -59,14 +74,16 @@ int main()
         assert(meta(AIV_COMBINE, phase, 0) == (int64_t(4) << 32 | 256));
         assert(wave(AIV_COMBINE, phase) == 7);
         for (int type : {AIV_RDMA_POST, AIV_RDMA_QUIET_WAIT, AIV_RDMA_RECV_WAIT}) {
-            int slot = type == AIV_RDMA_RECV_WAIT ? phase : phase * 2;
+            int slot = type == AIV_RDMA_RECV_WAIT    ? phase
+                       : type == AIV_RDMA_QUIET_WAIT ? phase * quietsPerPhase
+                                                     : phase * 2;
             assert(end(type, slot) > start(type, slot));
             assert(meta(type, slot, 0) == (int64_t(kPeer + 1) << 32 | (phase + 1)));
             assert(wave(type, slot) == NO_WAVE);
         }
         assert(meta(AIV_RDMA_POST, phase * 2, 1) == 32);
         assert(meta(AIV_RDMA_POST, phase * 2 + 1, 1) == (int64_t(1) << 32 | 4));
-        assert(meta(AIV_RDMA_QUIET_WAIT, phase * 2, 1) == 0);
+        assert(meta(AIV_RDMA_QUIET_WAIT, phase * quietsPerPhase, 1) == 0);
         assert(meta(AIV_RDMA_RECV_WAIT, phase, 1) == (int64_t(1) << 32 | 4));
     }
     // Span state survives independent RDMA handles too, with no extra split.
@@ -97,6 +114,7 @@ int main()
     (void)count;
     (void)meta;
     (void)wave;
+    (void)quietsPerPhase;
 #endif
     AscendTimerDevice disabled;
     disabled.Init(nullptr);

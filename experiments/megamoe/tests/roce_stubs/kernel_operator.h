@@ -11,6 +11,9 @@
 #define __ubuf__
 #define GM_ADDR uint8_t*
 #define ASCEND_IS_AIV (RoceTest::isAiv)
+#if !defined(MEGAMOE_TEST_HOST_PASS) && !defined(__CCE_KT_TEST__)
+#define __CCE_KT_TEST__ 1
+#endif
 constexpr int PIPE_ALL = 0;
 
 inline void trap()
@@ -29,6 +32,12 @@ inline bool mteCanRead = false;
 inline std::vector<int> operations;
 inline int pipelineBarriers = 0;
 inline int64_t cycle = 100;
+inline int64_t cycleStep = 1;
+inline uint32_t timeoutDiagnostics = 0U;
+inline uint32_t lastWaitKind = 0U;
+inline uint32_t lastWaitPeer = 0U;
+inline uint32_t lastWaitExpected = 0U;
+inline uint32_t lastWaitObserved = 0U;
 }  // namespace RoceTest
 
 namespace AscendC {
@@ -46,7 +55,16 @@ inline int GetSubBlockIdx()
 }
 inline int64_t GetSystemCycle()
 {
-    return ++RoceTest::cycle;
+    RoceTest::cycle += RoceTest::cycleStep;
+    return RoceTest::cycle;
+}
+inline void printf(const char*, uint32_t kind, uint32_t peer, uint32_t expected, uint32_t observed)
+{
+    ++RoceTest::timeoutDiagnostics;
+    RoceTest::lastWaitKind = kind;
+    RoceTest::lastWaitPeer = peer;
+    RoceTest::lastWaitExpected = expected;
+    RoceTest::lastWaitObserved = observed;
 }
 template <int Pipe>
 void PipeBarrier()
@@ -61,6 +79,10 @@ public:
         data_ = data;
     }
     T& operator()(int index)
+    {
+        return data_[index];
+    }
+    T GetValue(uint32_t index) const
     {
         return data_[index];
     }

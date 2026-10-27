@@ -62,8 +62,7 @@ __aicore__ inline void InitializeHierarchicalCombineProgress(const MoeStageCommo
     // using the owner's reserved 256B UB; the last word is a marker, not an ID.
     // This runs only before the first Combine Post, after Dispatch is drained.
     const uint32_t rowCount = common.tokenNum * common.topK;
-    for (uint32_t packet = 0U, firstRow = 0U; firstRow < rowCount;
-         ++packet, firstRow += RAIL_PACKET_DATA_WORDS) {
+    for (uint32_t packet = 0U, firstRow = 0U; firstRow < rowCount; ++packet, firstRow += RAIL_PACKET_DATA_WORDS) {
         const uint32_t remaining = rowCount - firstRow;
         const uint32_t validPacket = remaining < RAIL_PACKET_DATA_WORDS ? remaining : RAIL_PACKET_DATA_WORDS;
         for (uint32_t firstWord = 0U; firstWord < validPacket; firstWord += scratchWords) {
@@ -109,7 +108,7 @@ struct HierarchicalCombineReadySnapshot {
             flags.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(
                 params.peermemInfo.gatewayCombineReadyPtr + static_cast<uint64_t>(row) * HIERARCHICAL_FLAG_BYTES));
             LocalTensor<int32_t> snapshot(TPosition::VECCALC, params.tilingData->roceScratchUbOffset,
-                                           MEGAMOE_ROCE_SCRATCH_BYTES / sizeof(int32_t));
+                                          MEGAMOE_ROCE_SCRATCH_BYTES / sizeof(int32_t));
             SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
             // blockLen/srcStride/dstStride are measured in 32B blocks.
             DataCopy(snapshot, flags,
@@ -146,8 +145,8 @@ struct HierarchicalCombineScanCursor {
     {
     }
 
-    __aicore__ inline bool Ready(const Params& params, HierarchicalCombineReadySnapshot& snapshot,
-                                 uint32_t rowsLeft, uint32_t scansLeft) const
+    __aicore__ inline bool Ready(const Params& params, HierarchicalCombineReadySnapshot& snapshot, uint32_t rowsLeft,
+                                 uint32_t scansLeft) const
     {
         if ((pending & 1U) == 0U) {
             return false;
@@ -278,11 +277,11 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
 // can prevent that same owner from producing rows needed by a gateway.
 //
 // This only posts the outstanding rows; it does not complete the transfers.
-// The caller must use RocePublishCommit after this returns to quiet the payload,
-// publish CombineCommit, and quiet the commit before waiting for its paired
-// gateway's commit. Outbound-before-inbound ordering on both hosts avoids
-// a cycle. The commit is required even when expectedRows is zero and also closes
-// this invocation's lifetime before the next one can reuse Dispatch buffers.
+// The caller must publish CombineCommit before waiting for its paired gateway.
+// HNS uses the NIC's ordered commit and retires outgoing work at kernel exit;
+// other backends retain the conservative completion/commit protocol. The commit
+// is required even when expectedRows is zero. Together with the host barrier,
+// the reciprocal commit closes old Dispatch readers before the next invocation.
 __aicore__ inline void DrainHierarchicalCombine(const MoeStageCommonConfig& common, const Params& params,
                                                 HierarchicalCombineProgress& progress, __ubuf__ uint8_t* roceScratch,
                                                 AscendTimerDevice* timer = nullptr)
@@ -296,11 +295,16 @@ __aicore__ inline void DrainHierarchicalCombine(const MoeStageCommonConfig& comm
     InitializeHierarchicalCombineProgress(common, params, progress, timer);
     const uint32_t pendingBefore = progress.expectedRows - progress.sentRows;
     AscendTimerCombineProgressScope drain(timer, AscendTimer::AIV_COMBINE_DRAIN);
+    RoceWaitState waitState{};
     while (progress.sentRows < progress.expectedRows) {
         if (!TryProgressHierarchicalCombine(common, params, progress, roceScratch, timer, {})) {
+            RoceCheckWait(waitState, HierarchicalGateway(common.rankId), roceScratch, RoceWaitKind::CombineRows,
+                          progress.expectedRows, progress.sentRows);
             const int64_t waitStart = GetSystemCycle();
             while (GetSystemCycle() - waitStart < GM_FLAG_POLL_BACKOFF_CYCLES) {
             }
+        } else {
+            waitState = {};
         }
     }
     // The parent includes child progress calls and backoff. Their scan/POST

@@ -1044,7 +1044,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                                   HierarchicalGateway(rankId_), scratch, rdmaTimer, AscendTimer::RdmaPhase::Combine);
                 RoceWaitCommit(HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::CombineCommit),
                                params_.tilingData->hierarchicalSequence, rdmaTimer, AscendTimer::RdmaPhase::Combine,
-                               HierarchicalGateway(rankId_));
+                               HierarchicalGateway(rankId_), scratch);
             }
             PipeBarrier<PIPE_ALL>();
             SyncAll<true>();
@@ -1058,6 +1058,14 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         UnpermuteTokens<CombineQuantMode, TopkWeightsType, TopkWeightsPrefetch, GMM1_TILE_M>(
             tokenUnpermuteConfig_, commonConfig_, params_, tokenUnpermuteScratch_, unpermuteBufferConfig);
         timer_.End(AscendTimer::AIV_UNPERMUTE);
+        if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
+            // HNS ordered commits permit receive consumption before local CQ
+            // retirement. Keep every outbound GM source and Sequence immutable
+            // until this final drain, after Unpermute but before kernel return.
+            RoceFinishOutstanding(HierarchicalGateway(rankId_), HierarchicalRoceScratch(params_),
+                                  timer_.Enabled() ? &timer_ : nullptr, AscendTimer::RdmaPhase::Combine);
+            PublishHierarchicalLocalSignal(params_, HierarchicalSignal::TxDone);
+        }
     }
 
     // 恢复入口时的溢出模式。

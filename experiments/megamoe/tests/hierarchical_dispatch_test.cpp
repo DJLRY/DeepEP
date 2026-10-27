@@ -156,6 +156,8 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     posts.clear();
     queued.clear();
     quiets = waits = packCalls = relayCalls = 0U;
+    progressCalls = 0U;
+    RoceTest::cycleStep = 1;
     peer = HierarchicalGateway(rank);
     sequence = t.hierarchicalSequence;
     receiveLeaderJob = 2U + (1U - HierarchicalHost(rank));
@@ -243,11 +245,13 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     RoceTest::subBlockIndex = static_cast<int>(receiver.jobIndex % 2U);
     RoceTest::signalObserved = RoceTest::scalarEventSet = RoceTest::mteCanRead = false;
     bool staleRejected = false;
+    RoceTest::cycleStep = static_cast<int64_t>(MEGAMOE_ROCE_WAIT_TIMEOUT_CYCLES);
     try {
         GatherAndPostHierarchicalDispatch(receiver, common, params, nullptr, config, scratch);
     } catch (const std::runtime_error&) {
         staleRejected = true;
     }
+    RoceTest::cycleStep = 1;
     Check(staleRejected && relayCalls == 0U && ReadWord(local, metaReady) != sequence &&
               ReadWord(local, relayReady) != sequence,
           "split metadata flag incorrectly released the unified receiver");
@@ -268,13 +272,32 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     Check(payload == std::vector<uint8_t>(local.begin() + source, local.begin() + source + activeBytes),
           "posting changed the quantized source");
     FinishHierarchicalDispatch(owner, common, params);
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+    Check(remote == expected && queued.size() == 3U && quiets == 0U && ReadWord(local, txDone) != sequence,
+          "HNS Dispatch waited for local completion or published TxDone before the kernel tail");
+    Check((RoceTest::operations == std::vector<int>{1, 1, 1}), "HNS Dispatch inserted a quiet around its SO marker");
+    DeliverPosted();
+    Check(queued.size() == 3U && quiets == 0U, "remote visibility incorrectly retired local CQ entries");
+    // The production kernel performs this boundary after Unpermute, before
+    // returning to the stream that may overwrite this invocation's sources.
+    RoceFinishOutstanding(peer, HierarchicalRoceScratch(params));
+    PublishHierarchicalLocalSignal(params, HierarchicalSignal::TxDone);
+#else
+    RoceFinishOutstanding(peer, HierarchicalRoceScratch(params));
+#endif
     std::copy_n(local.data() + rail, railBytes, expected.data() + rail);
     std::copy(payload.begin(), payload.end(), expected.begin() + destination);
     std::memcpy(expected.data() + payloadCommit, &sequence, sizeof(sequence));
     Check(remote == expected, "whole-batch payload changed active data, capacity tail, or neighboring regions");
-    Check(queued.empty() && posts.size() == 3U && quiets == 2U && waits == 1U,
+    Check(queued.empty() && posts.size() == 3U && waits == 1U && progressCalls == 0U,
           "Finish omitted completion/commit or zero-remote notification");
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+    Check(quiets == 1U && (RoceTest::operations == std::vector<int>{1, 1, 1, 2}),
+          "HNS deferred completion did not use exactly one kernel-tail quiet");
+#else
+    Check(quiets == 2U, "XSCALE changed the conservative completion count");
     Check((RoceTest::operations == std::vector<int>{1, 1, 2, 1, 2}), "unified payload/commit quiet ordering changed");
+#endif
     Check(ReadWord(local, txDone) == sequence && ReadWord(local, relayReady) == sequence && !RoceTest::mteCanRead,
           "sender repeated the receive acquire or lost independent readiness");
     std::fill_n(local.data() + source, activeBytes, uint8_t{0xDDU});

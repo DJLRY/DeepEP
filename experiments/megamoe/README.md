@@ -570,11 +570,17 @@ AIV1 在 Dispatch 和 Combine 全程独占 QP1，包括 Put、quiet 和 commit�
 不再扫描路由并拆成多个连续 token 段；B 小于预分配容量时只发送实际 B 行。
 接收区保留原 token 编号，专家仍按路由元数据读取，多传的行不会增加计算。
 该策略用于上述 B≤32 的 A8W4/A8W8 路径，包括没有远端路由的批次。
-元数据和 payload 先在同一 QP 提交，完成等待延后到 owner 的 reset/shared-input 工作之后；
-一次 quiet 覆盖两份数据，再发布共用的 `NetPayloadCommit` 并 quiet 该通知。四次 quiet 减为两次，
+元数据和 payload 先在同一 QP 提交，owner 完成 reset/shared-input 工作后
+发布共用的 `NetPayloadCommit`。HNS1825 使用已确认的网卡合同：每个 WQE 的末分片自动具有 SO，
+覆盖同一 QP 的前序 WQE；远端观察到该分片时，前序数据已在 GM 可见。因此独立的4 B commit
+WQE 可直接跟在数据之后，Dispatch 不执行显式 quiet；SHMEM 无需设置 WQE 的 SO 字段。
 接收 leader 获取这个标记后立即发布 `RelayPayloadReady` 和 `MetaReady`，然后转发 metadata；
-接收就绪不再等待本卡反方向的发送完成。发送 owner 完成两次 quiet 后只发布 `TxDone`。
+接收就绪不等待本卡反方向的 CQ 完成。接收侧仍保留 DCache 失效和 scalar→MTE2 acquire。
 公共输入 barrier 保留，统一 commit 和接收就绪仍须在它之前发布。
+HNS1825 的 Dispatch、Combine 发送源以及完整32位 `Sequence` 在本轮保持不变；
+Unpermute 只读独立的接收区，结束后由 AIV1 统一 quiet 一次并发布 `TxDone`，再允许 kernel 返回。
+下一轮沿用同一 runtime stream，不能在这个完成边界前覆盖源区或 epoch。
+XSCALE 没有使用上述 SO 合同，仍保留每阶段 `quiet → commit → quiet`；该优化不依赖 PI-on-chip 开关。
 这会放弃 metadata 提前到达时的 relay 重叠机会，整体收益以关闭打点的 perf 为准。
 H=3584、B=32 时 payload 为118784 B；相较已测 EP32/K8 balanced 样本的8次7424 B提交，
 该策略以每 rank 额外59392 B流量换取一次提交和更少的发送端扫描工作。
@@ -603,12 +609,23 @@ owner 对每个 Combine slice 保留非阻塞生产完成检查，就绪后推�
 再回到循环入口检查 activation；尚未就绪时继续其他任务和有预算的远端推进。
 这避免 owner 因无本地行而立即跳完所有 slice、提前进入 SyncAll。非 RoCE、A8W8 路径
 及仅一个 AIC 的回退路径沿用原本地 Combine 分工；QP1 始终由固定物理 AIV1 独占。
-最终 host barrier 后完整 drain，再执行 payload quiet、commit、commit quiet 和对端 commit 等待。
+最终 host barrier 后完整 drain，HNS1825 直接提交 Combine commit，再等待对端 commit、执行 acquire
+和全 AIV 同步，然后 Unpermute，最后统一 quiet。两端都必须先提交再等待；没有远端行也不能省略
+Dispatch/Combine commit。host barrier 关闭本机的生产者和旧 Dispatch 读取，双向 commit 继续保护跨轮复用。
 单次 Put 内部仍可能因队列回压等待，这些计数预算并非硬性时间上限。
 扫描在单次调用内缓存当前 token 的 pending mask，通过递增槽位推进，避免逐行除模；
 连续发送段在 Put 返回后按 token 清除对应位。扫描仍逐槽计数，保留洞、游标绕回、
 预算截断和相邻行合并的原有语义；恢复 A 的扫描行为，完成当次扫描或达到 Put 预算后返回，
 后续调用在全部行已提交时直接返回。提交完成不代表传输完成，后者仍由后续 quiet 保证。
+
+HNS1825 每轮显式 quiet 从4次减为1次，包含在 kernel 总计时内；不能将 quiet 的耗时简单乘以
+删除次数当作端到端收益。SDK 的队列回压回收仍保留，每个 WQE 继续产生 CQE。
+每轮 WQE 数最多为 `B * topK + 4`，是否触发内部回收取决于实际 SQ/CQ 深度和预留空间。
+网络 commit、Dispatch 本地就绪、host 握手及最终 Combine 行等待加入60秒停滞超时诊断；只有 QP owner
+能在等待期间稀疏检查已 ready 的 CQE，不等待尚未完成的 CQE，不允许接收 leader 并发消费 CQ。
+正常短等待不增加 CQ DMA，最终 quiet 负责统一完成检查和队列回收。硬件 `SyncAll` 本身没有新增
+可取消机制，软件等待超时会打印上下文并 trap；日志 `kind=0/1/2/3` 分别表示 commit、
+Dispatch 本地就绪、host 生产者屏障、Combine 行，另含 peer、expected、observed。设备故障后的清理由 runtime 负责。
 
 ready 探测通过一次跨步 DMA，将最多8个512 B flag 槽的首32 B收集到 owner 专用256 B UB。
 读取沿用默认 L2 缓存策略 `CACHE_MODE_NORMAL`，DMA 完成后仅将匹配当前完整 sequence 的结果保留为标量位图，

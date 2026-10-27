@@ -10,7 +10,9 @@ transport with direct routing and uses the existing BF16 oracle for arithmetic.
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from itertools import groupby
+from pathlib import Path
 import random
+import re
 
 import numpy as np
 import pytest
@@ -319,7 +321,14 @@ def test_repeated_calls_ignore_old_epoch_after_legacy_marker_wrap():
         np.testing.assert_array_equal(output, np.broadcast_to(value, output.shape))
 
 
-def lifecycle_dependencies(*, whole_host=True, wait_before_send=False):
+def lifecycle_dependencies(*, backend, whole_host=True, wait_before_send=False, remote_rows=1, tail_quiet=True):
+    """Separate remote visibility from local CQ retirement.
+
+    HNS's ordered terminal WQE publishes remote visibility before the sender
+    needs to retire its CQ. XSCALE retains quiet -> commit -> quiet. ``post``
+    includes the empty final drain, which must still be followed by a commit.
+    """
+    assert backend in ("HNS_1825", "XSCALE")
     graph = {}
     for rank in range(WORLD):
         graph["produce", rank] = set()
@@ -328,11 +337,27 @@ def lifecycle_dependencies(*, whole_host=True, wait_before_send=False):
     for rank in range(WORLD):
         finish = ("host", host(rank)) if whole_host else ("produce", rank)
         graph["post", rank] = {finish}
-        graph["quiet", rank] = {("post", rank)}
-        graph["commit", rank] = {("quiet", rank)}
-        graph["commit-complete", rank] = {("commit", rank)}
-        graph["receive", rank] = {("commit-complete", rank), ("commit", pair(rank))}
-        graph["reuse", rank] = {("receive", rank), ("host", host(rank))}
+        data_visible = set()
+        if remote_rows:
+            graph["data-visible", rank] = {("post", rank)}
+            data_visible.add(("data-visible", rank))
+        if backend == "HNS_1825":
+            graph["commit", rank] = {("post", rank)}
+            # Automatic SO orders all prior data before the terminal flag at GM.
+            graph["commit-visible", rank] = {("commit", rank)} | data_visible
+        else:
+            graph["quiet", rank] = {("post", rank)} | data_visible
+            graph["commit", rank] = {("quiet", rank)}
+            graph["commit-visible", rank] = {("commit", rank)}
+        graph["commit-complete", rank] = {("commit-visible", rank)}
+        outgoing = "commit" if backend == "HNS_1825" else "commit-complete"
+        graph["receive", rank] = {(outgoing, rank), ("commit-visible", pair(rank))}
+        graph["unpermute", rank] = {("receive", rank)}
+        retired = ("unpermute", rank)
+        if backend == "HNS_1825" and tail_quiet:
+            graph["tail-quiet", rank] = {("unpermute", rank), ("commit-complete", rank)}
+            retired = ("tail-quiet", rank)
+        graph["reuse", rank] = {retired, ("host", host(rank))}
         if wait_before_send:
             graph["post", rank].add(("receive", rank))
     return graph
@@ -350,9 +375,10 @@ def ancestors(graph, event):
 
 
 @pytest.mark.parametrize("late_rank", [0, 15, 16, 31])
-@pytest.mark.parametrize("late_stage", ["produce", "commit"])
-def test_host_finish_and_commit_close_buffer_lifetime_without_wait_cycle(late_rank, late_stage):
-    graph = lifecycle_dependencies()
+@pytest.mark.parametrize("late_stage", ["produce", "commit", "commit-complete"])
+@pytest.mark.parametrize("backend", ["HNS_1825", "XSCALE"])
+def test_host_finish_and_commit_close_buffer_lifetime_without_wait_cycle(late_rank, late_stage, backend):
+    graph = lifecycle_dependencies(backend=backend)
     finished = set()
     scheduler = random.Random(late_rank)
     while len(finished) < len(graph):
@@ -362,23 +388,65 @@ def test_host_finish_and_commit_close_buffer_lifetime_without_wait_cycle(late_ra
         event = scheduler.choice(ordinary or runnable)
         if event[0] == "reuse":
             assert {("produce", rank) for rank in range(WORLD)} <= finished
-        if event[0] == "receive":
             assert ("commit-complete", event[1]) in finished
+        if event[0] == "receive":
+            assert ("commit", event[1]) in finished
+            assert ("commit-visible", pair(event[1])) in finished
+            if backend == "XSCALE":
+                assert ("commit-complete", event[1]) in finished
         finished.add(event)
     for rank in range(WORLD):
         assert {("produce", peer) for peer in range(WORLD)} <= ancestors(graph, ("reuse", rank))
+        if backend == "HNS_1825":
+            assert ("commit-complete", rank) not in ancestors(graph, ("unpermute", rank))
+            assert ("tail-quiet", rank) in ancestors(graph, ("reuse", rank))
+            assert ("quiet", rank) not in graph
 
 
-def test_lifecycle_requires_even_zero_contribution_commit_and_full_host_finish():
+@pytest.mark.parametrize("backend", ["HNS_1825", "XSCALE"])
+def test_lifecycle_requires_even_zero_contribution_commit_and_full_host_finish(backend):
     # A rank with no expected remote rows still closes the remote host's reads of
     # its old quantization/relay/rail buffers. Omitting its commit strands its peer.
-    graph = lifecycle_dependencies()
+    graph = lifecycle_dependencies(backend=backend, remote_rows=0)
+    assert not any(event[0] == "data-visible" for event in graph)
     assert ("commit", 16) in ancestors(graph, ("reuse", 0))
-    early = lifecycle_dependencies(whole_host=False)
+    assert ("commit-complete", 0) in ancestors(graph, ("reuse", 0))
+    early = lifecycle_dependencies(backend=backend, whole_host=False, remote_rows=0)
     assert ("produce", 17) not in ancestors(early, ("reuse", 0))
     assert ("produce", 17) in ancestors(graph, ("reuse", 0))
-    cyclic = lifecycle_dependencies(wait_before_send=True)
+    cyclic = lifecycle_dependencies(backend=backend, wait_before_send=True, remote_rows=0)
     assert ("receive", 0) in ancestors(cyclic, ("receive", 0))
+
+
+def test_hns_incoming_commit_does_not_retire_the_outgoing_source():
+    graph = lifecycle_dependencies(backend="HNS_1825")
+    assert ("commit-complete", 0) not in ancestors(graph, ("receive", 0))
+    assert ("commit-complete", 0) in ancestors(graph, ("reuse", 0))
+    missing_retirement = lifecycle_dependencies(backend="HNS_1825", tail_quiet=False)
+    assert ("commit-complete", 0) not in ancestors(missing_retirement, ("reuse", 0))
+
+
+@pytest.mark.parametrize("backend", ["HNS_1825", "XSCALE"])
+def test_next_call_cannot_overwrite_sequence_or_payload_before_local_and_remote_closure(backend):
+    graph = {}
+    # Alternating empty and nonempty Combine traffic models shape/route changes.
+    sequences = (127, 128, 129, 256, 257)
+    for index, sequence in enumerate(sequences):
+        call = lifecycle_dependencies(backend=backend, remote_rows=index % 2)
+        for event, deps in call.items():
+            graph[sequence, *event] = {(sequence, *dependency) for dependency in deps}
+        if index:
+            for rank in range(WORLD):
+                # The public API's dedicated stream serializes kernel calls.
+                graph[sequence, "produce", rank].add((sequences[index - 1], "reuse", rank))
+    for previous, sequence in zip(sequences, sequences[1:]):
+        for rank in (0, 15, 16, 31):
+            before_reuse = ancestors(graph, (sequence, "produce", rank))
+            assert (previous, "commit-complete", rank) in before_reuse
+            assert (previous, "commit-visible", pair(rank)) in before_reuse
+            assert {(previous, "produce", peer) for peer in range(WORLD)} <= before_reuse
+            if backend == "HNS_1825":
+                assert (previous, "tail-quiet", rank) in before_reuse
 
 
 def test_every_expert_source_pair_uses_only_local_mte_then_paired_rdma():
@@ -498,31 +566,55 @@ def test_a8w8_full_row_ready_counts_only_producers_after_every_n_tile(aic_count,
             model.notify(delayed_owner)
 
 
-def a8w8_qp_phase_dependencies(*, combine_owner=1, input_barrier=True):
+def a8w8_qp_phase_dependencies(*, backend, combine_owner=1, input_barrier=True):
     """Phase/resource model shared by every rank, with a fixed AIV1 Dispatch owner."""
+    assert backend in ("HNS_1825", "XSCALE")
     dispatch_owner = 1
     graph = {
         "quantized-input": set(),
         "dispatch-put": {"quantized-input"},
-        "dispatch-payload-quiet": {"dispatch-put"},
-        "dispatch-commit": {"dispatch-payload-quiet"},
-        "dispatch-commit-quiet": {"dispatch-commit"},
         "incoming-commit": set(),
-        "dispatch-receive": {"dispatch-commit-quiet", "incoming-commit"},
+        # An independent receive leader observes the incoming flag. It never
+        # waits for this rank's outgoing CQ and never borrows the owner's UB.
+        "dispatch-receive": {"incoming-commit"},
         "input-finish-aiv0": set(),
-        "input-finish-aiv1": set(),
         "all-core-input-barrier": {"dispatch-receive", "input-finish-aiv0", "input-finish-aiv1"},
         "aic-fix-next-wave-aiv0": {"all-core-input-barrier"},
         # The same AIV finishes Dispatch before entering Combine, even without
         # the barrier that additionally closes every other core's input work.
-        "combine-progress": {"all-core-input-barrier"} if input_barrier else {"dispatch-receive"},
+        "combine-progress": {"all-core-input-barrier"} if input_barrier else {"input-finish-aiv1"},
         "local-producers-finished": {"combine-progress", "aic-fix-next-wave-aiv0"},
         "host-finish-barrier": {"local-producers-finished"},
         "combine-final-drain": {"host-finish-barrier"},
-        "combine-payload-quiet": {"combine-final-drain"},
-        "combine-commit": {"combine-payload-quiet"},
-        "combine-commit-quiet": {"combine-commit"},
+        "incoming-combine-commit": set(),
+        "output-aiv-barrier": {"combine-receive"},
+        "unpermute": {"output-aiv-barrier"},
     }
+    if backend == "HNS_1825":
+        graph.update(
+            {
+                "dispatch-commit": {"dispatch-put"},
+                "input-finish-aiv1": {"dispatch-commit"},
+                "combine-commit": {"combine-final-drain"},
+                "combine-receive": {"combine-commit", "incoming-combine-commit"},
+                "tail-quiet": {"unpermute"},
+                "return": {"tail-quiet"},
+            }
+        )
+    else:
+        graph.update(
+            {
+                "dispatch-payload-quiet": {"dispatch-put"},
+                "dispatch-commit": {"dispatch-payload-quiet"},
+                "dispatch-commit-quiet": {"dispatch-commit"},
+                "input-finish-aiv1": {"dispatch-commit-quiet"},
+                "combine-payload-quiet": {"combine-final-drain"},
+                "combine-commit": {"combine-payload-quiet"},
+                "combine-commit-quiet": {"combine-commit"},
+                "combine-receive": {"combine-commit-quiet", "incoming-combine-commit"},
+                "return": {"unpermute"},
+            }
+        )
     actions = {}
     for event in (
         "dispatch-put",
@@ -534,9 +626,18 @@ def a8w8_qp_phase_dependencies(*, combine_owner=1, input_barrier=True):
         "combine-payload-quiet",
         "combine-commit",
         "combine-commit-quiet",
+        "tail-quiet",
     ):
+        if event not in graph:
+            continue
         owner = dispatch_owner if event.startswith("dispatch-") else combine_owner
         actions[event] = owner, {"qp1", "cq1", ("ub-tail", owner), ("event7", owner)}
+    if backend == "HNS_1825":
+        # During this receive wait the same QP owner may reclaim ready CQEs.
+        actions["combine-receive"] = (
+            combine_owner,
+            {"qp1", "cq1", ("ub-tail", combine_owner), ("event7", combine_owner)},
+        )
     actions["aic-fix-next-wave-aiv0"] = "aic", {("ub-tail", 0)}
     return graph, actions
 
@@ -553,25 +654,88 @@ def unordered_resource_conflicts(graph, actions):
     }
 
 
-def test_a8w8_fixed_qp_owner_and_aiv1_scratch_allow_next_wave_fix_overlap():
-    graph, actions = a8w8_qp_phase_dependencies()
+@pytest.mark.parametrize("backend", ["HNS_1825", "XSCALE"])
+def test_a8w8_fixed_qp_owner_and_aiv1_scratch_allow_next_wave_fix_overlap(backend):
+    graph, actions = a8w8_qp_phase_dependencies(backend=backend)
     assert all(actions[event][0] == 1 for event in actions if event.startswith("dispatch-"))
     assert all(actions[event][0] == 1 for event in actions if event.startswith("combine-"))
-    assert "dispatch-commit-quiet" in ancestors(graph, "combine-progress")
+    dispatch_finished = "dispatch-commit" if backend == "HNS_1825" else "dispatch-commit-quiet"
+    assert dispatch_finished in ancestors(graph, "combine-progress")
+    assert dispatch_finished not in ancestors(graph, "dispatch-receive")
     assert "all-core-input-barrier" in ancestors(graph, "combine-progress")
     assert "host-finish-barrier" in ancestors(graph, "combine-final-drain")
     assert "combine-commit-quiet" not in ancestors(graph, "combine-progress")
     assert not unordered_resource_conflicts(graph, actions)
+    if backend == "HNS_1825":
+        assert "tail-quiet" in ancestors(graph, "return")
+        assert "unpermute" in ancestors(graph, "tail-quiet")
+        assert "tail-quiet" not in ancestors(graph, "unpermute")
+        assert "dispatch-payload-quiet" not in graph and "combine-payload-quiet" not in graph
     # FIX may continue on AIV0's UB while the communication owner progresses.
     # Neither action must wait for the other, and their resources must be disjoint.
     assert "aic-fix-next-wave-aiv0" not in ancestors(graph, "combine-progress")
     assert "combine-progress" not in ancestors(graph, "aic-fix-next-wave-aiv0")
     assert actions["aic-fix-next-wave-aiv0"][1].isdisjoint(actions["combine-progress"][1])
 
-    missing_barrier = a8w8_qp_phase_dependencies(input_barrier=False)
+    missing_barrier = a8w8_qp_phase_dependencies(backend=backend, input_barrier=False)
     assert not unordered_resource_conflicts(*missing_barrier)
-    assert "dispatch-commit-quiet" in ancestors(missing_barrier[0], "combine-progress")
+    assert dispatch_finished in ancestors(missing_barrier[0], "combine-progress")
     assert "input-finish-aiv0" not in ancestors(missing_barrier[0], "combine-progress")
     assert "input-finish-aiv0" in ancestors(graph, "combine-progress")
-    aiv0_owner = a8w8_qp_phase_dependencies(combine_owner=0)
+    aiv0_owner = a8w8_qp_phase_dependencies(backend=backend, combine_owner=0)
     assert ("combine-progress", "aic-fix-next-wave-aiv0") in unordered_resource_conflicts(*aiv0_owner)
+
+
+def cpp_function_body(path, signature):
+    """Inspect actual entrypoint order in addition to the dependency models.
+
+    The real transport helper is compiled by test_roce_transport.py. These
+    guards catch either kernel forgetting to call its final retirement helper;
+    they do not establish NIC/cache visibility or execute device barriers.
+    """
+    source = path.read_text(encoding="utf-8")
+    source = re.sub(r"/\*.*?\*/|//[^\n]*", "", source, flags=re.DOTALL)
+    start = source.index("{", source.index(signature))
+    depth = 1
+    for end in range(start + 1, len(source)):
+        depth += (source[end] == "{") - (source[end] == "}")
+        if depth == 0:
+            return source[start + 1 : end]
+    raise AssertionError(f"Unclosed function body in {path.name}: {signature}")
+
+
+@pytest.mark.parametrize(
+    "header,signature,timed",
+    [
+        ("mega_moe_arch35.hpp", "::ProcessWave(Derived& derived)", True),
+        ("mega_moe_wave_a8w8.hpp", "::Process()", False),
+    ],
+)
+def test_real_kernel_entrypoints_retire_sources_after_unpermute_before_return(header, signature, timed):
+    kernels = Path(__file__).resolve().parents[1] / "csrc/kernels/mega_moe"
+    body = cpp_function_body(kernels / header, signature)
+    expected = (
+        "CrossRankSyncInHierarchicalHost(",
+        "DrainHierarchicalCombine(",
+        "RocePublishCommit(",
+        "RoceWaitCommit(",
+        "UnpermuteTokens<",
+        "RoceFinishOutstanding(",
+        "HierarchicalSignal::TxDone",
+        "Stage::COMPLETE",
+    )
+    positions = [body.index(token) for token in expected]
+    assert positions == sorted(positions), "Both entrypoints must close all RDMA lifetimes before kernel return"
+    assert body.count("RoceFinishOutstanding(") == 1
+    # The final retirement remains on the designated communication owner and is
+    # reached on empty-route calls too; it must not be guarded by sentRows.
+    tail_begin = body.index("UnpermuteTokens<")
+    tail = body[tail_begin : body.index("Stage::COMPLETE")]
+    assert "UseHierarchicalRoce(params_.tilingData)" in tail
+    assert "aivJob_.jobIndex == HierarchicalSendJob()" in tail
+    assert "expectedRows" not in tail and "sentRows" not in tail
+    if timed:
+        assert positions[-2] < body.index("timer_.End(AscendTimer::KERNEL_TIMING)")
+        assert positions[-2] < body.index("timer_.FlushDynamicCounts()")
+        finish_call = re.search(r"RoceFinishOutstanding\([^;]+;", tail)
+        assert finish_call is not None and "timer_" in finish_call.group()

@@ -48,6 +48,7 @@ def hierarchical_progress_binary(tmp_path_factory):
         "complete-in-call",
         "metadata",
         "drain",
+        "drain-stalled",
         "topology",
         "telemetry",
         "cursor-oracle",

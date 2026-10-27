@@ -5,13 +5,18 @@
 #include <algorithm>
 #include <array>
 #include <cstring>
+#include <functional>
 #include "kernel_operator.h"
+
+// The separate progress test exercises the device CQ/SQ implementation.
+#define MEGA_MOE_ROCE_PROGRESS_H
 
 constexpr int ACLSHMEM_CMP_EQ = 0;
 
 namespace RoceTest {
 constexpr uint32_t kPeer = 21U;
 constexpr uint32_t kCommitOffset = 1536U;
+constexpr uint32_t kCombineCommitOffset = 1024U;
 inline std::array<uint8_t, 4096> local{};
 inline std::array<uint8_t, 4096> remote{};
 inline std::array<uint8_t, 256> scratch{};
@@ -19,10 +24,19 @@ struct Write {
     uint32_t destination;
     uint8_t* source;
     uint32_t bytes;
+    std::vector<uint8_t> sourceAtPost;
+    bool delivered = false;
+    bool commit = false;
 };
 inline std::vector<Write> queued;
 inline uint32_t writes = 0;
 inline uint32_t quiets = 0;
+inline uint32_t progressCalls = 0;
+inline uint32_t retired = 0;
+inline uint32_t signalTests = 0;
+inline bool cqError = false;
+inline std::function<void()> onProgress;
+inline std::function<void(const Write&)> onCommitVisible;
 
 inline void CheckResource(uint32_t peer, uint32_t qp, uint8_t* ub, uint32_t event)
 {
@@ -39,6 +53,39 @@ inline uint32_t CheckSymmetric(uint8_t* address, uint32_t bytes)
     }
     return static_cast<uint32_t>(offset);
 }
+
+inline void CheckSource(const Write& write)
+{
+    if (!std::equal(write.sourceAtPost.begin(), write.sourceAtPost.end(), write.source)) {
+        throw std::runtime_error("in-flight GM source changed before local completion");
+    }
+}
+
+inline void Deliver(Write& write)
+{
+    CheckSource(write);
+    if (!write.delivered) {
+        std::copy_n(write.source, write.bytes, remote.data() + write.destination);
+        write.delivered = true;
+        if (write.commit && onCommitVisible) onCommitVisible(write);
+    }
+}
+
+// Model the supplied HNS contract: a marker's only fragment is SO, so it
+// becomes visible after every preceding WQE. Reverse the data within each
+// group to avoid accidentally relying on their individual execution order.
+// Delivery does not consume CQEs or release the sender's lifetime contract.
+inline void DeliverPosted()
+{
+    size_t begin = 0U;
+    while (begin < queued.size()) {
+        size_t end = begin;
+        while (end < queued.size() && !queued[end].commit) ++end;
+        for (size_t i = end; i > begin; --i) Deliver(queued[i - 1U]);
+        if (end < queued.size()) Deliver(queued[end++]);
+        begin = end;
+    }
+}
 }  // namespace RoceTest
 
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_XSCALE) || defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
@@ -51,10 +98,13 @@ void aclshmemx_roce_qp_put_nbi(T* destination, T* source, T* scratch, uint32_t c
     CheckResource(static_cast<uint32_t>(peer), qp, scratch, event);
     const uint32_t offset = CheckSymmetric(destination, count);
     CheckSymmetric(source, count);
-    if (offset == kCommitOffset && !queued.empty()) {
-        throw std::runtime_error("commit can overtake outstanding data writes");
+    const bool commit = offset == kCommitOffset || offset == kCombineCommitOffset;
+#if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+    if (commit && !queued.empty()) {
+        throw std::runtime_error("XSCALE commit can overtake outstanding data writes");
     }
-    queued.push_back({offset, source, count});
+#endif
+    queued.push_back({offset, source, count, std::vector<uint8_t>(source, source + count), false, commit});
     ++writes;
     operations.push_back(1);
 }
@@ -65,23 +115,70 @@ void aclshmemx_roce_qp_quiet(uint32_t peer, uint32_t qp, T* scratch, uint32_t ev
     static_assert(sizeof(T) == 1U);
     using namespace RoceTest;
     CheckResource(peer, qp, scratch, event);
-    // Delayed completion and reversed WQE execution expose premature signaling.
-    for (auto item = queued.rbegin(); item != queued.rend(); ++item) {
-        std::copy_n(item->source, item->bytes, remote.data() + item->destination);
-    }
+    if (cqError) throw std::runtime_error("completion error");
+    DeliverPosted();
+    retired += static_cast<uint32_t>(queued.size());
     queued.clear();
     ++quiets;
     operations.push_back(2);
 }
 #endif
 
-inline int32_t aclshmem_signal_wait_until(int32_t* address, int comparison, int32_t value)
+namespace MegaMoeImpl {
+inline uint32_t RoceProgressReady(uint32_t peer, uint32_t qp, uint8_t* scratch, uint32_t event)
 {
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+    using namespace RoceTest;
+    CheckResource(peer, qp, scratch, event);
+    ++progressCalls;
+    if (cqError) throw std::runtime_error("ready CQE error");
+    if (onProgress) onProgress();
+    uint32_t consumed = 0U;
+    while (consumed < queued.size() && queued[consumed].delivered) {
+        CheckSource(queued[consumed]);
+        ++consumed;
+    }
+    queued.erase(queued.begin(), queued.begin() + consumed);
+    retired += consumed;
+    return consumed;
+#else
+    (void)peer;
+    (void)qp;
+    (void)scratch;
+    (void)event;
+    return 0U;
+#endif
+}
+}  // namespace MegaMoeImpl
+
+inline int TestSignal(int32_t* address, int comparison, int32_t value)
+{
+    ++RoceTest::signalTests;
     int32_t observed;
     std::memcpy(&observed, address, sizeof(observed));
-    if (comparison != ACLSHMEM_CMP_EQ || observed != value) {
+    if (comparison != ACLSHMEM_CMP_EQ) throw std::runtime_error("invalid signal comparison");
+    if (observed != value) return 0;
+    RoceTest::signalObserved = true;
+    return 1;
+}
+
+#if defined(MEGAMOE_TEST_HOST_PASS)
+// The real pinned SDK declares this distinct signature during host compilation.
+inline void aclshmem_int32_test(int32_t* address, int comparison, int32_t value, int* result)
+{
+    *result = TestSignal(address, comparison, value);
+}
+#else
+inline int aclshmem_int32_test(int32_t* address, int comparison, int32_t value)
+{
+    return TestSignal(address, comparison, value);
+}
+#endif
+
+inline int32_t aclshmem_signal_wait_until(int32_t* address, int comparison, int32_t value)
+{
+    if (!TestSignal(address, comparison, value)) {
         throw std::runtime_error("receiver did not wait for its exact invocation");
     }
-    RoceTest::signalObserved = true;
-    return observed;
+    return value;
 }

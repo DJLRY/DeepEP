@@ -19,10 +19,18 @@ __aicore__ inline void PublishHierarchicalLocalSignal(const Params& params, Hier
                         static_cast<int32_t>(params.tilingData->hierarchicalSequence));
 }
 
-__aicore__ inline void WaitHierarchicalLocalSignal(const Params& params, HierarchicalSignal signal)
+__aicore__ inline void WaitHierarchicalLocalSignal(const Params& params, HierarchicalSignal signal, uint32_t peer = 0U,
+                                                   __ubuf__ uint8_t* scratch = nullptr)
 {
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+    RoceWaitFlagEquals(HierarchicalSignalAddress(params.peermemInfo, signal), params.tilingData->hierarchicalSequence,
+                       peer, scratch, RoceWaitKind::LocalReadiness);
+#else
+    (void)peer;
+    (void)scratch;
     WaitUntilGmFlagEquals(HierarchicalSignalAddress(params.peermemInfo, signal),
                           static_cast<int32_t>(params.tilingData->hierarchicalSequence));
+#endif
     SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
 }
 
@@ -45,14 +53,15 @@ __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& comm
                  gateway, roceScratch, timer, AscendTimer::RdmaPhase::DispatchPayload);
     // Payload is independent of the rail packer: let its transfer overlap the
     // remaining metadata packing instead of putting that wait on both Puts.
-    WaitHierarchicalLocalSignal(params, HierarchicalSignal::LocalRailPacked);
+    WaitHierarchicalLocalSignal(params, HierarchicalSignal::LocalRailPacked, gateway, roceScratch);
     GM_ADDR packedRail = params.peermemInfo.railTopkIdsRecvPtr + myHost * config.railTopkIdsSlotBytes;
     const uint32_t railBytes = static_cast<uint32_t>(CalcRailTopkIdsSlotDataBytes(common.tokenNum, common.topK));
     RocePutBytes(packedRail, packedRail, railBytes, gateway, roceScratch, timer, AscendTimer::RdmaPhase::DispatchMeta);
-    // Both Puts use the same owned QP and share the completion/commit below.
+    // Both Puts use the same owned QP and share the commit below. HNS local
+    // completion is deferred to the single quiet before kernel return.
     // Neither metadata nor payload may be consumed before NetPayloadCommit.
-    // Completion is deliberately deferred until after this owner's reset/shared
-    // input work. Batches with no remote routes still publish the completion epoch.
+    // Commit publication follows this owner's reset/shared input work. Batches
+    // with no remote routes still publish the completion epoch.
 }
 
 __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& job, const MoeStageCommonConfig& common,
@@ -97,7 +106,8 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
     const uint32_t expertsPerHost = HIERARCHICAL_RANKS_PER_HOST * common.moeExpertPerRank;
     for (uint32_t sourceHost = relayCore % 2U; sourceHost < 2U; sourceHost += relayCores) {
         WaitHierarchicalLocalSignal(
-            params, sourceHost == myHost ? HierarchicalSignal::LocalRailPacked : HierarchicalSignal::MetaReady);
+            params, sourceHost == myHost ? HierarchicalSignal::LocalRailPacked : HierarchicalSignal::MetaReady,
+            HierarchicalGateway(common.rankId));
         uint32_t firstExpert;
         uint32_t expertCount;
         CalcRailRelayExpertRange(expertsPerHost, relayCore, relayCores, 2U, sourceHost, firstExpert, expertCount);
@@ -119,14 +129,16 @@ __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, cons
         return;
     }
     const uint32_t gateway = HierarchicalGateway(common.rankId);
-    // Complete both earlier data Puts before the single remote notification.
-    // The trailing quiet still protects Sequence until the notification source
-    // has been consumed, including calls with no cross-host expert routes.
+    // Commit both earlier Puts before the input barrier can block this owner.
+    // HNS posts only: the final kernel-tail quiet protects all GM sources and
+    // Sequence. XSCALE retains the conservative phase completion boundary.
     RocePublishCommit(
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit)),
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence)), gateway,
         HierarchicalRoceScratch(params), timer, AscendTimer::RdmaPhase::DispatchPayload);
+#if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
     PublishHierarchicalLocalSignal(params, HierarchicalSignal::TxDone);
+#endif
     // The independent receive leader acquires the opposite direction and
     // publishes RelayPayloadReady before reaching the public input barrier.
 }
@@ -149,7 +161,13 @@ __aicore__ inline void CrossRankSyncInHierarchicalHost(const AivJobContext& job,
         const uint32_t peer = firstRank + localRank;
         auto* remoteFlag = reinterpret_cast<__gm__ int32_t*>(g_winRankAddr_[peer]) + common.rankId * INT_CACHELINE;
         WriteGmByPassDCache(remoteFlag, epoch);
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+        auto* scratch = job.jobIndex == HierarchicalSendJob() ? HierarchicalRoceScratch(params) : nullptr;
+        RoceWaitFlagEquals(localFlags + peer * INT_CACHELINE, static_cast<uint32_t>(epoch),
+                           HierarchicalGateway(common.rankId), scratch, RoceWaitKind::HostProducerBarrier);
+#else
         GmSignalWaitBarrier(localFlags + peer * INT_CACHELINE, epoch);
+#endif
     }
     WriteGmByPassDCache(counter, epoch);
     PipeBarrier<PIPE_ALL>();

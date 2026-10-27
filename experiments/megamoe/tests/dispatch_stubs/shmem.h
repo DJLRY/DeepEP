@@ -9,6 +9,8 @@
 #include <vector>
 #include "kernel_operator.h"
 
+#define MEGA_MOE_ROCE_PROGRESS_H
+
 constexpr int ACLSHMEM_CMP_EQ = 0;
 
 namespace DispatchTest {
@@ -17,6 +19,7 @@ struct Write {
     uint32_t source;
     uint32_t bytes;
     std::vector<uint8_t> sourceAtPost;
+    bool delivered = false;
 };
 inline std::vector<uint8_t> local;
 inline std::vector<uint8_t> remote;
@@ -34,6 +37,7 @@ inline uint32_t quiets = 0U;
 inline uint32_t packCalls = 0U;
 inline uint32_t relayCalls = 0U;
 inline uint32_t receiveLeaderJob = 0U;
+inline uint32_t progressCalls = 0U;
 inline std::function<void()> completePacking;
 constexpr uint32_t kScratchOffset = 4096U;
 
@@ -62,6 +66,31 @@ inline void CheckResource(uint32_t actualPeer, uint32_t qp, uint8_t* ub, uint32_
     Check(actualPeer == peer && qp == 1U && reinterpret_cast<uintptr_t>(ub) == kScratchOffset && event == 7U,
           "Dispatch used an unowned peer/QP/UB/event");
 }
+
+inline void Deliver(Write& item)
+{
+    Check(std::equal(item.sourceAtPost.begin(), item.sourceAtPost.end(), local.data() + item.source),
+          "in-flight GM source was reused before quiet");
+    if (!item.delivered) {
+        std::copy_n(local.data() + item.source, item.bytes, remote.data() + item.destination);
+        item.delivered = true;
+    }
+}
+
+// HNS SO makes a single-fragment commit visible after the earlier data WQEs.
+// Reverse those data transfers, then expose the marker without retiring CQEs.
+inline void DeliverPosted()
+{
+    size_t begin = 0U;
+    while (begin < queued.size()) {
+        size_t end = begin;
+        while (end < queued.size() && queued[end].destination != metaCommit && queued[end].destination != payloadCommit)
+            ++end;
+        for (size_t i = end; i > begin; --i) Deliver(queued[i - 1U]);
+        if (end < queued.size()) Deliver(queued[end++]);
+        begin = end;
+    }
+}
 }  // namespace DispatchTest
 
 template <typename T>
@@ -74,7 +103,10 @@ void aclshmemx_roce_qp_put_nbi(T* destination, T* source, T* scratch, uint32_t c
     const uint32_t destinationOffset = Offset(destination, count);
     const uint32_t sourceOffset = Offset(source, count);
     if (destinationOffset == metaCommit || destinationOffset == payloadCommit) {
-        Check(count == sizeof(uint32_t) && queued.empty(), "commit overtook unfinished payload");
+        Check(count == sizeof(uint32_t), "commit was not a single-fragment epoch");
+#if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+        Check(queued.empty(), "XSCALE commit overtook unfinished payload");
+#endif
     }
     Write operation{destinationOffset, sourceOffset, count, std::vector<uint8_t>(source, source + count)};
     posts.push_back(operation);
@@ -88,31 +120,48 @@ void aclshmemx_roce_qp_quiet(uint32_t peer, uint32_t qp, T* scratch, uint32_t ev
     static_assert(sizeof(T) == 1U);
     using namespace DispatchTest;
     CheckResource(peer, qp, scratch, event);
-    // Execute in reverse order to expose a missing payload-before-commit quiet.
-    // Bytes are read at completion, so reusing the GM source early is observable.
-    for (auto item = queued.rbegin(); item != queued.rend(); ++item) {
-        Check(std::equal(item->sourceAtPost.begin(), item->sourceAtPost.end(), local.data() + item->source),
-              "in-flight GM source was reused before quiet");
-        std::copy_n(local.data() + item->source, item->bytes, remote.data() + item->destination);
-    }
+    DeliverPosted();
     queued.clear();
     ++quiets;
     RoceTest::operations.push_back(2);
 }
 
-inline int32_t aclshmem_signal_wait_until(int32_t* address, int comparison, int32_t value)
+namespace MegaMoeImpl {
+inline uint32_t RoceProgressReady(uint32_t peer, uint32_t qp, uint8_t* scratch, uint32_t event)
+{
+    DispatchTest::CheckResource(peer, qp, scratch, event);
+    ++DispatchTest::progressCalls;
+    return 0U;
+}
+}  // namespace MegaMoeImpl
+
+inline int aclshmem_int32_test(int32_t* address, int comparison, int32_t value)
 {
     using namespace DispatchTest;
-    Check(Offset(reinterpret_cast<uint8_t*>(address), sizeof(int32_t)) == payloadCommit,
-          "receiver did not wait on the unified Dispatch commit");
-    Check(comparison == ACLSHMEM_CMP_EQ && static_cast<uint32_t>(value) == sequence &&
-              ReadWord(local, payloadCommit) == sequence,
-          "receiver accepted a stale invocation");
+    if (completePacking) {
+        auto pack = std::move(completePacking);
+        completePacking = nullptr;
+        pack();
+    }
+    const auto offset = Offset(reinterpret_cast<uint8_t*>(address), sizeof(int32_t));
+    Check(comparison == ACLSHMEM_CMP_EQ && static_cast<uint32_t>(value) == sequence, "incorrect invocation wait");
+    if (ReadWord(local, offset) != sequence) return 0;
+#if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
     if (RoceTest::blockIndex == 1) {
         Check(queued.empty() && ReadWord(remote, payloadCommit) == sequence && ReadWord(local, txDone) == sequence,
               "sender's incoming wait preceded outgoing completion and TxDone");
     }
-    ++waits;
+#endif
+    if (offset == payloadCommit) ++waits;
     RoceTest::signalObserved = true;
+    return 1;
+}
+
+inline int32_t aclshmem_signal_wait_until(int32_t* address, int comparison, int32_t value)
+{
+    DispatchTest::Check(
+        DispatchTest::Offset(reinterpret_cast<uint8_t*>(address), sizeof(int32_t)) == DispatchTest::payloadCommit,
+        "receiver did not wait on the unified Dispatch commit");
+    DispatchTest::Check(aclshmem_int32_test(address, comparison, value) != 0, "receiver accepted a stale invocation");
     return value;
 }

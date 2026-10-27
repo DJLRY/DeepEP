@@ -11,6 +11,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 #define __aicore__
@@ -150,6 +151,8 @@ struct State {
     uint32_t pendingDmaBlocks = 0U;
     uint32_t flagDmas = 0U;
     uint32_t releaseAfterSnapshot = 0xffffffffU;
+    uint32_t waitChecks = 0U;
+    uint32_t failAfterWaitChecks = 0U;
 };
 inline State* state = nullptr;
 constexpr uint32_t kUbOffset = 4096U;
@@ -224,8 +227,14 @@ public:
         return data_;
     }
 
-    void SetL2CacheHint(CacheMode mode) { cacheMode_ = mode; }
-    CacheMode GetL2CacheHint() const { return cacheMode_; }
+    void SetL2CacheHint(CacheMode mode)
+    {
+        cacheMode_ = mode;
+    }
+    CacheMode GetL2CacheHint() const
+    {
+        return cacheMode_;
+    }
 
 private:
     T* data_ = nullptr;
@@ -261,8 +270,9 @@ void DataCopy(const LocalTensor<T>& destination, const GlobalTensor<T>& source, 
     Check(s.overwriteOrdered && s.pendingDma == nullptr, "ready DMA reused live scratch");
     Check(destination.Data() == reinterpret_cast<T*>(s.ub.data()), "ready DMA used unowned scratch");
     Check(source.GetL2CacheHint() == CacheMode::CACHE_MODE_NORMAL, "ready DMA disabled the default L2 cache");
-    Check(copy.blockCount > 0U && copy.blockCount <= 8U && copy.blockLen == 1U &&
-              copy.srcStride == 15U && copy.dstStride == 0U, "invalid ready gather geometry");
+    Check(copy.blockCount > 0U && copy.blockCount <= 8U && copy.blockLen == 1U && copy.srcStride == 15U &&
+              copy.dstStride == 0U,
+          "invalid ready gather geometry");
     const auto offset = source.Data() - s.flags.data();
     Check(offset >= 0 && offset % kFlagWords == 0, "ready gather is not flag-aligned");
     const auto first = static_cast<uint32_t>(offset / kFlagWords);
@@ -332,6 +342,20 @@ inline uint32_t HierarchicalHost(uint32_t rank)
 inline uint32_t HierarchicalGateway(uint32_t rank)
 {
     return rank ^ HIERARCHICAL_RANKS_PER_HOST;
+}
+struct RoceWaitState {};
+enum class RoceWaitKind { CombineRows };
+inline void RoceCheckWait(RoceWaitState&, uint32_t peer, uint8_t* scratch, RoceWaitKind kind, uint32_t expected,
+                          uint32_t observed)
+{
+    auto& s = *ProgressTest::state;
+    ProgressTest::Check(peer == s.peer && scratch == s.ub.data(), "drain wait used another owner's QP/scratch");
+    ProgressTest::Check(kind == RoceWaitKind::CombineRows && observed < expected,
+                        "drain wait lost its incomplete-row diagnostic");
+    ++s.waitChecks;
+    if (s.failAfterWaitChecks != 0U && s.waitChecks >= s.failAfterWaitChecks) {
+        throw std::runtime_error("stalled producer");
+    }
 }
 inline bool UseHierarchicalRoce(const MegaMoeTilingData* tiling)
 {
@@ -484,10 +508,12 @@ public:
             if (std::strcmp(pattern, "last") == 0) {
                 remoteContribution = row + 1U == s.rows;
             }
-            const uint32_t expert =
-                remoteContribution ? localBase + (std::strcmp(pattern, "duplicate") == 0 ? 7U : row % 511U) : otherBase + row % 511U;
-            ids[row] =
-                std::strcmp(pattern, "holes") == 0 || (std::strcmp(pattern, "mixed") == 0 && row % 11U == 3U) ? -1 : static_cast<int32_t>(expert);
+            const uint32_t expert = remoteContribution
+                                        ? localBase + (std::strcmp(pattern, "duplicate") == 0 ? 7U : row % 511U)
+                                        : otherBase + row % 511U;
+            ids[row] = std::strcmp(pattern, "holes") == 0 || (std::strcmp(pattern, "mixed") == 0 && row % 11U == 3U)
+                           ? -1
+                           : static_cast<int32_t>(expert);
             s.expected[row] =
                 ids[row] >= 0 && static_cast<uint32_t>(ids[row]) / expertsPerHost == HierarchicalHost(common.rankId);
             paired[row / 127U * 128U + row % 127U] = ids[row];
@@ -743,6 +769,22 @@ void Drain()
           "final drain used steady-state fragmentation instead of unrestricted runs");
     ready.CheckPayload();
 }
+
+void DrainStalledProducer()
+{
+    Fixture f(1U, 8U);
+    f.Routes("all");
+    f.Init();
+    f.s.failAfterWaitChecks = 2U;
+    bool failed = false;
+    try {
+        DrainHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data());
+    } catch (const std::runtime_error&) {
+        failed = true;
+    }
+    Check(failed && f.s.waitChecks == 2U, "missing producer bypassed bounded wait handling");
+    Check(f.s.posts.empty() && f.progress.sentRows == 0U, "missing producer caused an unready row to be sent");
+}
 void Topology()
 {
     Fixture f(32U, 32U);
@@ -876,7 +918,8 @@ void OracleStep(Fixture& f, uint32_t maxPosts, uint32_t maxScans)
     }
     for (uint32_t row : loaded) {
         Check(std::count(loaded.begin(), loaded.end(), row) == 1 &&
-                  std::find(visits.begin(), visits.end(), row) != visits.end(), "snapshot exceeded scan bounds");
+                  std::find(visits.begin(), visits.end(), row) != visits.end(),
+              "snapshot exceeded scan bounds");
     }
     const uint32_t nextRow = scanned == 0U ? beforeRow : (beforeRow + scanned) % f.s.rows;
     Check(f.progress.nextRow == nextRow, "resumed cursor differs from bounded circular row sequence");
@@ -1081,6 +1124,8 @@ int main(int argc, char** argv)
         Metadata();
     else if (std::strcmp(scenario, "drain") == 0)
         Drain();
+    else if (std::strcmp(scenario, "drain-stalled") == 0)
+        DrainStalledProducer();
     else if (std::strcmp(scenario, "topology") == 0)
         Topology();
     else if (std::strcmp(scenario, "telemetry") == 0)

@@ -1066,9 +1066,9 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
             PipeBarrier<PIPE_ALL>();
         }
     }
-    // FinishHierarchicalDispatch has quieted both payload and commit before this
-    // full-core barrier. Physical AIV1 retains QP1 ownership through Combine
-    // on both hosts; only AIV1 posts or consumes its CQ.
+    // Dispatch has posted its ordered commit and acquired the incoming commit
+    // before this barrier. HNS defers outbound CQ retirement until kernel exit;
+    // physical AIV1 remains the only QP1/CQ1 owner throughout both phases.
     SyncAll<false>();  // AIC 等待 AIV 完成输入准备与 flag 清零后再进入计算
 
     ProcessGmmPipeline();
@@ -1087,9 +1087,10 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
                                       params_.peermemInfo, HierarchicalSignal::CombineCommit)),
                                   reinterpret_cast<GM_ADDR>(
                                       HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::Sequence)),
-                                  HierarchicalGateway(rankId_), scratch);
+                                  HierarchicalGateway(rankId_), scratch, nullptr, AscendTimer::RdmaPhase::Combine);
                 RoceWaitCommit(HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::CombineCommit),
-                               params_.tilingData->hierarchicalSequence);
+                               params_.tilingData->hierarchicalSequence, nullptr, AscendTimer::RdmaPhase::Combine,
+                               HierarchicalGateway(rankId_), scratch);
             }
             PipeBarrier<PIPE_ALL>();
             SyncAll<true>();
@@ -1100,6 +1101,13 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         UnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();
         UnpermuteTokens<CombineQuantMode, TopkWeightsType, TopkWeightsPrefetch, GMM1_TILE_M>(
             tokenUnpermuteConfig_, commonConfig_, params_, tokenUnpermuteScratch_, unpermuteBufferConfig);
+        if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
+            // Unpermute reads the incoming combineSend region, never the
+            // outbound gatewayCombine rows or Sequence protected by this drain.
+            RoceFinishOutstanding(HierarchicalGateway(rankId_), HierarchicalRoceScratch(params_), nullptr,
+                                  AscendTimer::RdmaPhase::Combine);
+            PublishHierarchicalLocalSignal(params_, HierarchicalSignal::TxDone);
+        }
     }
     // 恢复入口时保存的溢出模式。
     SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(oriOverflowMode);
