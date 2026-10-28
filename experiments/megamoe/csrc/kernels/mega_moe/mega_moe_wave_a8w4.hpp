@@ -276,21 +276,11 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
 {
     const auto& begin = cursor.slice.begin;
     uint32_t rows = static_cast<uint32_t>(cursor.slice.end.globalTokenIndex - begin.globalTokenIndex);
-    // RoCE owner 保留 SwiGLU 和远端 progress，把本地 Combine 搬运交给其余 AIV1。
-    // 只修改局部 consumer job；成员 waveCombineJob_ 仍描述原来的 GMM2 生产核。
+    // Payload QP owners retain their compute duties; bounded remote progress
+    // runs between foreground tasks on each AIV1.
     auto combineJob = waveCombineJob_;
-    const bool offloadRoceCombine = UseHierarchicalRoce(params_.tilingData) && combineJob.totalJobs > 1U;
-    const bool roceOwner = offloadRoceCombine && this->aivJob_.jobIndex == HierarchicalSendJob();
-    if (offloadRoceCombine) {
-        constexpr uint32_t AIV_CORE_COUNT_PER_AIC = 2U;
-        const uint32_t ownerBlock = HierarchicalSendJob() / AIV_CORE_COUNT_PER_AIC;
-        --combineJob.totalJobs;
-        if (combineJob.jobIndex == ownerBlock) {
-            combineJob.jobIndex = combineJob.totalJobs;  // 空任务，仍需探测当前 slice 的生产完成状态。
-        } else if (combineJob.jobIndex > ownerBlock) {
-            --combineJob.jobIndex;
-        }
-    }
+    const bool roceOwner =
+        UseHierarchicalRoce(params_.tilingData) && IsHierarchicalPayloadOwner(this->aivJob_.jobIndex);
     // 在剩余 consumer 空间轮换完整行任务，不修改成员中的物理核编号。
     // 输入是 Combine 自己的逻辑 wave（cursor.wave），不是当前 Dispatch/GMM1 的进度；
     // BS>=4096 时 GMM2 滞后一轮，使用其他阶段的 wave 会把同一批输出分给错误的 owner。
@@ -317,7 +307,7 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
         return false;
     }
     timer_.SetWave(static_cast<int64_t>(cursor.wave));
-    // owner 不搬行，但必须随 GMM2 就绪推进 slice；不能一次跳过全部 slice 后提前
+    // 空 slice 的 owner 也必须随 GMM2 就绪推进；不能一次跳过全部 slice 后提前
     // 进入 SyncAll，停止 RDMA progress。未就绪时仍由调度器推进其他工作，绝不阻塞。
     if (owned.count == 0U) {
         return true;

@@ -414,7 +414,7 @@ python -I -m deep_ep_experimental.megamoe.timer.trace_parser \
 | `AIV_COUNT_TABLE_PREPARE` | AIV1 准备 count/prefix 表的完整父区间 |
 | `AIV_COUNT_METADATA_WAIT` | 获取所有来源的有效 count：包含 DMA、epoch 校验、转置、重试与退避，并非纯网络延迟 |
 | `AIV_GATEWAY_PAYLOAD_CHECK` | count-ready 发布后，按保存的来源集合检查本核负责的 gateway、发布并等待本卡就绪槽的父区间 |
-| `AIV_GATEWAY_PAYLOAD_WAIT` | 唯一检查者获取所需 gateway 的 `RelayPayloadReady` 及发布前的 GM 顺序保障；显示 source rank、gateway rank 和 sequence |
+| `AIV_GATEWAY_PAYLOAD_WAIT` | 唯一检查者获取所需 gateway 的8路 `NetPayloadCommit` 及发布前的 GM 顺序保障；显示 source rank、gateway rank 和 sequence |
 | `AIV_COUNT_PREFIX_BUILD` | 从原始 count 保存 gateway 依赖集合，再计算专家 token 总数和 prefix 表，包含既有向量完成同步 |
 | `AIV_COUNT_TABLE_PUBLISH` | count/prefix 写回、既有 MTE3 完成同步和 count-ready 发布 |
 | `AIC/AIV_COUNT_READY_WAIT` | AIC/AIV0 等待对应 block 的 AIV1 发布 count-ready |
@@ -585,63 +585,51 @@ python3 experiments/megamoe/scripts/trace_text.py restore part1.txt part2.txt \
 FP8 和内部量化的 BF16 输入均沿用原接口，容量可大于实际 B。B>32 及更多16卡主机暂不支持。
 A8W8 当前只运行路由专家，`num_shared_experts` 必须为0，不能传入 timer。
 
-两台机器的所有 rank 都固定由物理 AIV0 打包本地元数据，物理 AIV1 发送 RDMA。
-AIV1 在 Dispatch 和 Combine 全程独占 QP1，包括 Put、quiet 和 commit；AIV0 不推进 RDMA。
-此分工适用于 A8W4/A8W8；host_id 仍用于选择 rail 槽、gateway 和接收转发分工，
-打包使用 AIV0 自己的 epoch 计数槽，元数据发送前等待 `LocalRailPacked`；payload 先行提交，
-与 AIV0 剩余的元数据打包重叠。
+两台机器的所有 rank 使用相同的 QP/AIV 归属：QP0 保留给 SDK，前8个核组的 AIV1
+（物理 AIV 1、3、…、15）分别独占 payload QP1…8；物理 AIV0 打包路由并独占 metadata QP9。
+运行时在初始化前统一设置10个 QP。锁定 SDK 按所有非自身 peer 建立渠道，EP32 对应
+每 rank 31×10=310个渠道；这项资源开销需要在目标设备验证。
+每个 owner 使用自己核内的256 B UB scratch，并独占其 QP 的 Put、CQ 回收及 quiet。
 
-跨机输入 payload 在本卡全部 token/scale 准备完成后，按实际 B 一次 Put 到配对 gateway，
-不再扫描路由并拆成多个连续 token 段；B 小于预分配容量时只发送实际 B 行。
-接收区保留原 token 编号，专家仍按路由元数据读取，多传的行不会增加计算。
-该策略用于上述 B≤32 的 A8W4/A8W8 路径，包括没有远端路由的批次。
-元数据和 payload 先在同一 QP 提交，owner 完成 reset/shared-input 工作后
-发布共用的 `NetPayloadCommit`。HNS1825 使用已确认的网卡合同：每个 WQE 的末分片自动具有 SO，
-覆盖同一 QP 的前序 WQE；远端观察到该分片时，前序数据已在 GM 可见。因此独立的4 B commit
-WQE 可直接跟在数据之后，Dispatch 不执行显式 quiet；SHMEM 无需设置 WQE 的 SO 字段。
-接收 leader 获取这个标记后立即发布 `RelayPayloadReady` 和 `MetaReady`，然后转发 metadata；
-接收就绪不等待本卡反方向的 CQ 完成。接收侧仍保留 DCache 失效和 scalar→MTE2 acquire。
-公共输入 barrier 保留，统一 commit 和接收就绪仍须在它之前发布。
-HNS1825 的 Dispatch、Combine 发送源以及完整32位 `Sequence` 在本轮保持不变；
-Unpermute 只读独立的接收区。输出就绪屏障之后，通信 owner 统一 quiet 一次并发布 `TxDone`，
-其他 AIV 同时执行 Unpermute；kernel 完成等待两部分工作全部结束。
-下一轮沿用同一 runtime stream，不能在这个完成边界前覆盖源区或 epoch。
-XSCALE 没有使用上述 SO 合同，仍保留每阶段 `quiet → commit → quiet`；该优化不依赖 PI-on-chip 开关。
-这会放弃 metadata 提前到达时的 relay 重叠机会，整体收益以关闭打点的 perf 为准。
-H=3584、B=32 时 payload 为118784 B；相较已测 EP32/K8 balanced 样本的8次7424 B提交，
-该策略以每 rank 额外59392 B流量换取一次提交和更少的发送端扫描工作。
-性能验证应同时检查 payload POST 次数、quiet、输入准备结束及首 GMM 时间，
-并以关闭打点的 `rank-max-mean` 判断整体收益，不能仅由 POST 次数推断加速比例。
+Dispatch 打包核在已有 Top-k UB 数据上一次生成有效 token mask：至少一个有效专家位于对端主机
+才发送该 token，并且只发送一次。连续有效 token 合并成段；按8路 token 配额切分较长段，
+各路行数最多相差一行，多个可用 lane 之间优先选择已分配 Put 次数少的 lane。
+计划只含8个32位 mask，写入 GM 后由 `LocalRailPacked` 发布，各 sender 只读取自己的 mask。
+发送保持原 token 偏移，不增加压紧/解包步骤；空 lane 仍发送本轮 commit。
+H=3584、B=32、K=8 的 balanced 路由形成8段连续2-token，每 QP 一次7424 B payload Put，
+总 payload 59392 B；全本地路由不发送 payload。
 
-跨机输入的 gateway 依赖按 AIV1 block 分工：各核从同一份有效 count 表得到本 rank
-实际需要的来源，并在原始 count 被前缀和覆盖前保存依赖 mask。数量表及前缀写回完成后立即
-发布 count-ready，允许 AIC/AIV0 提前准备 GMM 状态和权重。随后唯一检查者确认对应 gateway
-就绪，向本卡独立的512 B槽发布当前 epoch；AIV1 等到所需本卡槽就绪后才读取 payload。
-各检查者先完成自己的检查和发布，
-再消费本卡通知，避免把并行检查串行化。28个 AIV1 都需要16个来源的用例中，
-gateway 检查调用由448次降为16次；这些是依赖检查调用数，未就绪时仍会轮询。
-新增16×512 B槽及对齐 padding 纳入现有输入屏障前的 workspace reset，
-不改变 peermem 通信布局，也不新增全核屏障。转发前显式执行
-[`DataSyncBarrier<DDR>`](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/basic_api/sync_control/intra_core_sync/DataSyncBarrier_ISASI.md)，
-消费者保留 scalar→MTE2 顺序保障。A8W4/A8W8 共用此协议。
+路由在 QP9 上通过独立 `NetMetaCommit` 放行。接收 leader 只获取路由 commit，发布 `MetaReady`
+并开始机内 Relay、路由及计数构造，不等待 payload。56个 AIV 中，打包核和8个 sender 不参与
+Relay，其余47个核用连续逻辑编号划分专家。各 sender 在公共输入 barrier 之前提交自己的
+`NetPayloadCommit[lane]`，不能把入站 payload 等待放回 Relay 或输入 barrier 之前。
+每个网络 commit 独占512 B缓存行，metadata、Dispatch 各 lane、Combine 各 lane 使用不同槽。
 
-A8W4 的跨机 Combine 在 AIV1 的计算间隙分批推进：仍有本核路由或共享 activation 时，每次最多提交2个 Put、
-扫描64个 `[token, top-k]` 槽位；这些前台工作完成后扩大为最多8个 Put和一个完整槽位扫描。
-输出 export 前的最后一次推进也使用扩大后的预算。扫描游标跨调用保留，已发送槽位不再参与就绪判定；
-全部发送后立即返回。固定物理 AIV1 保留 activation、dispatch 和远端推进，
-本地 Combine 搬运交给其余 AIV1：28个 AIC 时由剩余27个 AIV1 均衡分配完整行，
-在27个 consumer 的空间内按 Combine wave 和全局行前缀轮换，确保每行只搬运一次。
-GMM2 仍使用原28个生产核及其实际完成计数，不能用27个搬运核代替生产核数。
-owner 对每个 Combine slice 保留非阻塞生产完成检查，就绪后推进 slice 并尝试远端发送，
-再回到循环入口检查 activation；尚未就绪时继续其他任务和有预算的远端推进。
-这避免 owner 因无本地行而立即跳完所有 slice、提前进入 SyncAll。非 RoCE、A8W8 路径
-及仅一个 AIC 的回退路径沿用原本地 Combine 分工；QP1 始终由固定物理 AIV1 独占。
-最终 host barrier 后完整 drain，HNS1825 直接提交 Combine commit，再等待对端 commit、执行 acquire
-和全 AIV 同步。随后 owner 执行 quiet，其他 AIV 同时 Unpermute。主机配置和设备分工统一排除物理 owner，
-例如56个 AIV 时由55个消费核完整分配输出行，owner 不再承担输出 token；不新增同步屏障。
-两端都必须先提交再等待；没有远端行也不能省略
-Dispatch/Combine commit。host barrier 关闭本机的生产者和旧 Dispatch 读取，双向 commit 继续保护跨轮复用。
-单次 Put 内部仍可能因队列回压等待，这些计数预算并非硬性时间上限。
+跨机 payload 依赖仍由每个 source 的唯一 AIV1 检查者获取。它在有效 count 被前缀和覆盖前
+保存依赖 mask，先发布 count-ready，使 AIC/AIV0 能准备计算状态及权重；再直接检查本机 gateway
+上的8个 `NetPayloadCommit`。全部等于完整32位 sequence 后执行 `DataSyncBarrier<DDR>`，
+向本卡独立512 B槽发布该 source 的就绪 epoch。各检查者先完成自己的发布，再消费所需的
+本卡通知；AIV1 保留 scalar→MTE2 acquire，实际 token 搬运以及 GMM tile-ready 都在此之后。
+本卡16个通知槽继续由输入屏障前的 workspace reset 清零，不新增全核屏障。
+
+Combine 的8个 payload owner 各自负责连续 token 范围，BS32 时每人4个 token。
+每核只解析自己的 Top-k 范围，独立维护 pending、扫描游标和计数，只回传本机负责的有效专家行。
+这些 AIV1 保留 activation、dispatch 和本地 Combine 工作，在任务间隙做有预算的远端推进。
+前台任务未完成时每次最多2个 Put/64个槽；之后最多8个 Put并扫描自己的完整范围。
+连续就绪行仍按原合包规则发送；扫描及合包不跨 owner 边界。
+
+最终16-rank host barrier 关闭本机生产者及旧 Dispatch 读取，各 payload owner drain 自己的范围，
+在自己的 QP 上发布 `CombineCommit[lane]`，再等待同 lane 的入站 commit。空范围也执行这个协议。
+已有全 AIV 屏障将8个接收完成条件汇合后放行 Unpermute。
+HNS1825 使用同一 QP 上已确认的 SO 顺序合同：4 B commit 可跟在数据 WQE 后直接提交，
+它只证明同 QP 的前序数据在远端 GM 可见，不能证明其他 QP 完成，也不能替代本地完成。
+8个 payload owner 和 metadata owner 随后各自执行一次 tail quiet；其余47个 AIV 执行 Unpermute。
+主机输出 buffer 配置与设备逻辑编号使用同一分工，kernel 完成等待所有核结束。
+所有 Dispatch/Combine 源及 `Sequence` 保持不变直到所属 QP quiet；下一轮在同一 runtime stream
+上执行，不能提前复用。XSCALE 继续使用每阶段 `quiet → commit → quiet` 的保守完成协议。
+单次 Put 仍可能因队列回压等待，因此上述提交计数预算不是硬性时间上限。
+性能收益应以关闭打点的 `rank-max-mean` 为准，并检查 POST、路由传播、payload 等待和最终 quiet。
+
 扫描在单次调用内缓存当前 token 的 pending mask，通过递增槽位推进，避免逐行除模；
 连续发送段在 Put 返回后按 token 清除对应位。扫描仍逐槽计数，保留洞、游标绕回、
 预算截断和相邻行合并。少于4行且前后仍有待发行的短段，允许同一起点最多延后一次，
@@ -680,7 +668,7 @@ Combine POST 分布和 quiet/commit 等待。CPU 回归不能替代设备精度�
 
 两机 RoCE runtime 的 `barrier()` 和 `destroy()` 先同步本卡全部 stream，再通过现有
 StoreGroup（TCPStore）或 ProcessGroup 交换完成状态；全部 rank 成功后才允许清理 SHMEM。
-当前 kernel 在返回前已等待应用 QP1 完成，这一顺序确保释放前没有未完成的通信。
+当前 kernel 在返回前已等待全部9条应用 QP 完成，这一顺序确保释放前没有未完成的通信。
 这里不调用直接读取对端 GM 的通用 `aclshmem_barrier_all()`，也不要求机内各 rank 建立 RoCE QP。
 所有 rank 必须按相同顺序调用，调用期间不得并发提交新的算子；任一 rank 同步失败则保留资源并要求重启作业。
 该修复涉及 Python 和原生扩展，两台机器都需重新构建/安装匹配的 wheel；已有 SHMEM SDK 无需为此修改。

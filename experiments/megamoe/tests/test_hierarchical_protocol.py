@@ -64,8 +64,8 @@ def input_records(bs, seed):
 
 
 def hierarchical_dispatch(ids, records):
-    """Stage every actual token once; original routes alone select consumers."""
-    transfer_keys = {(source, token, 1 - host(source)) for source in range(WORLD) for token in range(ids.shape[1])}
+    """Stage only tokens with a remote consumer, retaining original offsets."""
+    transfer_keys = {(key[0], key[1], host(owner)) for key, owner, _ in routes(ids) if host(owner) != host(key[0])}
     relayed = {(pair(source), token): records[source, token] for source, token, _ in transfer_keys}
     consumers = {}
     for key, owner, expert in routes(ids):
@@ -175,17 +175,21 @@ def test_hierarchical_messages_match_direct_routing(bs, topk, pattern):
     transfers, consumers = hierarchical_dispatch(ids, records)
     direct = {(owner, expert, key): records[key[:2]] for key, owner, expert in routes(ids)}
     assert consumers == direct
-    expected_tokens = {(source, token, 1 - host(source)) for source in range(WORLD) for token in range(bs)}
+    expected_tokens = {
+        (source, token, 1 - host(source))
+        for source in range(WORLD)
+        for token in range(bs)
+        if any(host(int(expert) // EXPERTS_PER_RANK) != host(source) for expert in ids[source, token])
+    }
     assert transfers == expected_tokens
-    assert len(transfers) == WORLD * bs
-    # Extra staging rows must not create extra expert invocations. In particular,
-    # all-local routing still transfers payload but has no cross-host consumer.
+    assert len(transfers) <= WORLD * bs
+    # Filtering must not change the expert invocations.
     remote_consumers = {key for key in consumers if host(key[0]) != host(key[2][0])}
     assert remote_consumers == {
         (owner, expert, key) for key, owner, expert in routes(ids) if host(owner) != host(key[0])
     }
     if pattern == "local":
-        assert not remote_consumers
+        assert not remote_consumers and not transfers
     if pattern == "duplicate-rank":
         assert len(transfers) == WORLD * bs
         assert all(len(set(token_ids // EXPERTS_PER_RANK)) == 1 for token_ids in ids.reshape(-1, topk))
@@ -722,7 +726,6 @@ def test_real_kernel_entrypoints_overlap_owner_retirement_after_output_ready(hea
         "RocePublishCommit(",
         "RoceWaitCommit(",
         "RoceFinishOutstanding(",
-        "HierarchicalSignal::TxDone",
         "UnpermuteTokens<",
         "Stage::COMPLETE",
     )
@@ -734,9 +737,9 @@ def test_real_kernel_entrypoints_overlap_owner_retirement_after_output_ready(hea
     tail_begin = body.index("Stage::UNPERMUTE")
     tail = body[tail_begin : body.index("Stage::COMPLETE")]
     assert "UseHierarchicalRoce(params_.tilingData)" in tail
-    assert "aivJob_.jobIndex == HierarchicalSendJob()" in tail
+    assert "IsHierarchicalQpOwner(aivJob_.jobIndex)" in tail
     assert "expectedRows" not in tail and "sentRows" not in tail
-    assert "} else {" in tail[tail.index("HierarchicalSignal::TxDone") : tail.index("UnpermuteTokens<")]
+    assert "} else {" in tail[tail.index("RoceFinishOutstanding(") : tail.index("UnpermuteTokens<")]
     assert "SyncAll<true>()" in body[body.index("RoceWaitCommit(") : tail_begin]
     assert "SyncAll" not in tail, "The owner must not gate other AIVs behind its final quiet"
     if timed:

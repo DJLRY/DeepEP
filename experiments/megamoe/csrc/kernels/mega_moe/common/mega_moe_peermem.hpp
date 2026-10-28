@@ -33,6 +33,7 @@
 #endif
 #include "../mega_moe_tiling.hpp"
 #include "mega_moe_constants.hpp"
+#include "../../../../../../csrc/common/roce_qp_layout.hpp"
 
 namespace MegaMoeImpl {
 
@@ -59,6 +60,7 @@ constexpr uint32_t HIERARCHICAL_WORLD_SIZE = 32U;
 constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 32U;
 constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
 constexpr uint32_t HIERARCHICAL_ROCE_UB_BYTES = 256U;
+constexpr uint32_t HIERARCHICAL_PAYLOAD_LANES = ascend_deepep::roce_layout::kPayloadQps;
 
 // Every flag owns a full L2 line. Network writers, local publishers and consumers
 // must never share a line with payload or with a different flag producer.
@@ -68,9 +70,8 @@ enum class HierarchicalSignal : uint32_t {
     NetMetaCommit,
     MetaReady,
     NetPayloadCommit,
-    RelayPayloadReady,
-    TxDone,
-    CombineCommit,
+    CombineCommit = NetPayloadCommit + HIERARCHICAL_PAYLOAD_LANES,
+    DispatchPlan = CombineCommit + HIERARCHICAL_PAYLOAD_LANES,
     Count
 };
 
@@ -90,16 +91,38 @@ HOST_DEVICE uint32_t HierarchicalPackJob()
     return 0U;
 }
 
-HOST_DEVICE uint32_t HierarchicalSendJob()
+HOST_DEVICE uint32_t HierarchicalSendJob(uint32_t lane = 0U)
 {
-    return 1U;
+    return lane * 2U + 1U;
 }
 
-// Reserve the physical QP owner for completion after the output-ready barrier.
-// Host buffer sizing and device token partitioning must use the same job count.
+HOST_DEVICE bool IsHierarchicalPayloadOwner(uint32_t job)
+{
+    return (job & 1U) != 0U && job < 2U * HIERARCHICAL_PAYLOAD_LANES;
+}
+
+HOST_DEVICE bool IsHierarchicalQpOwner(uint32_t job)
+{
+    return job == HierarchicalPackJob() || IsHierarchicalPayloadOwner(job);
+}
+
+HOST_DEVICE uint32_t HierarchicalOwnerQp(uint32_t job)
+{
+    return job == HierarchicalPackJob() ? ascend_deepep::roce_layout::kMetadataQp
+                                        : ascend_deepep::roce_layout::kFirstPayloadQp + job / 2U;
+}
+
+// Compact indices skip the packer and all eight AIV1 payload owners.
+HOST_DEVICE uint32_t HierarchicalRelayJob(uint32_t job)
+{
+    const uint32_t ownersBefore = job / 2U < HIERARCHICAL_PAYLOAD_LANES ? job / 2U : HIERARCHICAL_PAYLOAD_LANES;
+    return job - 1U - ownersBefore;
+}
+
+// All nine QP owners retire outgoing work while the other AIVs unpermute.
 HOST_DEVICE uint32_t UnpermuteJobCount(const MegaMoeTilingData* t)
 {
-    return UseHierarchicalRoce(t) && t->blockAivNum > HierarchicalSendJob() ? t->blockAivNum - 1U : t->blockAivNum;
+    return UseHierarchicalRoce(t) ? t->blockAivNum - HIERARCHICAL_PAYLOAD_LANES - 1U : t->blockAivNum;
 }
 
 HOST_DEVICE uint32_t UnpermuteJobIndex(const MegaMoeTilingData* t, uint32_t physicalJob)
@@ -107,15 +130,15 @@ HOST_DEVICE uint32_t UnpermuteJobIndex(const MegaMoeTilingData* t, uint32_t phys
     if (UnpermuteJobCount(t) == t->blockAivNum) {
         return physicalJob;
     }
-    if (physicalJob == HierarchicalSendJob()) {
+    if (IsHierarchicalQpOwner(physicalJob)) {
         return UnpermuteJobCount(t);  // Invalid logical job: owns no output rows.
     }
-    return physicalJob > HierarchicalSendJob() ? physicalJob - 1U : physicalJob;
+    return HierarchicalRelayJob(physicalJob);
 }
 
-HOST_DEVICE uint64_t HierarchicalSignalOffset(HierarchicalSignal signal)
+HOST_DEVICE uint64_t HierarchicalSignalOffset(HierarchicalSignal signal, uint32_t lane = 0U)
 {
-    return static_cast<uint64_t>(signal) * HIERARCHICAL_FLAG_BYTES;
+    return (static_cast<uint64_t>(signal) + lane) * HIERARCHICAL_FLAG_BYTES;
 }
 
 // ============================ 各区尺寸（host / device 共用） ============================
@@ -412,9 +435,10 @@ struct PeermemInfo {
 };
 
 #if defined(__DAV_C310_CUBE__) || defined(__DAV_C310_VEC__)
-__aicore__ inline __gm__ int32_t* HierarchicalSignalAddress(const PeermemInfo& info, HierarchicalSignal signal)
+__aicore__ inline __gm__ int32_t* HierarchicalSignalAddress(const PeermemInfo& info, HierarchicalSignal signal,
+                                                            uint32_t lane = 0U)
 {
-    return reinterpret_cast<__gm__ int32_t*>(info.hierarchicalControlPtr + HierarchicalSignalOffset(signal));
+    return reinterpret_cast<__gm__ int32_t*>(info.hierarchicalControlPtr + HierarchicalSignalOffset(signal, lane));
 }
 #endif
 

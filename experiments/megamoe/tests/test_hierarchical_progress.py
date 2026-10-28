@@ -64,3 +64,29 @@ def test_hierarchical_progress_contract(hierarchical_progress_binary, scenario):
         timeout=10,
     )
     assert result.returncode == 0, result.stderr
+
+
+def test_eight_owners_preserve_partition_qp_and_exact_coverage(tmp_path):
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("Hierarchical progress compilation requires g++ or clang++")
+    binary = tmp_path / "eight_owners"
+    result = subprocess.run(
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            "-DTEST_PAYLOAD_LANES=8",
+            str(Path(__file__).with_name("hierarchical_progress_test.cpp")),
+            "-o",
+            str(binary),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert result.returncode == 0, result.stderr
+    result = subprocess.run([str(binary), "eight-owners"], capture_output=True, text=True, timeout=10)
+    assert result.returncode == 0, result.stderr

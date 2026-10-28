@@ -34,9 +34,9 @@ constexpr uint32_t kWorld = 32U;
 constexpr uint32_t kExperts = 3U;
 constexpr uint32_t kLineBytes = 512U;
 constexpr uint32_t kLineWords = kLineBytes / sizeof(int32_t);
-constexpr uint32_t kWindowBytes = 8192U;
+constexpr uint32_t kWindowBytes = 12288U;
 constexpr uint32_t kControlOffset = 4096U;
-constexpr uint32_t kReadyOffset = kControlOffset + 5U * kLineBytes;
+constexpr uint32_t kReadyOffset = kControlOffset + 4U * kLineBytes;
 constexpr uint32_t kMaxGroups = 32U;
 constexpr uint32_t kSparse = 0x8429U;  // Sources 0, 3, 5, 10 and 15 of the other host.
 thread_local uint32_t currentGroup = 0U;
@@ -95,6 +95,7 @@ inline State* state = nullptr;
 struct Address {
     bool local;
     uint32_t slot;
+    uint32_t qpLane = 0U;
 };
 
 // Bounds/line checks do not emulate the production work distribution.
@@ -110,9 +111,11 @@ inline Address Decode(const int32_t* pointer)
     for (uint32_t rank = 0U; rank < kWorld; ++rank) {
         const auto begin = reinterpret_cast<uintptr_t>(s.windows[rank].data());
         if (address >= begin && address < begin + kWindowBytes) {
-            Check(address == begin + kReadyOffset, "remote read used the wrong signal offset");
+            Check(address >= begin + kReadyOffset && address < begin + kReadyOffset + 8U * kLineBytes &&
+                      (address - begin - kReadyOffset) % kLineBytes == 0U,
+                  "wrong payload commit offset");
             Check(rank / kSlots == s.rank / kSlots, "gateway read addressed the source host");
-            return {false, rank % kSlots};
+            return {false, rank % kSlots, static_cast<uint32_t>((address - begin - kReadyOffset) / kLineBytes)};
         }
     }
     throw std::runtime_error("flag access exceeded the declared workspace/window ranges");
@@ -130,7 +133,7 @@ inline void WaitFlag(int32_t* pointer, int32_t expected)
     } else {
         Check(currentGroup == address.slot % s.groups, "gateway had a duplicate or incorrect checker");
         ++s.remoteWaits[address.slot];
-        Check(s.remoteWaits[address.slot] == 1U, "gateway was acquired by more than one checker");
+        Check(s.remoteWaits[address.slot] == address.qpLane + 1U, "duplicate or skipped QP acquire");
     }
     s.changed.notify_all();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -238,7 +241,8 @@ private:
 namespace MegaMoeImpl {
 constexpr uint32_t HIERARCHICAL_RANKS_PER_HOST = 16U;
 constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
-enum class HierarchicalSignal : uint32_t { RelayPayloadReady = 5U };
+constexpr uint32_t HIERARCHICAL_PAYLOAD_LANES = 8U;
+enum class HierarchicalSignal : uint32_t { NetPayloadCommit = 4U };
 enum class HardEvent { S_MTE2 };
 struct MoeStageCommonConfig {
     uint32_t rankId = 0U;
@@ -400,7 +404,7 @@ struct Fixture {
     {
         std::lock_guard<std::mutex> lock(s.mutex);
         Check(s.Needed(slot), "test publisher selected an unused gateway");
-        *s.Remote(slot) = s.sequence;
+        for (uint32_t lane = 0U; lane < 8U; ++lane) s.Remote(slot)[lane * kLineWords] = s.sequence;
         s.changed.notify_all();
     }
     void PublishAllExcept(uint32_t held = kSlots)
@@ -463,7 +467,7 @@ struct Fixture {
         }
         for (uint32_t slot = 0U; slot < kSlots; ++slot) {
             const uint32_t expected = s.Needed(slot) ? 1U : 0U;
-            Check(s.remoteWaits[slot] == expected && s.remoteBarriers[slot] == expected &&
+            Check(s.remoteWaits[slot] == expected * 8U && s.remoteBarriers[slot] == expected &&
                       s.publications[slot] == expected,
                   "needed gateways did not each have exactly one checker/publication");
             Check(s.timerStarts[slot] == (timed ? expected : 0U) && s.timerEnds[slot] == (timed ? expected : 0U),
@@ -504,7 +508,12 @@ void LateArrival()
         f.Begin(143U, kSparse);
         f.PublishAllExcept(0U);
         f.StartAll();
-        f.Await([&] { return f.s.remoteWaits[0] != 0U; });
+        {
+            std::lock_guard<std::mutex> lock(f.s.mutex);
+            for (uint32_t lane = 0U; lane < 7U; ++lane) f.s.Remote(0U)[lane * kLineWords] = f.s.sequence;
+            f.s.changed.notify_all();
+        }
+        f.Await([&] { return f.s.remoteWaits[0] == 8U; });
         {
             std::lock_guard<std::mutex> lock(f.s.mutex);
             for (uint32_t group = 0U; group < groups; ++group) {

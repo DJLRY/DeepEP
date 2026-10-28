@@ -16,19 +16,16 @@ uint32_t GetSubBlockIdx()
 }
 constexpr int64_t GM_FLAG_POLL_BACKOFF_CYCLES = 4;
 /* TILE_CONSTANTS */
-namespace Ops::Base
-{
+namespace Ops::Base {
 uint32_t CeilDiv(uint32_t x, uint32_t y)
 {
     return (x + y - 1U) / y;
 }
-} // namespace Ops::Base
-namespace AscendTimer
-{
+}  // namespace Ops::Base
+namespace AscendTimer {
 constexpr int64_t NO_WAVE = -1;
 }
-namespace AscendC
-{
+namespace AscendC {
 uint32_t reads = 0U;
 int32_t ReadGmByPassDCache(const int32_t* flag)
 {
@@ -40,33 +37,28 @@ int64_t GetSystemCycle()
     static int64_t cycle = 0;
     return ++cycle;
 }
-} // namespace AscendC
-struct AivJobContext
-{
+}  // namespace AscendC
+struct AivJobContext {
     uint32_t jobIndex = 0U, totalJobs = 28U;
 };
-struct WorkRange
-{
+struct WorkRange {
     uint32_t start = 0U, count = 0U;
 };
-struct MoeStageCommonConfig
-{
+struct MoeStageCommonConfig {
     uint32_t tokenHiddenDim = 3584U, moeExpertPerRank = 0U;
 };
-struct TilingData
-{
+struct TilingData {
     bool hierarchical = true;
 };
 bool UseHierarchicalRoce(const TilingData* tiling)
 {
     return tiling->hierarchical;
 }
-uint32_t HierarchicalSendJob()
+bool IsHierarchicalPayloadOwner(uint32_t job)
 {
-    return 1U;
+    return (job & 1U) != 0U && job < 16U;
 }
-struct Params
-{
+struct Params {
     TilingData* tilingData;
     std::array<int32_t, 128> ready{};
     std::vector<uint32_t>* writes = nullptr;
@@ -81,8 +73,7 @@ int32_t* GetTokenCombineReadyCounter(Params& params, uint32_t expert, uint32_t r
     assert(slot < params.ready.size());
     return &params.ready[slot];
 }
-struct ExpertLoopState
-{
+struct ExpertLoopState {
     uint32_t expertIdx = 0U;
     uint64_t globalTokenStartIndex = 0U;
 };
@@ -90,8 +81,7 @@ ExpertLoopState CreateExpertLoopState(const MoeStageCommonConfig&)
 {
     return {};
 }
-struct Timer
-{
+struct Timer {
     int64_t wave = 999;
     uint32_t clears = 0U;
     void SetWave(int64_t value)
@@ -127,13 +117,12 @@ void RunTokenCombineSlice(const MoeStageCommonConfig&, const AivJobContext& job,
     static_assert(InputReadyChecked);
     assert(*GetTokenCombineReadyCounter(params, state.expertIdx, rowStart) >=
            static_cast<int32_t>(params.expectedProducers));
-    assert(state.globalTokenStartIndex + rowStart == params.expectedPrefix);
+    if (params.writes != nullptr) assert(state.globalTokenStartIndex + rowStart == params.expectedPrefix);
     WorkRange range = GetWaveCombineOwnedRange(job, rowCount, state.globalTokenStartIndex + rowStart);
     assert(range.count != 0U && range.start + range.count <= rowCount);
-    assert(params.writes && params.writes->size() == rowCount);
-    for (uint32_t row = range.start; row < range.start + range.count; ++row)
-    {
-        ++params.writes->at(row);
+    assert(params.writes == nullptr || params.writes->size() == rowCount);
+    for (uint32_t row = range.start; row < range.start + range.count; ++row) {
+        if (params.writes != nullptr) ++params.writes->at(row);
     }
     ++params.sendCalls;
     params.lastConsumer = job;
@@ -141,36 +130,31 @@ void RunTokenCombineSlice(const MoeStageCommonConfig&, const AivJobContext& job,
 
 // Keep this member in a dependent base, as in the production kernel. Declaring
 // it directly in the fixture would hide missing this-> qualification errors.
-template <typename Tag> struct FixtureBase
-{
+template <typename Tag>
+struct FixtureBase {
     AivJobContext aivJob_{1U, 56U};
 };
-template <typename Tag> struct FixtureImpl : FixtureBase<Tag>
-{
-    struct ExpertTokenPosition
-    {
+template <typename Tag>
+struct FixtureImpl : FixtureBase<Tag> {
+    struct ExpertTokenPosition {
         uint32_t expertIdx = 0U;
         uint32_t tokenIndexInExpert = 0U;
         uint64_t globalTokenIndex = 0U;
     };
-    struct AivTaskCursor
-    {
-        struct
-        {
+    struct AivTaskCursor {
+        struct {
             ExpertTokenPosition begin{}, end{};
         } slice;
         uint64_t wave = 0U;
         uint32_t nextTile = 0U, tileCount = 1U, nextSlice = 0U;
     };
-    struct SharedActivationCursor
-    {
+    struct SharedActivationCursor {
         bool done = false;
     };
     TilingData tiling{};
     Params params_{&tiling};
     AivJobContext waveCombineJob_{};
-    struct
-    {
+    struct {
         AivJobContext blockJob{};
     } gmmExecutionConfig_;
     MoeStageCommonConfig commonConfig_{};
@@ -216,25 +200,21 @@ template <typename Tag> struct FixtureImpl : FixtureBase<Tag>
 
     bool NextAivSlice(AivTaskCursor& cursor, bool activation)
     {
-        if (activation)
-        {
-            if (cursor.nextSlice++ != 0U)
-            {
+        if (activation) {
+            if (cursor.nextSlice++ != 0U) {
                 assert(activationDone);
                 return false;
             }
             return true;
         }
         uint32_t next = cursor.nextSlice;
-        if (next != 0U)
-        {
+        if (next != 0U) {
             // The owner cannot retire an unfinished slice just because it moves no rows.
             assert(Ready(slices[next - 1U]) >= static_cast<int32_t>(Producers(slices[next - 1U])));
             ++retired;
         }
         currentSlice = next;
-        if (next == slices.size())
-        {
+        if (next == slices.size()) {
             return false;
         }
         cursor = slices[next];
@@ -243,8 +223,7 @@ template <typename Tag> struct FixtureImpl : FixtureBase<Tag>
     }
     bool TryRunReadyActivation(const AivTaskCursor&, int32_t& readySequence)
     {
-        if (!activationReady)
-        {
+        if (!activationReady) {
             return false;
         }
         assert(!activationDone);
@@ -261,19 +240,15 @@ template <typename Tag> struct FixtureImpl : FixtureBase<Tag>
         assert(false);
         return false;
     }
-    bool TryProgressRemoteCombine()
+    bool TryProgressRemoteCombine(bool = true)
     {
-        assert(this->aivJob_.jobIndex == HierarchicalSendJob() && tiling.hierarchical);
+        assert(IsHierarchicalPayloadOwner(this->aivJob_.jobIndex) && tiling.hierarchical);
         assert(++remoteCalls < 100U);
-        if (remoteCalls == 1U)
-        {
+        if (remoteCalls == 1U) {
             activationReady = true;
-        }
-        else
-        {
+        } else {
             assert(activationDone);
-            if (currentSlice < slices.size())
-            {
+            if (currentSlice < slices.size()) {
                 ++Ready(slices[currentSlice]);
             }
         }
@@ -286,19 +261,13 @@ using Fixture = FixtureImpl<void>;
 
 void Coverage()
 {
-    for (bool hierarchical : {false, true})
-    {
-        for (uint32_t blocks : {1U, 2U, 4U, 28U})
-        {
-            for (uint32_t rows : {1U, 7U, 21U, 22U, 27U, 28U, 29U, 32U, 255U, 256U, 257U, 1024U})
-            {
-                for (uint64_t prefix : {0ULL, 1ULL, 27ULL, 257ULL, (1ULL << 40U) + 17ULL})
-                {
-                    for (uint64_t wave : {0ULL, 1ULL, 27ULL, 28ULL, (1ULL << 35U) + 3ULL})
-                    {
+    for (bool hierarchical : {false, true}) {
+        for (uint32_t blocks : {1U, 2U, 4U, 28U}) {
+            for (uint32_t rows : {1U, 7U, 21U, 22U, 27U, 28U, 29U, 32U, 255U, 256U, 257U, 1024U}) {
+                for (uint64_t prefix : {0ULL, 1ULL, 27ULL, 257ULL, (1ULL << 40U) + 17ULL}) {
+                    for (uint64_t wave : {0ULL, 1ULL, 27ULL, 28ULL, (1ULL << 35U) + 3ULL}) {
                         std::vector<uint32_t> writes(rows, 0U), loads;
-                        for (uint32_t block = 0U; block < blocks; ++block)
-                        {
+                        for (uint32_t block = 0U; block < blocks; ++block) {
                             Fixture f(block, blocks, hierarchical);
                             // H8192 requires all 28 producers, exposing accidental use of 27 consumers.
                             f.commonConfig_.tokenHiddenDim = 8192U;
@@ -308,37 +277,23 @@ void Coverage()
                             f.params_.expectedPrefix = prefix + 256U;
                             f.params_.expectedProducers = f.Producers(cursor);
                             uint32_t before = 0U;
-                            for (auto count : writes)
-                            {
+                            for (auto count : writes) {
                                 before += count;
                             }
                             assert(f.TryRunReadyCombine(cursor));
                             uint32_t after = 0U;
-                            for (auto count : writes)
-                            {
+                            for (auto count : writes) {
                                 after += count;
                             }
-                            if (hierarchical && blocks > 1U && block == 0U)
-                            {
-                                assert(f.params_.sendCalls == 0U && after == before);
-                            }
-                            else
-                            {
-                                loads.push_back(after - before);
-                                uint32_t consumers = blocks - static_cast<uint32_t>(hierarchical && blocks > 1U);
-                                uint32_t consumer = block - static_cast<uint32_t>(hierarchical && blocks > 1U);
-                                uint32_t first =
-                                    (cursor.slice.begin.globalTokenIndex % consumers + wave % consumers) % consumers;
-                                uint32_t logical = (consumer + consumers - first) % consumers;
-                                assert(after - before ==
-                                       rows / consumers + static_cast<uint32_t>(logical < rows % consumers));
-                            }
+                            loads.push_back(after - before);
+                            uint32_t first = (cursor.slice.begin.globalTokenIndex % blocks + wave % blocks) % blocks;
+                            uint32_t logical = (block + blocks - first) % blocks;
+                            assert(after - before == rows / blocks + static_cast<uint32_t>(logical < rows % blocks));
                             assert(f.waveCombineJob_.jobIndex == block && f.waveCombineJob_.totalJobs == blocks);
                             assert(f.gmmExecutionConfig_.blockJob.jobIndex == block);
                             assert(f.aivJob_.jobIndex == 2U * block + 1U);
                         }
-                        for (auto count : writes)
-                        {
+                        for (auto count : writes) {
                             assert(count == 1U);
                         }
                         auto limits = std::minmax_element(loads.begin(), loads.end());
@@ -352,10 +307,8 @@ void Coverage()
 
 void Readiness()
 {
-    for (uint32_t hidden : {1024U, 3584U, 8192U})
-    {
-        for (uint32_t block : {0U, 1U, 27U})
-        {
+    for (uint32_t hidden : {1024U, 3584U, 8192U}) {
+        for (uint32_t block : {0U, 1U, 27U}) {
             Fixture f(block);
             f.commonConfig_.tokenHiddenDim = hidden;
             auto cursor = Fixture::Slice(64U, 256U, 28U, 3U, 256U);
@@ -363,7 +316,7 @@ void Readiness()
             f.params_.writes = &writes;
             f.params_.expectedPrefix = 256U;
             f.params_.expectedProducers = f.Producers(cursor);
-            f.params_.ready.fill(1000); // Other slices must not release this slice.
+            f.params_.ready.fill(1000);  // Other slices must not release this slice.
             f.Ready(cursor) = f.Producers(cursor) - 1U;
             AscendC::reads = 0U;
             assert(!f.TryRunReadyCombine(cursor));
@@ -372,7 +325,7 @@ void Readiness()
             ++f.Ready(cursor);
             assert(f.TryRunReadyCombine(cursor));
             assert(f.timer_.wave == 28);
-            assert(f.params_.sendCalls == (block == 0U ? 0U : 1U));
+            assert(f.params_.sendCalls == 1U);
         }
     }
     // Empty non-owner consumers still skip without polling unrelated producers.
@@ -386,8 +339,7 @@ void Scheduler()
 {
     Fixture f;
     f.commonConfig_.tokenHiddenDim = 8192U;
-    for (uint32_t expert = 0U; expert < 12U; ++expert)
-    {
+    for (uint32_t expert = 0U; expert < 12U; ++expert) {
         f.slices.push_back(Fixture::Slice(21U, 21U * expert, expert / 4U, expert));
         f.Ready(f.slices.back()) = f.Producers(f.slices.back()) - 2U;
     }
@@ -396,7 +348,7 @@ void Scheduler()
     assert(readySequence == 41 && f.activationDone);
     assert(f.retired == f.slices.size() && f.currentSlice == f.slices.size());
     assert(f.remoteCalls > f.slices.size());
-    assert(f.params_.sendCalls == 0U);
+    assert(f.params_.sendCalls > 0U);
     assert(f.timer_.clears == 1U && f.timer_.wave == AscendTimer::NO_WAVE);
     assert(f.waveCombineJob_.totalJobs == 28U && f.gmmExecutionConfig_.blockJob.totalJobs == 28U);
 }
@@ -405,16 +357,11 @@ int main(int argc, char** argv)
 {
     assert(argc == 2);
     const char* scenario = argv[1];
-    if (std::strcmp(scenario, "coverage") == 0)
-    {
+    if (std::strcmp(scenario, "coverage") == 0) {
         Coverage();
-    }
-    else if (std::strcmp(scenario, "readiness") == 0)
-    {
+    } else if (std::strcmp(scenario, "readiness") == 0) {
         Readiness();
-    }
-    else
-    {
+    } else {
         assert(std::strcmp(scenario, "scheduler") == 0);
         Scheduler();
     }

@@ -38,6 +38,7 @@ int main() {
     for (uint32_t physical : {2U, 4U, 16U, 48U, 56U, 64U})
     for (uint32_t bs = 1U; bs <= 65U; ++bs)
     for (uint32_t topk : {1U, 8U, 32U}) {
+        if (topology == TOPO_TYPE_MTE_ROCE && physical <= 16U) continue;
         MegaMoeTilingData t{};
         t.topoType = topology;
         t.blockAivNum = physical;
@@ -46,11 +47,11 @@ int main() {
         t.h = 3584U;
         SetUnpermuteConfigs(t, 192U * 1024U - 256U);
         const uint32_t jobs = UnpermuteJobCount(&t);
-        assert(jobs == physical - (topology == TOPO_TYPE_MTE_ROCE));
+        assert(jobs == physical - (topology == TOPO_TYPE_MTE_ROCE ? 9U : 0U));
         std::vector<unsigned> owners(bs, 0U);
         for (uint32_t p = 0; p < physical; ++p) {
             const uint32_t logical = UnpermuteJobIndex(&t, p);
-            if (topology == TOPO_TYPE_MTE_ROCE && p == HierarchicalSendJob()) {
+            if (topology == TOPO_TYPE_MTE_ROCE && IsHierarchicalQpOwner(p)) {
                 assert(logical >= jobs);
                 continue;
             }

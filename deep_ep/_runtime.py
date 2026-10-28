@@ -254,7 +254,7 @@ class Runtime:
             raise RuntimeError("Use Buffer on its creating NPU device")
 
     def _roce_collective(self, operation):
-        # MegaMoE senders quiet QP1 before returning. Complete all compute and
+        # MegaMoE senders complete all application QPs before returning. Complete all compute and
         # communication streams before any rank can release symmetric memory.
         # The generic SHMEM WORLD barrier directly reads remote GM and cannot
         # synchronize peers reachable only over RoCE.

@@ -151,6 +151,9 @@ struct State {
     uint32_t rows = 0U;
     uint32_t topK = 0U;
     const uint32_t* pendingMasks = nullptr;
+    uint32_t qp = 1U;
+    uint32_t firstOwnedRow = 0U;
+    uint32_t endOwnedRow = 0xffffffffU;
     uint32_t peer = 0U;
     uint32_t sequence = 0U;
     uint32_t flagReads = 0U;
@@ -319,6 +322,11 @@ inline int64_t GetSystemCycle()
 namespace MegaMoeImpl {
 using namespace AscendC;
 constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 32U;
+#ifndef TEST_PAYLOAD_LANES
+#define TEST_PAYLOAD_LANES 1U
+#endif
+constexpr uint32_t HIERARCHICAL_PAYLOAD_LANES = TEST_PAYLOAD_LANES;
+constexpr uint32_t MEGAMOE_ROCE_QP_INDEX = 1U;
 constexpr uint32_t HIERARCHICAL_RANKS_PER_HOST = 16U;
 constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
 constexpr uint32_t MEGAMOE_ROCE_SCRATCH_BYTES = 256U;
@@ -360,7 +368,7 @@ inline uint32_t HierarchicalGateway(uint32_t rank)
 struct RoceWaitState {};
 enum class RoceWaitKind { CombineRows };
 inline void RoceCheckWait(RoceWaitState&, uint32_t peer, uint8_t* scratch, RoceWaitKind kind, uint32_t expected,
-                          uint32_t observed)
+                          uint32_t observed, int32_t* = nullptr, uint32_t = 1U)
 {
     auto& s = *ProgressTest::state;
     ProgressTest::Check(peer == s.peer && scratch == s.ub.data(), "drain wait used another owner's QP/scratch");
@@ -429,7 +437,7 @@ inline int32_t ReadGmByPassDCache(const int32_t* address)
     return *address;
 }
 inline void RocePutBytes(uint8_t* destination, uint8_t* source, uint32_t bytes, uint32_t peer, uint8_t* scratch,
-                         AscendTimerDevice* timer, AscendTimer::RdmaPhase phase)
+                         AscendTimerDevice* timer, AscendTimer::RdmaPhase phase, bool, uint32_t qp)
 {
     using namespace ProgressTest;
     auto& s = *state;
@@ -445,6 +453,8 @@ inline void RocePutBytes(uint8_t* destination, uint8_t* source, uint32_t bytes, 
     Check(bytes <= s.source.size() - srcOffset, "Put exceeded the last source row");
     const auto first = static_cast<uint32_t>(srcOffset / s.rowBytes);
     const auto count = bytes / s.rowBytes;
+    Check(qp == s.qp && first >= s.firstOwnedRow && first + count <= s.endOwnedRow,
+          "Put crossed the owner's range or used another QP");
     for (uint32_t row = first; row < first + count; ++row) {
         Check(s.expected[row], "Put merged across an unused route");
         Check(s.flags[row * kFlagWords] == static_cast<int32_t>(s.sequence), "Put merged across an unready row");
@@ -988,6 +998,7 @@ void CompleteInCall()
         Check(!f.progress.initialized && f.s.copies.empty() && f.s.posts.empty() && f.s.flagReads == 0U &&
                   timer.initializations == 0U && timer.records.empty() && timer.scanStarts == 0U,
               "zero budget touched progress state");
+        InitializeHierarchicalCombineProgress(f.common, f.params, f.progress, &timer);
         f.progress.nextRow = c.first;
         Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {2U, 64U}),
               "sparse completion failed to submit ready routes");
@@ -1168,6 +1179,55 @@ void Coalescing()
         f.CheckPayload();
     }
 }
+void EightOwners()
+{
+    Check(HIERARCHICAL_PAYLOAD_LANES == 8U, "multiowner test must use eight partitions");
+    for (uint32_t tokens : {0U, 1U, 7U, 17U, 32U})
+        for (uint32_t topk : {1U, 8U, 32U})
+            for (uint32_t rank : {0U, 31U})
+                for (const char* pattern : {"all", "mixed", "holes"}) {
+                    Fixture f(tokens, topk, rank);
+                    f.Routes(pattern);
+                    std::array<HierarchicalCombineProgress, 8> owners{};
+                    for (uint32_t lane = 0U; lane < 8U; ++lane) {
+                        auto& progress = owners[lane];
+                        f.s.pendingMasks = progress.pendingTopkMasks;
+                        f.s.qp = lane + 1U;
+                        f.s.firstOwnedRow = tokens * lane / 8U * topk;
+                        f.s.endOwnedRow = tokens * (lane + 1U) / 8U * topk;
+                        InitializeHierarchicalCombineProgress(f.common, f.params, progress, nullptr, lane);
+                        uint32_t expected = 0U;
+                        for (uint32_t row = 0U; row < f.s.rows; ++row) {
+                            const bool owned = row >= f.s.firstOwnedRow && row < f.s.endOwnedRow;
+                            const bool pending = (progress.pendingTopkMasks[row / topk] & (1U << (row % topk))) != 0U;
+                            Check(pending == (owned && f.s.expected[row]), "partition skipped or overlapped metadata");
+                            if (owned && f.s.expected[row]) ++expected;
+                        }
+                        Check(progress.expectedRows == expected, "partition count is wrong");
+                        Check(!TryProgressHierarchicalCombine(f.common, f.params, progress, f.s.ub.data(), nullptr,
+                                                              {1U, 3U}, lane),
+                              "owner submitted before readiness");
+                    }
+                    ReleaseAll();
+                    for (uint32_t lane = 8U; lane-- > 0U;) {
+                        auto& progress = owners[lane];
+                        f.s.pendingMasks = progress.pendingTopkMasks;
+                        f.s.qp = lane + 1U;
+                        f.s.firstOwnedRow = tokens * lane / 8U * topk;
+                        f.s.endOwnedRow = tokens * (lane + 1U) / 8U * topk;
+                        for (uint32_t calls = 0U; progress.sentRows < progress.expectedRows; ++calls) {
+                            Check(calls < 2048U, "bounded cursor failed to wrap inside its owner's partition");
+                            TryProgressHierarchicalCombine(f.common, f.params, progress, f.s.ub.data(), nullptr,
+                                                           {1U, 3U, 2U}, lane);
+                        }
+                        DrainHierarchicalCombine(f.common, f.params, progress, f.s.ub.data(), nullptr, lane);
+                    }
+                    for (uint32_t row = 0U; row < f.s.rows; ++row) {
+                        Check(f.s.sent[row] == (f.s.expected[row] ? 1U : 0U),
+                              "eight owners missed or duplicated a row");
+                    }
+                }
+}
 }  // namespace ProgressTest
 
 int main(int argc, char** argv)
@@ -1175,7 +1235,9 @@ int main(int argc, char** argv)
     using namespace ProgressTest;
     Check(argc == 2, "expected one test scenario");
     const char* scenario = argv[1];
-    if (std::strcmp(scenario, "routing") == 0)
+    if (std::strcmp(scenario, "eight-owners") == 0)
+        EightOwners();
+    else if (std::strcmp(scenario, "routing") == 0)
         Routing();
     else if (std::strcmp(scenario, "late-ready") == 0)
         LateReady();

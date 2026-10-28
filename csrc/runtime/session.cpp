@@ -1,6 +1,7 @@
 // Copyright (c) 2026, Lu Lu
 
 #include "runtime/session.hpp"
+#include "common/roce_qp_layout.hpp"
 #include <cstring>
 #include <cstdlib>
 #include <dlfcn.h>
@@ -105,8 +106,9 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     // reserved until a new process is launched; do not finalize foreign state.
     occupied = true;
     if (roce) {
-        // QP0 belongs to SDK operations; one sender owns application QP1 per peer.
-        check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, 2), "aclshmemx_set_qp_num (RoCE)");
+        // QP0 belongs to SDK operations; MegaMoE owns eight payload QPs and one metadata QP.
+        check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, ascend_deepep::roce_layout::kQpCount),
+              "aclshmemx_set_qp_num (RoCE)");
     }
     if (udma) {
         // Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.

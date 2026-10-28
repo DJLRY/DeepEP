@@ -18,6 +18,7 @@ struct Write {
     uint32_t destination;
     uint32_t source;
     uint32_t bytes;
+    uint32_t qp;
     std::vector<uint8_t> sourceAtPost;
     bool delivered = false;
 };
@@ -29,8 +30,6 @@ inline uint32_t peer = 0U;
 inline uint32_t metaCommit = 0U;
 inline uint32_t payloadCommit = 0U;
 inline uint32_t metaReady = 0U;
-inline uint32_t relayReady = 0U;
-inline uint32_t txDone = 0U;
 inline uint32_t sequence = 0U;
 inline uint32_t waits = 0U;
 inline uint32_t quiets = 0U;
@@ -62,8 +61,10 @@ inline uint32_t ReadWord(const std::vector<uint8_t>& heap, uint32_t offset)
 
 inline void CheckResource(uint32_t actualPeer, uint32_t qp, uint8_t* ub, uint32_t event)
 {
-    Check(RoceTest::blockIndex == 1 && RoceTest::subBlockIndex == 1, "QP owner is not physical AIV1");
-    Check(actualPeer == peer && qp == 1U && reinterpret_cast<uintptr_t>(ub) == kScratchOffset && event == 7U,
+    const uint32_t job = static_cast<uint32_t>(RoceTest::blockIndex);
+    Check((job == 0U && qp == 9U) || (job < 16U && (job & 1U) != 0U && qp == job / 2U + 1U),
+          "QP was submitted or polled by another owner");
+    Check(actualPeer == peer && reinterpret_cast<uintptr_t>(ub) == kScratchOffset && event == 7U,
           "Dispatch used an unowned peer/QP/UB/event");
 }
 
@@ -77,19 +78,29 @@ inline void Deliver(Write& item)
     }
 }
 
-// HNS SO makes a single-fragment commit visible after the earlier data WQEs.
-// Reverse those data transfers, then expose the marker without retiring CQEs.
-inline void DeliverPosted()
+inline bool IsCommit(const Write& item)
 {
-    size_t begin = 0U;
-    while (begin < queued.size()) {
-        size_t end = begin;
-        while (end < queued.size() && queued[end].destination != metaCommit && queued[end].destination != payloadCommit)
-            ++end;
-        for (size_t i = end; i > begin; --i) Deliver(queued[i - 1U]);
-        if (end < queued.size()) Deliver(queued[end++]);
-        begin = end;
+    return item.destination == metaCommit ||
+           (item.destination >= payloadCommit && item.destination < payloadCommit + 8U * 512U &&
+            (item.destination - payloadCommit) % 512U == 0U);
+}
+
+// Each queue can deliver independently. A metadata commit must never complete
+// any payload queue; within one QP only its commit orders earlier writes.
+inline void DeliverPosted(uint32_t qp)
+{
+    std::vector<size_t> pending;
+    for (size_t i = 0U; i < queued.size(); ++i) {
+        if (queued[i].qp != qp) continue;
+        if (IsCommit(queued[i])) {
+            for (auto it = pending.rbegin(); it != pending.rend(); ++it) Deliver(queued[*it]);
+            pending.clear();
+            Deliver(queued[i]);
+        } else {
+            pending.push_back(i);
+        }
     }
+    for (auto it = pending.rbegin(); it != pending.rend(); ++it) Deliver(queued[*it]);
 }
 }  // namespace DispatchTest
 
@@ -102,13 +113,14 @@ void aclshmemx_roce_qp_put_nbi(T* destination, T* source, T* scratch, uint32_t c
     CheckResource(static_cast<uint32_t>(peer), qp, scratch, event);
     const uint32_t destinationOffset = Offset(destination, count);
     const uint32_t sourceOffset = Offset(source, count);
-    if (destinationOffset == metaCommit || destinationOffset == payloadCommit) {
+    Write operation{destinationOffset, sourceOffset, count, qp, std::vector<uint8_t>(source, source + count)};
+    if (IsCommit(operation)) {
         Check(count == sizeof(uint32_t), "commit was not a single-fragment epoch");
 #if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-        Check(queued.empty(), "XSCALE commit overtook unfinished payload");
+        Check(std::none_of(queued.begin(), queued.end(), [qp](const auto& w) { return w.qp == qp; }),
+              "XSCALE commit overtook unfinished writes on its QP");
 #endif
     }
-    Write operation{destinationOffset, sourceOffset, count, std::vector<uint8_t>(source, source + count)};
     posts.push_back(operation);
     queued.push_back(operation);
     RoceTest::operations.push_back(1);
@@ -120,8 +132,9 @@ void aclshmemx_roce_qp_quiet(uint32_t peer, uint32_t qp, T* scratch, uint32_t ev
     static_assert(sizeof(T) == 1U);
     using namespace DispatchTest;
     CheckResource(peer, qp, scratch, event);
-    DeliverPosted();
-    queued.clear();
+    DeliverPosted(qp);
+    queued.erase(std::remove_if(queued.begin(), queued.end(), [qp](const auto& w) { return w.qp == qp; }),
+                 queued.end());
     ++quiets;
     RoceTest::operations.push_back(2);
 }
@@ -146,13 +159,7 @@ inline int aclshmem_int32_test(int32_t* address, int comparison, int32_t value)
     const auto offset = Offset(reinterpret_cast<uint8_t*>(address), sizeof(int32_t));
     Check(comparison == ACLSHMEM_CMP_EQ && static_cast<uint32_t>(value) == sequence, "incorrect invocation wait");
     if (ReadWord(local, offset) != sequence) return 0;
-#if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-    if (RoceTest::blockIndex == 1) {
-        Check(queued.empty() && ReadWord(remote, payloadCommit) == sequence && ReadWord(local, txDone) == sequence,
-              "sender's incoming wait preceded outgoing completion and TxDone");
-    }
-#endif
-    if (offset == payloadCommit) ++waits;
+    if (offset == metaCommit) ++waits;
     RoceTest::signalObserved = true;
     return 1;
 }
@@ -160,8 +167,8 @@ inline int aclshmem_int32_test(int32_t* address, int comparison, int32_t value)
 inline int32_t aclshmem_signal_wait_until(int32_t* address, int comparison, int32_t value)
 {
     DispatchTest::Check(
-        DispatchTest::Offset(reinterpret_cast<uint8_t*>(address), sizeof(int32_t)) == DispatchTest::payloadCommit,
-        "receiver did not wait on the unified Dispatch commit");
+        DispatchTest::Offset(reinterpret_cast<uint8_t*>(address), sizeof(int32_t)) == DispatchTest::metaCommit,
+        "receiver did not wait on the metadata Dispatch commit");
     DispatchTest::Check(aclshmem_int32_test(address, comparison, value) != 0, "receiver accepted a stale invocation");
     return value;
 }

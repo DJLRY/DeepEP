@@ -58,8 +58,8 @@ int main() {
         if (bs == 32U && topk == 8U) {
             assert(UseDecodeRailRouting(&t));
             assert(c.routeItemsPerBatch == 512 && RailItemsPerBatch(c) == 508 && c.routeBatchCount == 1);
-            // Both gates in TryRelayCompactRoutes must pass for 7/8 owned experts.
-            for (uint32_t experts : {7U, 8U}) {
+            // Both gates in TryRelayCompactRoutes must pass for 7/8/9 owned experts.
+            for (uint32_t experts : {7U, 8U, 9U}) {
                 const uint32_t routeBytes = experts * AlignUp(bs, uint32_t(INT32_PER_256B)) * 4U;
                 assert(total <= static_cast<uint32_t>(RailItemsPerBatch(c)));
                 assert(routeBytes <= static_cast<uint32_t>(c.bufferCount * c.bufferBytes) ||

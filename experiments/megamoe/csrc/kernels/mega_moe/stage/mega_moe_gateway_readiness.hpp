@@ -56,7 +56,7 @@ __aicore__ inline void AcquireHierarchicalGatewayPayload(const MoeStageCommonCon
     const uint32_t sourceFirst = HierarchicalHost(HierarchicalGateway(common.rankId)) * HIERARCHICAL_RANKS_PER_HOST;
     const int32_t sequence = static_cast<int32_t>(params.tilingData->hierarchicalSequence);
     const uint64_t readyOffset = params.peermemInfo.hierarchicalControlPtr - params.peermemInfo.rankSyncInWorldPtr +
-                                 HierarchicalSignalOffset(HierarchicalSignal::RelayPayloadReady);
+                                 HierarchicalSignalOffset(HierarchicalSignal::NetPayloadCommit);
     // All checkers publish before consuming anyone else's local notification.
     // Interleaving local waits with this loop would serialize the distributed
     // gateway checks. Striding also covers devices with fewer than 16 blocks.
@@ -69,10 +69,14 @@ __aicore__ inline void AcquireHierarchicalGatewayPayload(const MoeStageCommonCon
         {
             AscendTimerGatewayWaitScope wait(timer, source, gateway, params.tilingData->hierarchicalSequence);
             auto* ready = reinterpret_cast<__gm__ int32_t*>(winRankAddr[gateway] + readyOffset);
-            WaitUntilGmFlagEquals(ready, sequence);
+            // Acquire all eight independent QP commits directly on this local
+            // gateway. No pre-barrier gateway publisher waits for payload.
+            for (uint32_t lane = 0U; lane < HIERARCHICAL_PAYLOAD_LANES; ++lane) {
+                WaitUntilGmFlagEquals(ready + lane * (HIERARCHICAL_FLAG_BYTES / sizeof(int32_t)), sequence);
+            }
             // Order the acquired GM notification before forwarding it to local
             // consumers. Payload completion is certified by the gateway's
-            // existing quiet/commit protocol; this hop does not copy payload.
+            // per-QP ordered commits; this hop does not copy payload.
             AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
         }
         auto* localReady = reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.gatewayPayloadReadyPtr +
