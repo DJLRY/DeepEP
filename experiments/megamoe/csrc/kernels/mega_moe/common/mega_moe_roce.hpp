@@ -4,7 +4,6 @@
 #define MEGA_MOE_ROCE_H
 
 #include <cstdint>
-#include "../../../../../../csrc/common/roce_qp_layout.hpp"
 #include "kernel_operator.h"
 #include "shmem.h"
 #include "ascend_timer_v2_device.hpp"
@@ -12,9 +11,9 @@
 
 namespace MegaMoeImpl {
 
-// Each owner exclusively submits and polls its QP throughout the invocation.
-// QP0 belongs to SHMEM; payload uses QP1..8 and metadata uses QP9.
-constexpr uint32_t MEGAMOE_ROCE_QP_INDEX = ascend_deepep::roce_layout::kFirstPayloadQp;
+// QP0 belongs to SHMEM's default collectives. Physical AIV1 owns QP1 for the
+// paired peer throughout hierarchical Dispatch and Combine on both hosts.
+constexpr uint32_t MEGAMOE_ROCE_QP_INDEX = 1U;
 constexpr uint32_t MEGAMOE_ROCE_EVENT_ID = 7U;
 constexpr uint32_t MEGAMOE_ROCE_SCRATCH_BYTES = 256U;
 
@@ -28,10 +27,9 @@ constexpr uint64_t MEGAMOE_ROCE_CYCLES_PER_US = 1000U;
 constexpr uint64_t MEGAMOE_ROCE_PROGRESS_INTERVAL_CYCLES = 1000U * MEGAMOE_ROCE_CYCLES_PER_US;
 constexpr uint64_t MEGAMOE_ROCE_WAIT_TIMEOUT_CYCLES = 60ULL * 1000U * 1000U * MEGAMOE_ROCE_CYCLES_PER_US;
 
-__aicore__ inline uint32_t RoceTryProgress(uint32_t peer, __ubuf__ uint8_t* scratch,
-                                           uint32_t qpIndex = MEGAMOE_ROCE_QP_INDEX)
+__aicore__ inline uint32_t RoceTryProgress(uint32_t peer, __ubuf__ uint8_t* scratch)
 {
-    return RoceProgressReady(peer, qpIndex, scratch, MEGAMOE_ROCE_EVENT_ID);
+    return RoceProgressReady(peer, MEGAMOE_ROCE_QP_INDEX, scratch, MEGAMOE_ROCE_EVENT_ID);
 }
 
 struct RoceWaitState {
@@ -54,8 +52,7 @@ enum class RoceWaitKind : uint32_t {
 // DMA. A null scratch identifies a nonowner, which must never consume the CQ.
 // Callers may reset the state after useful producer progress to bound inactivity.
 __aicore__ inline void RoceCheckWait(RoceWaitState& state, uint32_t peer, __ubuf__ uint8_t* scratch, RoceWaitKind kind,
-                                     uint32_t expected, uint32_t observed, __gm__ int32_t* flag = nullptr,
-                                     uint32_t qpIndex = MEGAMOE_ROCE_QP_INDEX)
+                                     uint32_t expected, uint32_t observed, __gm__ int32_t* flag = nullptr)
 {
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825) && (defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__))
     if (!state.started) {
@@ -68,7 +65,7 @@ __aicore__ inline void RoceCheckWait(RoceWaitState& state, uint32_t peer, __ubuf
     }
     const uint64_t now = static_cast<uint64_t>(AscendC::GetSystemCycle());
     if (scratch != nullptr && now - state.progressCycle >= MEGAMOE_ROCE_PROGRESS_INTERVAL_CYCLES) {
-        RoceTryProgress(peer, scratch, qpIndex);
+        RoceTryProgress(peer, scratch);
         state.progressCycle = now;
     }
     if (now - state.startCycle >= MEGAMOE_ROCE_WAIT_TIMEOUT_CYCLES) {
@@ -79,14 +76,13 @@ __aicore__ inline void RoceCheckWait(RoceWaitState& state, uint32_t peer, __ubuf
             value.SetGlobalBuffer(flag);
             observed = static_cast<uint32_t>(value.GetValue(0));
         }
-        AscendC::printf("MegaMoE RoCE wait timeout: kind=%u peer=%u qp=%u expected=%u observed=%u\n",
-                        static_cast<uint32_t>(kind), peer, qpIndex, expected, observed);
+        AscendC::printf("MegaMoE RoCE wait timeout: kind=%u peer=%u expected=%u observed=%u\n",
+                        static_cast<uint32_t>(kind), peer, expected, observed);
         trap();
     }
 #else
     (void)state;
     (void)peer;
-    (void)qpIndex;
     (void)scratch;
     (void)kind;
     (void)expected;
@@ -96,17 +92,15 @@ __aicore__ inline void RoceCheckWait(RoceWaitState& state, uint32_t peer, __ubuf
 }
 
 __aicore__ inline void RoceWaitFlagEquals(__gm__ int32_t* flag, uint32_t sequence, uint32_t peer = 0U,
-                                          __ubuf__ uint8_t* scratch = nullptr, RoceWaitKind kind = RoceWaitKind::Commit,
-                                          uint32_t qpIndex = MEGAMOE_ROCE_QP_INDEX)
+                                          __ubuf__ uint8_t* scratch = nullptr, RoceWaitKind kind = RoceWaitKind::Commit)
 {
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825) && (defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__))
     RoceWaitState state;
     while (aclshmem_int32_test(flag, ACLSHMEM_CMP_EQ, static_cast<int32_t>(sequence)) == 0) {
-        RoceCheckWait(state, peer, scratch, kind, sequence, 0U, flag, qpIndex);
+        RoceCheckWait(state, peer, scratch, kind, sequence, 0U, flag);
     }
 #else
     (void)peer;
-    (void)qpIndex;
     (void)scratch;
     (void)kind;
     // The SDK host pass exposes a different four-argument test API. Keep its
@@ -123,21 +117,20 @@ __aicore__ inline void RoceWaitFlagEquals(__gm__ int32_t* flag, uint32_t sequenc
 __aicore__ inline void RocePutBytes(GM_ADDR dstLocalSym, GM_ADDR srcLocalSym, uint32_t bytes, uint32_t peer,
                                     __ubuf__ uint8_t* scratch, AscendTimerDevice* timer = nullptr,
                                     AscendTimer::RdmaPhase phase = AscendTimer::RdmaPhase::DispatchPayload,
-                                    bool isCommit = false, uint32_t qpIndex = MEGAMOE_ROCE_QP_INDEX)
+                                    bool isCommit = false)
 {
     if (bytes == 0U) {
         return;
     }
     AscendTimerRdmaScope timing(timer, AscendTimer::AIV_RDMA_POST, phase, peer, bytes, isCommit);
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_XSCALE) || defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-    aclshmemx_roce_qp_put_nbi<uint8_t>(dstLocalSym, srcLocalSym, scratch, bytes, static_cast<int>(peer), qpIndex,
-                                       MEGAMOE_ROCE_EVENT_ID);
+    aclshmemx_roce_qp_put_nbi<uint8_t>(dstLocalSym, srcLocalSym, scratch, bytes, static_cast<int>(peer),
+                                       MEGAMOE_ROCE_QP_INDEX, MEGAMOE_ROCE_EVENT_ID);
 #else
     // Host rejects this topology without a matching SDK; fail closed if that guard regresses.
     (void)dstLocalSym;
     (void)srcLocalSym;
     (void)peer;
-    (void)qpIndex;
     (void)scratch;
     trap();
 #endif
@@ -145,15 +138,14 @@ __aicore__ inline void RocePutBytes(GM_ADDR dstLocalSym, GM_ADDR srcLocalSym, ui
 
 __aicore__ inline void RoceQuiet(uint32_t peer, __ubuf__ uint8_t* scratch, AscendTimerDevice* timer = nullptr,
                                  AscendTimer::RdmaPhase phase = AscendTimer::RdmaPhase::DispatchPayload,
-                                 bool isCommit = false, uint32_t qpIndex = MEGAMOE_ROCE_QP_INDEX)
+                                 bool isCommit = false)
 {
     AscendTimerRdmaScope timing(timer, AscendTimer::AIV_RDMA_QUIET_WAIT, phase, peer, isCommit ? sizeof(uint32_t) : 0U,
                                 isCommit);
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_XSCALE) || defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-    aclshmemx_roce_qp_quiet<uint8_t>(peer, qpIndex, scratch, MEGAMOE_ROCE_EVENT_ID);
+    aclshmemx_roce_qp_quiet<uint8_t>(peer, MEGAMOE_ROCE_QP_INDEX, scratch, MEGAMOE_ROCE_EVENT_ID);
 #else
     (void)peer;
-    (void)qpIndex;
     (void)scratch;
     trap();
 #endif
@@ -168,31 +160,28 @@ __aicore__ inline void RoceQuiet(uint32_t peer, __ubuf__ uint8_t* scratch, Ascen
 // Each sequence/commit owns a distinct 512B line; the receiver never clears an inbox.
 __aicore__ inline void RocePublishCommit(GM_ADDR dstFlagLocalSym, GM_ADDR srcSeqLocalSym, uint32_t peer,
                                          __ubuf__ uint8_t* scratch, AscendTimerDevice* timer = nullptr,
-                                         AscendTimer::RdmaPhase phase = AscendTimer::RdmaPhase::DispatchPayload,
-                                         uint32_t qpIndex = MEGAMOE_ROCE_QP_INDEX)
+                                         AscendTimer::RdmaPhase phase = AscendTimer::RdmaPhase::DispatchPayload)
 {
 #if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-    RoceQuiet(peer, scratch, timer, phase, false, qpIndex);
+    RoceQuiet(peer, scratch, timer, phase);
 #endif
-    RocePutBytes(dstFlagLocalSym, srcSeqLocalSym, sizeof(uint32_t), peer, scratch, timer, phase, true, qpIndex);
+    RocePutBytes(dstFlagLocalSym, srcSeqLocalSym, sizeof(uint32_t), peer, scratch, timer, phase, true);
 #if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-    RoceQuiet(peer, scratch, timer, phase, true, qpIndex);
+    RoceQuiet(peer, scratch, timer, phase, true);
 #endif
 }
 
-// Each QP owner calls this once alongside Unpermute and before kernel return.
+// The fixed QP owner calls this once after Unpermute and before kernel return.
 // It closes the source/Sequence lifetime and retires all remaining SQ/CQ entries.
 // The reciprocal receive commit does not replace this local completion boundary.
 __aicore__ inline void RoceFinishOutstanding(uint32_t peer, __ubuf__ uint8_t* scratch,
                                              AscendTimerDevice* timer = nullptr,
-                                             AscendTimer::RdmaPhase phase = AscendTimer::RdmaPhase::Combine,
-                                             uint32_t qpIndex = MEGAMOE_ROCE_QP_INDEX)
+                                             AscendTimer::RdmaPhase phase = AscendTimer::RdmaPhase::Combine)
 {
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-    RoceQuiet(peer, scratch, timer, phase, false, qpIndex);
+    RoceQuiet(peer, scratch, timer, phase);
 #else
     (void)peer;
-    (void)qpIndex;
     (void)scratch;
     (void)timer;
     (void)phase;
@@ -203,14 +192,16 @@ __aicore__ inline void RoceFinishOutstanding(uint32_t peer, __ubuf__ uint8_t* sc
 // GM through SHMEM's DCache-invalidating signal APIs, then order subsequent MTE2 loads
 // after that scalar observation. Payload is only read through DMA, not scalar cache.
 // This event does not flush a NIC: NIC -> GM visibility comes from the SHMEM ordered
-// signal protocol. In particular, an old MTE packet-tail flag is not an RDMA commit.
+// signal protocol. HNS metadata may use an embedded full-sequence marker in
+// the last aligned 512B packet of a Write: packet visibility is indivisible and
+// every packet in the final 2KiB fragment carries SO. Other backends must not
+// infer completion from an ordinary MTE packet-tail flag.
 __aicore__ inline void RoceWaitCommit(__gm__ int32_t* localFlag, uint32_t sequence, AscendTimerDevice* timer = nullptr,
                                       AscendTimer::RdmaPhase phase = AscendTimer::RdmaPhase::DispatchPayload,
-                                      uint32_t peer = 0U, __ubuf__ uint8_t* scratch = nullptr,
-                                      uint32_t qpIndex = MEGAMOE_ROCE_QP_INDEX)
+                                      uint32_t peer = 0U, __ubuf__ uint8_t* scratch = nullptr)
 {
     AscendTimerRdmaScope timing(timer, AscendTimer::AIV_RDMA_RECV_WAIT, phase, peer, sizeof(uint32_t), true);
-    RoceWaitFlagEquals(localFlag, sequence, peer, scratch, RoceWaitKind::Commit, qpIndex);
+    RoceWaitFlagEquals(localFlag, sequence, peer, scratch);
     AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(static_cast<AscendC::TEventID>(MEGAMOE_ROCE_EVENT_ID));
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(static_cast<AscendC::TEventID>(MEGAMOE_ROCE_EVENT_ID));
 }

@@ -58,7 +58,7 @@ inline int64_t GetSystemCycle()
     RoceTest::cycle += RoceTest::cycleStep;
     return RoceTest::cycle;
 }
-inline void printf(const char*, uint32_t kind, uint32_t peer, uint32_t, uint32_t expected, uint32_t observed)
+inline void printf(const char*, uint32_t kind, uint32_t peer, uint32_t expected, uint32_t observed)
 {
     ++RoceTest::timeoutDiagnostics;
     RoceTest::lastWaitKind = kind;
@@ -93,11 +93,6 @@ private:
 
 using TEventID = uint32_t;
 enum class HardEvent { S_MTE2 };
-enum class MemDsbT { DDR };
-template <MemDsbT>
-void DataSyncBarrier()
-{
-}
 
 template <HardEvent Event>
 void SetFlag(TEventID event)

@@ -96,16 +96,16 @@ protected:
     __aicore__ inline bool TryProgressRemoteCombine(bool foregroundPending = true)
     {
         if constexpr (g_coreType == AIV) {
-            if (UseHierarchicalRoce(params_.tilingData) && IsHierarchicalPayloadOwner(aivJob_.jobIndex)) {
+            if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
                 // Bound both posting and flag scans before returning to the
                 // next activation/dispatch task on the fixed AIV1 owner.
                 const HierarchicalCombineProgressBudget budget =
                     foregroundPending ? HierarchicalCombineProgressBudget{2U, 64U, true, true}
                                       : HierarchicalCombineProgressBudget{
                                             8U, HIERARCHICAL_MAX_TOKENS * commonConfig_.topK, true, true};
-                return TryProgressHierarchicalCombine(
-                    commonConfig_, params_, hierarchicalCombine_, HierarchicalRoceScratch(params_),
-                    timer_.Enabled() ? &timer_ : nullptr, budget, aivJob_.jobIndex / 2U);
+                return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_,
+                                                      HierarchicalRoceScratch(params_),
+                                                      timer_.Enabled() ? &timer_ : nullptr, budget);
             }
         }
         return false;
@@ -1037,21 +1037,18 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                                               AscendTimer::AIV_HOST_COMBINE_BARRIER_WAIT);
                 CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
             }
-            if (IsHierarchicalPayloadOwner(aivJob_.jobIndex)) {
+            if (aivJob_.jobIndex == HierarchicalSendJob()) {
                 auto* scratch = HierarchicalRoceScratch(params_);
                 auto* rdmaTimer = timer_.Enabled() ? &timer_ : nullptr;
-                DrainHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch, rdmaTimer,
-                                         aivJob_.jobIndex / 2U);
+                DrainHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch, rdmaTimer);
                 RocePublishCommit(reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(
-                                      params_.peermemInfo, HierarchicalSignal::CombineCommit, aivJob_.jobIndex / 2U)),
+                                      params_.peermemInfo, HierarchicalSignal::CombineCommit)),
                                   reinterpret_cast<GM_ADDR>(
                                       HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::Sequence)),
-                                  HierarchicalGateway(rankId_), scratch, rdmaTimer, AscendTimer::RdmaPhase::Combine,
-                                  HierarchicalOwnerQp(aivJob_.jobIndex));
-                RoceWaitCommit(HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::CombineCommit,
-                                                         aivJob_.jobIndex / 2U),
+                                  HierarchicalGateway(rankId_), scratch, rdmaTimer, AscendTimer::RdmaPhase::Combine);
+                RoceWaitCommit(HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::CombineCommit),
                                params_.tilingData->hierarchicalSequence, rdmaTimer, AscendTimer::RdmaPhase::Combine,
-                               HierarchicalGateway(rankId_), scratch, HierarchicalOwnerQp(aivJob_.jobIndex));
+                               HierarchicalGateway(rankId_), scratch);
             }
             PipeBarrier<PIPE_ALL>();
             SyncAll<true>();
@@ -1060,13 +1057,13 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         }
         timer_.End(AscendTimer::AIV_FINAL_CROSS_RANK_WAIT);
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::UNPERMUTE);
-        if (UseHierarchicalRoce(params_.tilingData) && IsHierarchicalQpOwner(aivJob_.jobIndex)) {
+        if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
             // The existing output barrier has released every consumer. Retire
             // outgoing sources while the other AIVs unpermute disjoint output
             // rows; kernel completion still waits for both groups of work.
             RoceFinishOutstanding(HierarchicalGateway(rankId_), HierarchicalRoceScratch(params_),
-                                  timer_.Enabled() ? &timer_ : nullptr, AscendTimer::RdmaPhase::Combine,
-                                  HierarchicalOwnerQp(aivJob_.jobIndex));
+                                  timer_.Enabled() ? &timer_ : nullptr, AscendTimer::RdmaPhase::Combine);
+            PublishHierarchicalLocalSignal(params_, HierarchicalSignal::TxDone);
         } else {
             MegaMoeUnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();
             timer_.Start(AscendTimer::AIV_UNPERMUTE);

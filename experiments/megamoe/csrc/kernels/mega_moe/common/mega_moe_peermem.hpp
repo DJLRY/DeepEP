@@ -33,7 +33,6 @@
 #endif
 #include "../mega_moe_tiling.hpp"
 #include "mega_moe_constants.hpp"
-#include "../../../../../../csrc/common/roce_qp_layout.hpp"
 
 namespace MegaMoeImpl {
 
@@ -60,18 +59,19 @@ constexpr uint32_t HIERARCHICAL_WORLD_SIZE = 32U;
 constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 32U;
 constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
 constexpr uint32_t HIERARCHICAL_ROCE_UB_BYTES = 256U;
-constexpr uint32_t HIERARCHICAL_PAYLOAD_LANES = ascend_deepep::roce_layout::kPayloadQps;
 
-// Every flag owns a full L2 line. Network writers, local publishers and consumers
-// must never share a line with payload or with a different flag producer.
+// Every control flag below owns a full L2 line. Embedded rail markers instead
+// travel with their packet's data under a single writer; see RailPacketMarker.
+// Distinct flag producers must never share a line.
 enum class HierarchicalSignal : uint32_t {
     Sequence,
     LocalRailPacked,
     NetMetaCommit,
     MetaReady,
     NetPayloadCommit,
-    CombineCommit = NetPayloadCommit + HIERARCHICAL_PAYLOAD_LANES,
-    RelayPayloadReady = CombineCommit + HIERARCHICAL_PAYLOAD_LANES,
+    RelayPayloadReady,
+    TxDone,
+    CombineCommit,
     Count
 };
 
@@ -91,38 +91,16 @@ HOST_DEVICE uint32_t HierarchicalPackJob()
     return 0U;
 }
 
-HOST_DEVICE uint32_t HierarchicalSendJob(uint32_t lane = 0U)
+HOST_DEVICE uint32_t HierarchicalSendJob()
 {
-    return lane * 2U + 1U;
+    return 1U;
 }
 
-HOST_DEVICE bool IsHierarchicalPayloadOwner(uint32_t job)
-{
-    return (job & 1U) != 0U && job < 2U * HIERARCHICAL_PAYLOAD_LANES;
-}
-
-HOST_DEVICE bool IsHierarchicalQpOwner(uint32_t job)
-{
-    return job == HierarchicalPackJob() || IsHierarchicalPayloadOwner(job);
-}
-
-HOST_DEVICE uint32_t HierarchicalOwnerQp(uint32_t job)
-{
-    return job == HierarchicalPackJob() ? ascend_deepep::roce_layout::kMetadataQp
-                                        : ascend_deepep::roce_layout::kFirstPayloadQp + job / 2U;
-}
-
-// Compact indices skip the packer and all eight AIV1 payload owners.
-HOST_DEVICE uint32_t HierarchicalRelayJob(uint32_t job)
-{
-    const uint32_t ownersBefore = job / 2U < HIERARCHICAL_PAYLOAD_LANES ? job / 2U : HIERARCHICAL_PAYLOAD_LANES;
-    return job - 1U - ownersBefore;
-}
-
-// All nine QP owners retire outgoing work while the other AIVs unpermute.
+// Reserve the physical QP owner for completion after the output-ready barrier.
+// Host buffer sizing and device token partitioning must use the same job count.
 HOST_DEVICE uint32_t UnpermuteJobCount(const MegaMoeTilingData* t)
 {
-    return UseHierarchicalRoce(t) ? t->blockAivNum - HIERARCHICAL_PAYLOAD_LANES - 1U : t->blockAivNum;
+    return UseHierarchicalRoce(t) && t->blockAivNum > HierarchicalSendJob() ? t->blockAivNum - 1U : t->blockAivNum;
 }
 
 HOST_DEVICE uint32_t UnpermuteJobIndex(const MegaMoeTilingData* t, uint32_t physicalJob)
@@ -130,15 +108,15 @@ HOST_DEVICE uint32_t UnpermuteJobIndex(const MegaMoeTilingData* t, uint32_t phys
     if (UnpermuteJobCount(t) == t->blockAivNum) {
         return physicalJob;
     }
-    if (IsHierarchicalQpOwner(physicalJob)) {
+    if (physicalJob == HierarchicalSendJob()) {
         return UnpermuteJobCount(t);  // Invalid logical job: owns no output rows.
     }
-    return HierarchicalRelayJob(physicalJob);
+    return physicalJob > HierarchicalSendJob() ? physicalJob - 1U : physicalJob;
 }
 
-HOST_DEVICE uint64_t HierarchicalSignalOffset(HierarchicalSignal signal, uint32_t lane = 0U)
+HOST_DEVICE uint64_t HierarchicalSignalOffset(HierarchicalSignal signal)
 {
-    return (static_cast<uint64_t>(signal) + lane) * HIERARCHICAL_FLAG_BYTES;
+    return static_cast<uint64_t>(signal) * HIERARCHICAL_FLAG_BYTES;
 }
 
 // ============================ 各区尺寸（host / device 共用） ============================
@@ -212,11 +190,19 @@ HOST_DEVICE int64_t RailServerSize(const MegaMoeTilingData* t)
     return RailServerSize(t->dispatchRanksPerNode);
 }
 // Platform contract: an aligned 512B peer-write packet becomes visible as a unit.
-// Reserve the last int32 of EVERY packet for (epoch << 24) | totalItems.
-// Slot and packet starts must remain 512B aligned; checking only the last packet is unsafe.
+// Reserve the last int32 of EVERY packet for a marker. MTE uses epoch/length;
+// hierarchical RoCE uses the full invocation sequence (all ranks share actual B).
+// Slot and packet starts must remain 512B aligned. Only the HNS SO contract
+// permits acquiring the whole RDMA Write from its last packet's marker.
 constexpr uint32_t RAIL_PACKET_BYTES = 512U;
 constexpr uint32_t RAIL_PACKET_WORDS = RAIL_PACKET_BYTES / sizeof(int32_t);
 constexpr uint32_t RAIL_PACKET_DATA_WORDS = RAIL_PACKET_WORDS - 1U;
+
+HOST_DEVICE int32_t RailPacketMarker(const MegaMoeTilingData* tilingData, uint32_t epoch, uint32_t totalItems)
+{
+    return static_cast<int32_t>(UseHierarchicalRoce(tilingData) ? tilingData->hierarchicalSequence
+                                                                : (epoch << 24) | totalItems);
+}
 
 HOST_DEVICE int64_t CalcServerNum(int64_t epWorldSize, int64_t ranksPerServer = MEGA_MOE_SERVER_SIZE)
 {
@@ -435,10 +421,9 @@ struct PeermemInfo {
 };
 
 #if defined(__DAV_C310_CUBE__) || defined(__DAV_C310_VEC__)
-__aicore__ inline __gm__ int32_t* HierarchicalSignalAddress(const PeermemInfo& info, HierarchicalSignal signal,
-                                                            uint32_t lane = 0U)
+__aicore__ inline __gm__ int32_t* HierarchicalSignalAddress(const PeermemInfo& info, HierarchicalSignal signal)
 {
-    return reinterpret_cast<__gm__ int32_t*>(info.hierarchicalControlPtr + HierarchicalSignalOffset(signal, lane));
+    return reinterpret_cast<__gm__ int32_t*>(info.hierarchicalControlPtr + HierarchicalSignalOffset(signal));
 }
 #endif
 

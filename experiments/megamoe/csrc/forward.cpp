@@ -275,8 +275,6 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
 #endif
     TORCH_CHECK(!hierarchical || p.ub > MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES,
                 "Not enough UB for MegaMoE RoCE scratch");
-    TORCH_CHECK(!hierarchical || p.aiv > 2U * MegaMoeImpl::HIERARCHICAL_PAYLOAD_LANES,
-                "MegaMoE RoCE requires eight AIV1 payload owners and relay workers");
     const uint32_t stage_ub = hierarchical ? p.ub - MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES : p.ub;
     t.roceScratchUbOffset = hierarchical ? stage_ub : 0U;
     t.sharedExpertNum = static_cast<uint32_t>(shared_experts);

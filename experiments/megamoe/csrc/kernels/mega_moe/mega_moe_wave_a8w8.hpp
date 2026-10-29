@@ -95,13 +95,13 @@ private:
     __aicore__ inline bool TryProgressRemoteCombine()
     {
         if constexpr (g_coreType == AIV) {
-            // Eight AIV1 cores each own a payload QP. A8W8's
+            // Physical AIV1 owns QP1 throughout Dispatch and Combine. A8W8's
             // AIC can FIX across AIV0's full UB; AIV1 has no FIX writer and
             // safely owns the RDMA scratch.
-            if (UseHierarchicalRoce(params_.tilingData) && IsHierarchicalPayloadOwner(aivJob_.jobIndex)) {
-                return TryProgressHierarchicalCombine(
-                    commonConfig_, params_, hierarchicalCombine_, HierarchicalRoceScratch(params_), nullptr,
-                    {8U, HIERARCHICAL_MAX_TOKENS * commonConfig_.topK, true, true}, aivJob_.jobIndex / 2U);
+            if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
+                return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_,
+                                                      HierarchicalRoceScratch(params_), nullptr,
+                                                      {8U, HIERARCHICAL_MAX_TOKENS * commonConfig_.topK, true, true});
             }
         }
         return false;
@@ -1070,7 +1070,7 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
     }
     // Dispatch has posted its ordered commit and acquired the incoming commit
     // before this barrier. HNS defers outbound CQ retirement until kernel exit;
-    // each payload AIV1 retains its own QP/CQ throughout both phases.
+    // physical AIV1 remains the only QP1/CQ1 owner throughout both phases.
     SyncAll<false>();  // AIC 等待 AIV 完成输入准备与 flag 清零后再进入计算
 
     ProcessGmmPipeline();
@@ -1082,20 +1082,17 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
             // Every routed producer and Dispatch reader on this host must finish
             // before a commit can allow the paired source to reuse its buffers.
             CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
-            if (IsHierarchicalPayloadOwner(aivJob_.jobIndex)) {
+            if (aivJob_.jobIndex == HierarchicalSendJob()) {
                 auto* scratch = HierarchicalRoceScratch(params_);
-                DrainHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch, nullptr,
-                                         aivJob_.jobIndex / 2U);
+                DrainHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch);
                 RocePublishCommit(reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(
-                                      params_.peermemInfo, HierarchicalSignal::CombineCommit, aivJob_.jobIndex / 2U)),
+                                      params_.peermemInfo, HierarchicalSignal::CombineCommit)),
                                   reinterpret_cast<GM_ADDR>(
                                       HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::Sequence)),
-                                  HierarchicalGateway(rankId_), scratch, nullptr, AscendTimer::RdmaPhase::Combine,
-                                  HierarchicalOwnerQp(aivJob_.jobIndex));
-                RoceWaitCommit(HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::CombineCommit,
-                                                         aivJob_.jobIndex / 2U),
+                                  HierarchicalGateway(rankId_), scratch, nullptr, AscendTimer::RdmaPhase::Combine);
+                RoceWaitCommit(HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::CombineCommit),
                                params_.tilingData->hierarchicalSequence, nullptr, AscendTimer::RdmaPhase::Combine,
-                               HierarchicalGateway(rankId_), scratch, HierarchicalOwnerQp(aivJob_.jobIndex));
+                               HierarchicalGateway(rankId_), scratch);
             }
             PipeBarrier<PIPE_ALL>();
             SyncAll<true>();
@@ -1103,11 +1100,12 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
             CrossRankSyncInWorldSize(params_.peermemInfo.rankSyncInWorldPtr, rankId_, worldSize_, aivJob_);
         }
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::UNPERMUTE);
-        if (UseHierarchicalRoce(params_.tilingData) && IsHierarchicalQpOwner(aivJob_.jobIndex)) {
+        if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
             // Output readiness is already acquired. Other AIVs own all output
             // rows and overlap their Unpermute with this owner's final quiet.
             RoceFinishOutstanding(HierarchicalGateway(rankId_), HierarchicalRoceScratch(params_), nullptr,
-                                  AscendTimer::RdmaPhase::Combine, HierarchicalOwnerQp(aivJob_.jobIndex));
+                                  AscendTimer::RdmaPhase::Combine);
+            PublishHierarchicalLocalSignal(params_, HierarchicalSignal::TxDone);
         } else {
             UnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();
             UnpermuteTokens<CombineQuantMode, TopkWeightsType, TopkWeightsPrefetch, GMM1_TILE_M>(

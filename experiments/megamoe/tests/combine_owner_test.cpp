@@ -54,9 +54,9 @@ bool UseHierarchicalRoce(const TilingData* tiling)
 {
     return tiling->hierarchical;
 }
-bool IsHierarchicalPayloadOwner(uint32_t job)
+uint32_t HierarchicalSendJob()
 {
-    return (job & 1U) != 0U && job < 16U;
+    return 1U;
 }
 struct Params {
     TilingData* tilingData;
@@ -117,12 +117,12 @@ void RunTokenCombineSlice(const MoeStageCommonConfig&, const AivJobContext& job,
     static_assert(InputReadyChecked);
     assert(*GetTokenCombineReadyCounter(params, state.expertIdx, rowStart) >=
            static_cast<int32_t>(params.expectedProducers));
-    if (params.writes != nullptr) assert(state.globalTokenStartIndex + rowStart == params.expectedPrefix);
+    assert(state.globalTokenStartIndex + rowStart == params.expectedPrefix);
     WorkRange range = GetWaveCombineOwnedRange(job, rowCount, state.globalTokenStartIndex + rowStart);
     assert(range.count != 0U && range.start + range.count <= rowCount);
-    assert(params.writes == nullptr || params.writes->size() == rowCount);
+    assert(params.writes && params.writes->size() == rowCount);
     for (uint32_t row = range.start; row < range.start + range.count; ++row) {
-        if (params.writes != nullptr) ++params.writes->at(row);
+        ++params.writes->at(row);
     }
     ++params.sendCalls;
     params.lastConsumer = job;
@@ -242,7 +242,7 @@ struct FixtureImpl : FixtureBase<Tag> {
     }
     bool TryProgressRemoteCombine(bool = true)
     {
-        assert(IsHierarchicalPayloadOwner(this->aivJob_.jobIndex) && tiling.hierarchical);
+        assert(this->aivJob_.jobIndex == HierarchicalSendJob() && tiling.hierarchical);
         assert(++remoteCalls < 100U);
         if (remoteCalls == 1U) {
             activationReady = true;
@@ -285,10 +285,18 @@ void Coverage()
                             for (auto count : writes) {
                                 after += count;
                             }
-                            loads.push_back(after - before);
-                            uint32_t first = (cursor.slice.begin.globalTokenIndex % blocks + wave % blocks) % blocks;
-                            uint32_t logical = (block + blocks - first) % blocks;
-                            assert(after - before == rows / blocks + static_cast<uint32_t>(logical < rows % blocks));
+                            if (hierarchical && blocks > 1U && block == 0U) {
+                                assert(f.params_.sendCalls == 0U && after == before);
+                            } else {
+                                loads.push_back(after - before);
+                                uint32_t consumers = blocks - static_cast<uint32_t>(hierarchical && blocks > 1U);
+                                uint32_t consumer = block - static_cast<uint32_t>(hierarchical && blocks > 1U);
+                                uint32_t first =
+                                    (cursor.slice.begin.globalTokenIndex % consumers + wave % consumers) % consumers;
+                                uint32_t logical = (consumer + consumers - first) % consumers;
+                                assert(after - before ==
+                                       rows / consumers + static_cast<uint32_t>(logical < rows % consumers));
+                            }
                             assert(f.waveCombineJob_.jobIndex == block && f.waveCombineJob_.totalJobs == blocks);
                             assert(f.gmmExecutionConfig_.blockJob.jobIndex == block);
                             assert(f.aivJob_.jobIndex == 2U * block + 1U);
@@ -325,7 +333,7 @@ void Readiness()
             ++f.Ready(cursor);
             assert(f.TryRunReadyCombine(cursor));
             assert(f.timer_.wave == 28);
-            assert(f.params_.sendCalls == 1U);
+            assert(f.params_.sendCalls == (block == 0U ? 0U : 1U));
         }
     }
     // Empty non-owner consumers still skip without polling unrelated producers.
@@ -348,7 +356,7 @@ void Scheduler()
     assert(readySequence == 41 && f.activationDone);
     assert(f.retired == f.slices.size() && f.currentSlice == f.slices.size());
     assert(f.remoteCalls > f.slices.size());
-    assert(f.params_.sendCalls > 0U);
+    assert(f.params_.sendCalls == 0U);
     assert(f.timer_.clears == 1U && f.timer_.wave == AscendTimer::NO_WAVE);
     assert(f.waveCombineJob_.totalJobs == 28U && f.gmmExecutionConfig_.blockJob.totalJobs == 28U);
 }

@@ -197,25 +197,8 @@ void check_workspace_ready_region(uint8_t mode)
     }
 }
 
-void check_hierarchical_control_layout()
-{
-    // Distinct phases and lanes must never share a 512B producer line.
-    assert(HierarchicalSignalOffset(HierarchicalSignal::NetMetaCommit) + 512U <=
-           HierarchicalSignalOffset(HierarchicalSignal::NetPayloadCommit));
-    assert(HierarchicalSignalOffset(HierarchicalSignal::NetPayloadCommit, 7U) + 512U ==
-           HierarchicalSignalOffset(HierarchicalSignal::CombineCommit));
-    assert(HierarchicalSignalOffset(HierarchicalSignal::CombineCommit, 7U) + 512U ==
-           HierarchicalSignalOffset(HierarchicalSignal::RelayPayloadReady));
-    uint32_t next = 0U;
-    for (uint32_t job = 0U; job < 56U; ++job) {
-        if (!IsHierarchicalQpOwner(job)) assert(HierarchicalRelayJob(job) == next++);
-    }
-    assert(next == 47U);
-}
-
 int main(int argc, char** argv)
 {
-    check_hierarchical_control_layout();
     assert(argc == 2);
     const std::string_view selected(argv[1]);
     assert(selected == "a8w4" || selected == "a8w8");
@@ -251,4 +234,18 @@ int main(int argc, char** argv)
     }
     assert(HierarchicalPackJob() == 0U);
     assert(HierarchicalSendJob() == 1U);
+    // Wire shape is unchanged, but hierarchical metadata must retain every
+    // sequence bit so a stale variable-length tail cannot match after 7-bit wrap.
+    auto markerTiling = make_tiling(32, 3584, 8, true, mode);
+    markerTiling.topoType = TOPO_TYPE_MTE_ROCE;
+    for (uint32_t sequence : {1U, 129U, 257U, 0x80000101U, 0xffffffffU}) {
+        markerTiling.hierarchicalSequence = sequence;
+        for (uint32_t items : {0U, 1U, 127U, 128U, 256U, 1024U}) {
+            assert(static_cast<uint32_t>(RailPacketMarker(&markerTiling, 0x81U, items)) == sequence);
+        }
+    }
+    markerTiling.topoType = TOPO_TYPE_MTE;
+    assert(static_cast<uint32_t>(RailPacketMarker(&markerTiling, 0x81U, 256U)) == 0x81000100U);
+    assert(CalcRailTopkIdsSlotDataBytes(32U, 8U) == 1536);
+    assert(CalcRailTopkIdsSlotDataBytes(0U, 8U) == 512);
 }

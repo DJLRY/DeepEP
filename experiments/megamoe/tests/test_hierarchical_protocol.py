@@ -64,8 +64,8 @@ def input_records(bs, seed):
 
 
 def hierarchical_dispatch(ids, records):
-    """Stage the whole batch on each paired gateway, retaining original offsets."""
-    transfer_keys = {(source, token, 1 - host(source)) for source, token in records}
+    """Stage every actual token once; original routes alone select consumers."""
+    transfer_keys = {(source, token, 1 - host(source)) for source in range(WORLD) for token in range(ids.shape[1])}
     relayed = {(pair(source), token): records[source, token] for source, token, _ in transfer_keys}
     consumers = {}
     for key, owner, expert in routes(ids):
@@ -178,7 +178,8 @@ def test_hierarchical_messages_match_direct_routing(bs, topk, pattern):
     expected_tokens = {(source, token, 1 - host(source)) for source in range(WORLD) for token in range(bs)}
     assert transfers == expected_tokens
     assert len(transfers) == WORLD * bs
-    # Sending unused rows must not create extra expert invocations.
+    # Extra staging rows must not create extra expert invocations. In particular,
+    # all-local routing still transfers payload but has no cross-host consumer.
     remote_consumers = {key for key in consumers if host(key[0]) != host(key[2][0])}
     assert remote_consumers == {
         (owner, expert, key) for key, owner, expert in routes(ids) if host(owner) != host(key[0])
@@ -571,18 +572,23 @@ def a8w8_qp_phase_dependencies(*, backend, combine_owner=1, input_barrier=True):
     dispatch_owner = 1
     graph = {
         "quantized-input": set(),
-        "dispatch-put": {"quantized-input"},
-        "incoming-commit": set(),
+        "packed-metadata": set(),
+        "dispatch-meta-put": {"packed-metadata"},
+        "dispatch-put": {"quantized-input", "dispatch-meta-put"},
+        "incoming-metadata": set(),
+        "incoming-payload-commit": {"incoming-metadata"},
         # An independent receive leader observes the incoming flag. It never
         # waits for this rank's outgoing CQ and never borrows the owner's UB.
-        "dispatch-receive": {"incoming-commit"},
+        "dispatch-receive": {"incoming-metadata"},
         "input-finish-aiv0": set(),
         "all-core-input-barrier": {"dispatch-receive", "input-finish-aiv0", "input-finish-aiv1"},
+        "input-count-ready": {"all-core-input-barrier"},
+        "gateway-payload-acquire": {"input-count-ready", "incoming-payload-commit"},
         "aic-fix-next-wave-aiv0": {"all-core-input-barrier"},
         # The same AIV finishes Dispatch before entering Combine, even without
         # the barrier that additionally closes every other core's input work.
         "combine-progress": {"all-core-input-barrier"} if input_barrier else {"input-finish-aiv1"},
-        "local-producers-finished": {"combine-progress", "aic-fix-next-wave-aiv0"},
+        "local-producers-finished": {"combine-progress", "aic-fix-next-wave-aiv0", "gateway-payload-acquire"},
         "host-finish-barrier": {"local-producers-finished"},
         "combine-final-drain": {"host-finish-barrier"},
         "incoming-combine-commit": set(),
@@ -603,6 +609,10 @@ def a8w8_qp_phase_dependencies(*, backend, combine_owner=1, input_barrier=True):
     else:
         graph.update(
             {
+                "dispatch-meta-quiet": {"dispatch-meta-put"},
+                "dispatch-meta-commit": {"dispatch-meta-quiet"},
+                "dispatch-meta-commit-quiet": {"dispatch-meta-commit"},
+                "dispatch-put": {"quantized-input", "dispatch-meta-commit-quiet"},
                 "dispatch-payload-quiet": {"dispatch-put"},
                 "dispatch-commit": {"dispatch-payload-quiet"},
                 "dispatch-commit-quiet": {"dispatch-commit"},
@@ -616,6 +626,10 @@ def a8w8_qp_phase_dependencies(*, backend, combine_owner=1, input_barrier=True):
         )
     actions = {}
     for event in (
+        "dispatch-meta-put",
+        "dispatch-meta-quiet",
+        "dispatch-meta-commit",
+        "dispatch-meta-commit-quiet",
         "dispatch-put",
         "dispatch-payload-quiet",
         "dispatch-commit",
@@ -661,6 +675,10 @@ def test_a8w8_fixed_qp_owner_and_aiv1_scratch_allow_next_wave_fix_overlap(backen
     dispatch_finished = "dispatch-commit" if backend == "HNS_1825" else "dispatch-commit-quiet"
     assert dispatch_finished in ancestors(graph, "combine-progress")
     assert dispatch_finished not in ancestors(graph, "dispatch-receive")
+    assert "incoming-payload-commit" not in ancestors(graph, "dispatch-receive")
+    assert "incoming-payload-commit" not in ancestors(graph, "input-count-ready")
+    assert "incoming-payload-commit" in ancestors(graph, "gateway-payload-acquire")
+    assert "input-count-ready" in ancestors(graph, "gateway-payload-acquire")
     assert "all-core-input-barrier" in ancestors(graph, "combine-progress")
     assert "host-finish-barrier" in ancestors(graph, "combine-final-drain")
     assert "combine-commit-quiet" not in ancestors(graph, "combine-progress")
@@ -721,6 +739,7 @@ def test_real_kernel_entrypoints_overlap_owner_retirement_after_output_ready(hea
         "RocePublishCommit(",
         "RoceWaitCommit(",
         "RoceFinishOutstanding(",
+        "HierarchicalSignal::TxDone",
         "UnpermuteTokens<",
         "Stage::COMPLETE",
     )
@@ -732,9 +751,9 @@ def test_real_kernel_entrypoints_overlap_owner_retirement_after_output_ready(hea
     tail_begin = body.index("Stage::UNPERMUTE")
     tail = body[tail_begin : body.index("Stage::COMPLETE")]
     assert "UseHierarchicalRoce(params_.tilingData)" in tail
-    assert "IsHierarchicalQpOwner(aivJob_.jobIndex)" in tail
+    assert "aivJob_.jobIndex == HierarchicalSendJob()" in tail
     assert "expectedRows" not in tail and "sentRows" not in tail
-    assert "} else {" in tail[tail.index("RoceFinishOutstanding(") : tail.index("UnpermuteTokens<")]
+    assert "} else {" in tail[tail.index("HierarchicalSignal::TxDone") : tail.index("UnpermuteTokens<")]
     assert "SyncAll<true>()" in body[body.index("RoceWaitCommit(") : tail_begin]
     assert "SyncAll" not in tail, "The owner must not gate other AIVs behind its final quiet"
     if timed:

@@ -285,7 +285,8 @@ __aicore__ inline void LoadRailTopkIdsBatch(const SendMaskConfig& config, SendMa
 }
 
 /*
- * 每个目标 server 一个发送核。每个 512B 包携带自身的 epoch/length 标记，
+ * 每个目标 server 一个发送核。每个 512B 包携带本轮标记：普通 MTE 为 epoch/length，
+ * 两机路径为完整32位 sequence，长度由全 rank 一致的实际 B 和 Top-k 确定。
  * 同批数据和标记用同一个连续 MTE3 写入，不再发独立 arrival，也不需要 data -> flag barrier。
  * 这里依赖平台的 512B 包内可见性约定，不依赖不同包或不同 MTE3 指令的完成顺序。
  */
@@ -299,12 +300,13 @@ __aicore__ inline void SendTopkIdsToRailServer(const MoeStageCommonConfig& commo
     const uint64_t slotOffset =
         config.railTopkIdsWinOffset + static_cast<uint64_t>(srcServerIdx) * config.railTopkIdsSlotBytes;
     const int32_t totalItems = static_cast<int32_t>(static_cast<uint64_t>(common.tokenNum) * common.topK);
-    // The epoch belongs to the packing AIV, independently of the destination host.
+    // The MTE epoch belongs to the packing AIV, independently of the target host.
+    // Hierarchical packing selects the full invocation sequence below instead.
     __gm__ int32_t* launchCountSlot =
         reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.rankSyncInWorldPtr + RANK_SYNC_COUNTER_OFFSET_BYTES +
                                           static_cast<uint64_t>(jobIdx) * RANK_SYNC_COUNTER_SLOT_BYTES);
     const uint32_t epoch = ((ReadGmByPassDCache(launchCountSlot) + 1) & 0x7F) | 0x80;
-    const int32_t marker = static_cast<int32_t>((epoch << 24) | static_cast<uint32_t>(totalItems));
+    const int32_t marker = RailPacketMarker(params.tilingData, epoch, static_cast<uint32_t>(totalItems));
     GlobalTensor<int32_t> topkIdsGm;
     topkIdsGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.expertIdxGmAddr));
     GlobalTensor<int32_t> dstRailGm;
@@ -649,8 +651,12 @@ __aicore__ inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig& com
     int32_t expectEpoch = ((ReadGmByPassDCache(launchCountSlot) + 1) & 0x7F) | 0x80;
     const int32_t sourceRank =
         static_cast<int32_t>(relayIdx * config.ranksPerServer + common.rankId % config.ranksPerServer);
-    int32_t realSendTotalNum;
-    {
+    // Hierarchical callers have acquired LocalRailPacked or MetaReady. Their
+    // packet markers hold the full 32-bit invocation, not epoch/length. The
+    // public API requires the same actual B/top-k on every rank; do not decode
+    // length from those markers or repeat the leader's network acquisition.
+    int32_t realSendTotalNum = static_cast<int32_t>(common.tokenNum * common.topK);
+    if (!UseHierarchicalRoce(params.tilingData)) {
         AscendTimerRelayScope packet(timer, AscendTimer::RelayStep::PacketWait, sourceRank, ownedExpertBegin,
                                      ownedExpertNum);
         realSendTotalNum = WaitRailPacketArrival(railSlotBase, expectEpoch);
