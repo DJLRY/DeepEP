@@ -318,7 +318,7 @@ inline int64_t GetSystemCycle()
 
 namespace MegaMoeImpl {
 using namespace AscendC;
-constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 32U;
+constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 144U;
 constexpr uint32_t HIERARCHICAL_RANKS_PER_HOST = 16U;
 constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
 constexpr uint32_t MEGAMOE_ROCE_SCRATCH_BYTES = 256U;
@@ -477,6 +477,7 @@ public:
     {
         state = &s;
         common.tokenNum = tokens;
+        tiling.numMaxTokensPerRank = std::max(32U, tokens);
         common.topK = tiling.topK = topk;
         common.rankId = rank;
         tiling.hierarchicalSequence = s.sequence = sequence;
@@ -1113,6 +1114,25 @@ void CursorOracle()
         crossing.CheckPayload();
     }
 }
+void LargeBatch()
+{
+    // DSV41's 144*6 routes and the maximum supported top-k exercise private
+    // masks beyond token 31, metadata packet boundaries and the final row.
+    for (uint32_t topk : {6U, 32U}) {
+        Fixture f(144U, topk, 16U);
+        f.Routes("all");
+        f.Init();
+        f.progress.nextRow = 31U * topk + topk - 1U;
+        for (uint32_t row = 0; row + 1U < f.s.rows; ++row) f.Publish(row, f.s.sequence);
+        OracleStep(f, 1U, 64U);
+        while (f.progress.sentRows + 1U < f.Expected()) OracleStep(f, 2U, 64U);
+        Check(f.s.sent.back() == 0U, "last row sent before its producer published");
+        f.Publish(f.s.rows - 1U, f.s.sequence);
+        f.Finish(2U, 64U);
+        f.CheckPayload();
+    }
+}
+
 void Coalescing()
 {
     {
@@ -1303,6 +1323,8 @@ int main(int argc, char** argv)
         Telemetry();
     else if (std::strcmp(scenario, "cursor-oracle") == 0)
         CursorOracle();
+    else if (std::strcmp(scenario, "large-batch") == 0)
+        LargeBatch();
     else if (std::strcmp(scenario, "ready-snapshot") == 0)
         ReadySnapshot();
     else if (std::strcmp(scenario, "coalescing") == 0)

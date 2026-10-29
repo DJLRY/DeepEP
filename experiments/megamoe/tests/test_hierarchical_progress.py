@@ -52,6 +52,7 @@ def hierarchical_progress_binary(tmp_path_factory):
         "topology",
         "telemetry",
         "cursor-oracle",
+        "large-batch",
         "ready-snapshot",
         "coalescing",
         "retry-spacing",

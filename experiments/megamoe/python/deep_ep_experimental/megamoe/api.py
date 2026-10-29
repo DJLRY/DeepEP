@@ -174,8 +174,10 @@ class SymmBuffer:
 
     def _prepare(self, bs):
         integer("BS", bs, 1, self.num_max_tokens_per_rank)
-        if self._hierarchical_roce and bs > 32:
-            raise ValueError("MTE+RoCE MegaMoE currently supports decode BS in [1,32]")
+        # Older protocol-6 wheels predate the extended sweep; retain their limit.
+        limit = getattr(_extension(), "hierarchical_max_tokens", 32)
+        if self._hierarchical_roce and bs > limit:
+            raise ValueError(f"MTE+RoCE MegaMoE currently supports decode BS in [1,{limit}]; rebuild for larger BS")
         if self._plan_bs == bs:
             return
         # 只保留当前 BS 的计划，不让不同 BS 的最坏容量 workspace 累积占满 HBM。

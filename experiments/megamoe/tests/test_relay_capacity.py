@@ -37,8 +37,8 @@ template <typename T> T AlignUp(T v, T a) { return CeilDiv(v, a) * a; }
         + """
 int main() {
     for (auto topology : {TOPO_TYPE_MTE, TOPO_TYPE_MTE_ROCE})
-    for (uint32_t bs : {1U, 31U, 32U, 33U, 64U})
-    for (uint32_t topk : {1U, 8U, 32U}) {
+    for (uint32_t bs : {1U, 31U, 32U, 33U, 64U, 138U, 144U})
+    for (uint32_t topk : {1U, 6U, 8U, 32U}) {
         MegaMoeTilingData t{};
         t.topoType = topology; t.bs = t.numMaxTokensPerRank = bs; t.topK = topk;
         t.groupedMatmulMode = GROUPED_MATMUL_MODE_A8W4;

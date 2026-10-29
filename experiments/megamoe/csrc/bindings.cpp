@@ -8,6 +8,7 @@
 #include "tiling/platform/platform_ascendc.h"
 #include "kernels/mega_moe/common/ascend_timer_v2.hpp"
 #include "kernels/mega_moe/common/mega_moe_constants.hpp"
+#include "kernels/mega_moe/common/mega_moe_peermem.hpp"
 
 namespace py = pybind11;
 
@@ -16,6 +17,7 @@ PYBIND11_MODULE(_C, module)
     using deepep::megamoe::Plan;
     module.attr("api_protocol") = 6;
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
+    module.attr("hierarchical_max_tokens") = MegaMoeImpl::HIERARCHICAL_MAX_TOKENS;
     module.def("buffer_size", &deepep::megamoe::buffer_size, py::arg("world"), py::arg("experts"), py::arg("tokens"),
                py::arg("topk"), py::arg("hidden"), py::arg("ranks_per_node") = 0);
     py::class_<Plan>(module, "Plan")

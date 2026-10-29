@@ -56,7 +56,9 @@ HOST_DEVICE bool UseHierarchicalRoce(const MegaMoeTilingData* t)
 
 constexpr uint32_t HIERARCHICAL_RANKS_PER_HOST = 16U;
 constexpr uint32_t HIERARCHICAL_WORLD_SIZE = 32U;
-constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 32U;
+// Covers the DSV41 sweep (original BS 1..24, six tokens per sequence).
+// Per-token Combine state has one uint32 top-k mask, not one bit per token.
+constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 144U;
 constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
 constexpr uint32_t HIERARCHICAL_ROCE_UB_BYTES = 256U;
 

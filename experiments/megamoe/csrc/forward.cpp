@@ -269,7 +269,7 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     t.topoType = hierarchical ? MegaMoeImpl::TOPO_TYPE_MTE_ROCE : MegaMoeImpl::TOPO_TYPE_MTE;
     TORCH_CHECK(
         !hierarchical || (world == MegaMoeImpl::HIERARCHICAL_WORLD_SIZE && bs <= MegaMoeImpl::HIERARCHICAL_MAX_TOKENS),
-        "MTE+RoCE MegaMoE requires two 16-rank hosts and BS in [1,32]");
+        "MTE+RoCE MegaMoE requires two 16-rank hosts and BS in [1,", MegaMoeImpl::HIERARCHICAL_MAX_TOKENS, "]");
 #ifndef DEEPEP_MEGAMOE_ROCE
     TORCH_CHECK(!hierarchical, "Rebuild MegaMoE with a RoCE-enabled SHMEM SDK (XSCALE or HNS_1825)");
 #endif
