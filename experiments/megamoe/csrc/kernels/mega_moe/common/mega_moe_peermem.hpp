@@ -71,7 +71,7 @@ enum class HierarchicalSignal : uint32_t {
     MetaReady,
     NetPayloadCommit,
     CombineCommit = NetPayloadCommit + HIERARCHICAL_PAYLOAD_LANES,
-    DispatchPlan = CombineCommit + HIERARCHICAL_PAYLOAD_LANES,
+    RelayPayloadReady = CombineCommit + HIERARCHICAL_PAYLOAD_LANES,
     Count
 };
 

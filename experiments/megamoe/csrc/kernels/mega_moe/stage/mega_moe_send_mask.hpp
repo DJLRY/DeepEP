@@ -4,7 +4,6 @@
 #ifndef MEGA_MOE_SEND_MASK_H
 #define MEGA_MOE_SEND_MASK_H
 
-#include "../common/mega_moe_dispatch_plan.hpp"
 #include "../common/mega_moe_utils.hpp"
 #include "../common/ascend_timer_v2_device.hpp"
 #include "mega_moe_route_compact.hpp"
@@ -292,8 +291,7 @@ __aicore__ inline void LoadRailTopkIdsBatch(const SendMaskConfig& config, SendMa
  */
 __aicore__ inline void SendTopkIdsToRailServer(const MoeStageCommonConfig& common, GM_ADDR* winRankAddr,
                                                const SendMaskConfig& config, const Params& params,
-                                               SendMaskScratch& scratch, uint32_t targetServerIdx, uint32_t jobIdx,
-                                               uint32_t* remoteTokens = nullptr)
+                                               SendMaskScratch& scratch, uint32_t targetServerIdx, uint32_t jobIdx)
 {
     const int32_t itemsPerBatch = RailItemsPerBatch(config.bufferConfig);
     const uint32_t railRank = targetServerIdx * config.ranksPerServer + common.rankId % config.ranksPerServer;
@@ -337,15 +335,6 @@ __aicore__ inline void SendTopkIdsToRailServer(const MoeStageCommonConfig& commo
         }
         // MTE2 padding may touch the marker word; stamp it only after input loads complete.
         SyncFuncStatic<AscendC::HardEvent::MTE2_S, SYNC_EVENT_ID0>();
-        if (remoteTokens != nullptr) {
-            // Piggyback the packer's existing UB load. Only this AIV inspects
-            // the IDs; payload owners consume the eight-word plan instead.
-            const uint32_t expertsPerHost = HIERARCHICAL_RANKS_PER_HOST * common.moeExpertPerRank;
-            const uint32_t remoteHost = 1U - HierarchicalHost(common.rankId);
-            AccumulateHierarchicalRemoteTokens(scratch.topkIdsTensor, static_cast<uint32_t>(start),
-                                               static_cast<uint32_t>(valid), common.topK, expertsPerHost, remoteHost,
-                                               *remoteTokens);
-        }
         for (int32_t packet = 0; packet < packetCount; ++packet) {
             scratch.topkIdsTensor.SetValue(packet * RAIL_PACKET_WORDS + RAIL_PACKET_DATA_WORDS, marker);
         }

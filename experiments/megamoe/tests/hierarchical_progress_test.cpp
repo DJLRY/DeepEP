@@ -1127,17 +1127,71 @@ void CursorOracle()
 void Coalescing()
 {
     {
+        // Reproduce the observed 17..20 and 22..31 fragments inside one
+        // natural 16..31 range. Both exceed the old short-run threshold.
+        Fixture f(4U, 8U);
+        std::vector<uint32_t> rows;
+        for (uint32_t row = 16U; row < 32U; ++row) rows.push_back(row);
+        f.RouteRows(rows);
+        for (uint32_t row : rows) {
+            if (row != 16U && row != 21U) f.Publish(row, f.s.sequence);
+        }
+        Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr,
+                                              {8U, 32U, true, true}),
+              "medium fragments were posted before their bounded coalescing opportunity");
+        const auto reads = f.s.flagReads;
+        ReleaseAll();
+        Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr,
+                                              {8U, 32U, true, true}) &&
+                  f.s.flagReads == reads,
+              "empty sweep immediately repeated its flag reads");
+        Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr,
+                                             {8U, 32U, true, true}),
+              "newly complete range did not progress after one skipped visit");
+        Check(f.s.posts.size() == 1U && f.s.posts[0].firstRow == 16U && f.s.posts[0].rowCount == 16U,
+              "medium fragments did not reunite into their natural range");
+        f.CheckPayload();
+    }
+    {
+        Fixture f(2U, 8U);
+        f.Routes("all");
+        for (uint32_t row = 2U; row < 14U; ++row) f.Publish(row, f.s.sequence);
+        for (uint32_t call = 0U; call < 2U; ++call) {
+            Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr,
+                                                  {2U, 16U, true, true}),
+                  "partial region ignored its bounded deferral or retry spacing");
+        }
+        Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr,
+                                             {2U, 16U, true, true}) &&
+                  f.progress.sentRows == 12U,
+              "unfinished neighbours indefinitely held an already-deferred medium run");
+        ReleaseAll();
+        DrainHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data());
+        f.CheckPayload();
+    }
+    {
+        Fixture f(2U, 8U);
+        f.RouteRows({0U, 1U, 2U, 3U, 8U, 9U, 10U, 11U});
+        ReleaseAll();
+        Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr,
+                                             {8U, 16U, true, true}),
+              "complete regions were deferred across a route gap");
+        Check(f.s.posts.size() == 2U && f.s.posts[0].rowCount == 4U && f.s.posts[1].rowCount == 4U,
+              "coalescing crossed a non-routed gap");
+        f.CheckPayload();
+    }
+    {
         Fixture f(2U, 8U);
         f.Routes("all");
         f.Publish(0U, f.s.sequence);
         AscendTimerDevice timer;
-        Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {2U, 16U, 4U}),
+        Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {2U, 16U, true}),
               "short growable run was submitted before its bounded deferral");
         Check(f.s.posts.empty() && f.progress.sentRows == 0U && timer.runs.size() == 1U &&
                   (timer.runs[0].second & 0x100U) != 0U && (timer.runs[0].second & 0xffU) == 2U,
               "deferral changed payload or lost its producer-not-ready reason");
         ReleaseAll();
-        Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {8U, 16U, 4U}),
+        Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {8U, 16U, true}),
               "coalesced run did not progress");
         Check(f.s.posts.size() == 1U && f.s.posts[0].rowCount == 16U, "late neighbouring rows were not coalesced");
         f.CheckPayload();
@@ -1146,9 +1200,9 @@ void Coalescing()
         Fixture f(2U, 8U);
         f.Routes("all");
         f.Publish(0U, f.s.sequence);
-        Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {2U, 16U, 4U}),
+        Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {2U, 16U, true}),
               "first short-run visit should defer");
-        Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {2U, 16U, 4U}),
+        Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {2U, 16U, true}),
               "an unfinished neighbour starved an already-deferred row");
         Check(f.s.sent[0] == 1U && f.progress.sentRows == 1U, "bounded retry submitted an unready row");
         ReleaseAll();
@@ -1163,7 +1217,7 @@ void Coalescing()
         // only once, with no wait on a producer inside the progress call.
         for (uint32_t calls = 0; f.progress.sentRows != f.Expected(); ++calls) {
             Check(calls <= 2U * f.s.rows, "coalescing exceeded its per-start retry bound");
-            TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {1U, 1U, 4U});
+            TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {1U, 1U, true});
         }
         f.CheckPayload();
     }
@@ -1171,11 +1225,59 @@ void Coalescing()
         Fixture f(2U, 8U);
         f.Routes("all");
         f.Publish(0U, f.s.sequence);
-        TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {1U, 16U, 4U});
+        TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {1U, 16U, true});
         ReleaseAll();
         DrainHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data());
         Check(f.s.posts.size() == 1U && f.s.posts[0].rowCount == 16U,
               "final drain inherited foreground coalescing or fragmented a ready run");
+        f.CheckPayload();
+    }
+}
+void RetrySpacing()
+{
+    {
+        Fixture f(2U, 8U);
+        f.Routes("all");
+        Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr,
+                                              {2U, 16U, true, true}),
+              "empty sweep submitted unready rows");
+        const auto reads = f.s.flagReads;
+        const auto next = f.progress.nextRow;
+        AscendTimerDevice timer;
+        ReleaseAll();
+        Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer,
+                                              {2U, 16U, true, true}) &&
+                  f.s.flagReads == reads && f.progress.nextRow == next && timer.records.empty(),
+              "skipped retry performed flag DMA or recorded a nonexistent scan");
+        Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr,
+                                             {2U, 16U, true, true}),
+              "retry spacing suppressed the next eligible visit");
+        f.CheckPayload();
+    }
+    {
+        // A partial empty sweep must continue to late rows at the next visit.
+        Fixture f(4U, 8U);
+        f.RouteRows({31U});
+        f.Publish(31U, f.s.sequence);
+        for (uint32_t call = 0U; call < 4U; ++call) {
+            const bool made = TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr,
+                                                             {2U, 8U, true, true});
+            Check(made == (call == 3U), "retry spacing stalled a partial sweep before a late ready row");
+        }
+        f.CheckPayload();
+    }
+    {
+        Fixture f(2U, 8U);
+        f.Routes("all");
+        f.Publish(3U, f.s.sequence);
+        TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {2U, 16U, true, true});
+        Check(f.progress.retryDeferred, "fixture did not arm foreground retry spacing");
+        // All producers have finished: drain must ignore the armed retry and
+        // pending coalescing, and issue the complete range in one Put.
+        ReleaseAll();
+        DrainHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data());
+        Check(f.s.posts.size() == 1U && f.s.posts[0].rowCount == 16U,
+              "final drain inherited foreground deferral or retry spacing");
         f.CheckPayload();
     }
 }
@@ -1218,7 +1320,7 @@ void EightOwners()
                         for (uint32_t calls = 0U; progress.sentRows < progress.expectedRows; ++calls) {
                             Check(calls < 2048U, "bounded cursor failed to wrap inside its owner's partition");
                             TryProgressHierarchicalCombine(f.common, f.params, progress, f.s.ub.data(), nullptr,
-                                                           {1U, 3U, 2U}, lane);
+                                                           {1U, 3U, true, true}, lane);
                         }
                         DrainHierarchicalCombine(f.common, f.params, progress, f.s.ub.data(), nullptr, lane);
                     }
@@ -1267,6 +1369,8 @@ int main(int argc, char** argv)
         ReadySnapshot();
     else if (std::strcmp(scenario, "coalescing") == 0)
         Coalescing();
+    else if (std::strcmp(scenario, "retry-spacing") == 0)
+        RetrySpacing();
     else
         Check(false, "unknown test scenario");
     return 0;

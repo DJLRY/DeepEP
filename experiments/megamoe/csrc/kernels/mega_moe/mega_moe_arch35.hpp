@@ -100,9 +100,9 @@ protected:
                 // Bound both posting and flag scans before returning to the
                 // next activation/dispatch task on the fixed AIV1 owner.
                 const HierarchicalCombineProgressBudget budget =
-                    foregroundPending
-                        ? HierarchicalCombineProgressBudget{2U, 64U, 4U}
-                        : HierarchicalCombineProgressBudget{8U, HIERARCHICAL_MAX_TOKENS * commonConfig_.topK, 4U};
+                    foregroundPending ? HierarchicalCombineProgressBudget{2U, 64U, true, true}
+                                      : HierarchicalCombineProgressBudget{
+                                            8U, HIERARCHICAL_MAX_TOKENS * commonConfig_.topK, true, true};
                 return TryProgressHierarchicalCombine(
                     commonConfig_, params_, hierarchicalCombine_, HierarchicalRoceScratch(params_),
                     timer_.Enabled() ? &timer_ : nullptr, budget, aivJob_.jobIndex / 2U);

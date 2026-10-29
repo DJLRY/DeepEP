@@ -4,7 +4,6 @@
 #define MEGA_MOE_HIERARCHICAL_DISPATCH_H
 
 #include "../common/mega_moe_roce.hpp"
-#include "../common/mega_moe_dispatch_plan.hpp"
 #include "mega_moe_send_mask.hpp"
 
 namespace MegaMoeImpl {
@@ -37,32 +36,23 @@ __aicore__ inline void WaitHierarchicalLocalSignal(const Params& params, Hierarc
     SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
 }
 
-// Every payload owner reads only its mask. Original token coordinates let
-// consumers retain their existing gateway addresses without an unpack stage.
+// Quantization completes on all AIVs before this stage. Each owner posts its
+// contiguous share of the whole batch without waiting for route packing.
 __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& common, const Params& params, uint32_t lane,
                                                 AscendTimerDevice* timer = nullptr)
 {
     const uint32_t gateway = HierarchicalGateway(common.rankId);
     const uint32_t qp = ascend_deepep::roce_layout::kFirstPayloadQp + lane;
     auto* scratch = HierarchicalRoceScratch(params);
-    WaitHierarchicalLocalSignal(params, HierarchicalSignal::LocalRailPacked, gateway, scratch, qp);
-    const uint32_t mask = static_cast<uint32_t>(
-        ReadGmByPassDCache(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::DispatchPlan) + lane));
+    const uint32_t firstToken = common.tokenNum * lane / HIERARCHICAL_PAYLOAD_LANES;
+    const uint32_t endToken = common.tokenNum * (lane + 1U) / HIERARCHICAL_PAYLOAD_LANES;
     const uint32_t rowBytes =
         static_cast<uint32_t>(CalcQuantTokenScaleBytes(common.tokenHiddenDim, 1U, common.topK, false));
-    for (uint32_t token = 0U; token < common.tokenNum;) {
-        if ((mask & (uint32_t(1) << token)) == 0U) {
-            ++token;
-            continue;
-        }
-        const uint32_t first = token++;
-        while (token < common.tokenNum && (mask & (uint32_t(1) << token)) != 0U) {
-            ++token;
-        }
-        const uint64_t offset = static_cast<uint64_t>(first) * rowBytes;
+    if (firstToken != endToken) {
+        const uint64_t offset = static_cast<uint64_t>(firstToken) * rowBytes;
         RocePutBytes(params.peermemInfo.relayPayloadPtr + offset, params.peermemInfo.quantTokenScalePtr + offset,
-                     (token - first) * rowBytes, gateway, scratch, timer, AscendTimer::RdmaPhase::DispatchPayload,
-                     false, qp);
+                     (endToken - firstToken) * rowBytes, gateway, scratch, timer,
+                     AscendTimer::RdmaPhase::DispatchPayload, false, qp);
     }
 }
 
@@ -78,14 +68,7 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
     const uint32_t otherHost = 1U - myHost;
     if (job.jobIndex == HierarchicalPackJob()) {
         PublishHierarchicalLocalSignal(params, HierarchicalSignal::Sequence);
-        uint32_t remoteTokens = 0U;
-        SendTopkIdsToRailServer(common, winRankAddr, config, params, scratch, myHost, job.jobIndex, &remoteTokens);
-        const auto plan = BuildHierarchicalDispatchPlan(remoteTokens);
-        auto* planGm = HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::DispatchPlan);
-        for (uint32_t lane = 0U; lane < HIERARCHICAL_PAYLOAD_LANES; ++lane) {
-            WriteGmByPassDCache(planGm + lane, static_cast<int32_t>(plan.tokens[lane]));
-        }
-        AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+        SendTopkIdsToRailServer(common, winRankAddr, config, params, scratch, myHost, job.jobIndex);
         PublishHierarchicalLocalSignal(params, HierarchicalSignal::LocalRailPacked);
         GM_ADDR packedRail = params.peermemInfo.railTopkIdsRecvPtr + myHost * config.railTopkIdsSlotBytes;
         RocePutBytes(packedRail, packedRail,
@@ -140,6 +123,12 @@ __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, cons
     }
     const bool metadata = job.jobIndex == HierarchicalPackJob();
     const uint32_t lane = metadata ? 0U : job.jobIndex / 2U;
+    if (!metadata) {
+        // Payload may be posted before the packer runs. Only its commit needs
+        // the shared, immutable Sequence source published by that packer.
+        WaitHierarchicalLocalSignal(params, HierarchicalSignal::Sequence, HierarchicalGateway(common.rankId),
+                                    HierarchicalRoceScratch(params), HierarchicalOwnerQp(job.jobIndex));
+    }
     // Empty payload lanes still commit. Every owner posts before any input
     // barrier, and each commit certifies only preceding work on its own QP.
     RocePublishCommit(

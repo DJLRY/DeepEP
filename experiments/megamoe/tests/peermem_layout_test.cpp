@@ -5,9 +5,8 @@
 #include <cstddef>
 #include <cstdint>
 #include <string_view>
-#include <random>
 #include <vector>
-#include "../csrc/kernels/mega_moe/common/mega_moe_dispatch_plan.hpp"
+#include "../csrc/kernels/mega_moe/common/mega_moe_peermem.hpp"
 #include "../csrc/kernels/mega_moe/common/mega_moe_workspace.hpp"
 
 using namespace MegaMoeImpl;
@@ -198,59 +197,15 @@ void check_workspace_ready_region(uint8_t mode)
     }
 }
 
-uint32_t bit_count(uint32_t bits)
+void check_hierarchical_control_layout()
 {
-    uint32_t count = 0U;
-    for (; bits != 0U; bits &= bits - 1U) ++count;
-    return count;
-}
-
-void check_dispatch_plan()
-{
-    std::mt19937 random(349U);
-    for (uint32_t i = 0U; i < 4096U; ++i) {
-        const uint32_t valid = i == 0U ? 0U : (i == 1U ? 0xffffffffU : random());
-        const auto plan = BuildHierarchicalDispatchPlan(valid);
-        uint32_t joined = 0U, smallest = 32U, largest = 0U;
-        for (uint32_t lane = 0U; lane < 8U; ++lane) {
-            assert((joined & plan.tokens[lane]) == 0U);
-            joined |= plan.tokens[lane];
-            smallest = std::min(smallest, bit_count(plan.tokens[lane]));
-            largest = std::max(largest, bit_count(plan.tokens[lane]));
-        }
-        assert(joined == valid && largest - smallest <= 1U);
-    }
-    // Exercise the production packer's mask accumulation across packet and
-    // batch boundaries; markers and invalid expert IDs must not create tokens.
-    struct Packed {
-        std::array<int32_t, 256> words{};
-        int32_t GetValue(uint32_t i) const
-        {
-            return words.at(i);
-        }
-    } packed;
-    for (uint32_t topk : {1U, 8U, 32U}) {
-        uint32_t mask = 0U, oracle = 0U;
-        for (uint32_t first = 0U; first < 32U * topk; first += 254U) {
-            packed.words.fill(192);  // poison marker/padding as a remote ID
-            const uint32_t count = std::min(254U, 32U * topk - first);
-            for (uint32_t i = 0U; i < count; ++i) {
-                const uint32_t row = first + i;
-                const int32_t expert = row % 19U == 0U ? 192 : (row % 3U == 0U ? -1 : 0);
-                packed.words[i + i / 127U] = expert;
-                if (expert == 192) oracle |= 1U << (row / topk);
-            }
-            AccumulateHierarchicalRemoteTokens(packed, first, count, topk, 192U, 1U, mask);
-        }
-        assert(mask == oracle);
-    }
     // Distinct phases and lanes must never share a 512B producer line.
     assert(HierarchicalSignalOffset(HierarchicalSignal::NetMetaCommit) + 512U <=
            HierarchicalSignalOffset(HierarchicalSignal::NetPayloadCommit));
     assert(HierarchicalSignalOffset(HierarchicalSignal::NetPayloadCommit, 7U) + 512U ==
            HierarchicalSignalOffset(HierarchicalSignal::CombineCommit));
     assert(HierarchicalSignalOffset(HierarchicalSignal::CombineCommit, 7U) + 512U ==
-           HierarchicalSignalOffset(HierarchicalSignal::DispatchPlan));
+           HierarchicalSignalOffset(HierarchicalSignal::RelayPayloadReady));
     uint32_t next = 0U;
     for (uint32_t job = 0U; job < 56U; ++job) {
         if (!IsHierarchicalQpOwner(job)) assert(HierarchicalRelayJob(job) == next++);
@@ -260,7 +215,7 @@ void check_dispatch_plan()
 
 int main(int argc, char** argv)
 {
-    check_dispatch_plan();
+    check_hierarchical_control_layout();
     assert(argc == 2);
     const std::string_view selected(argv[1]);
     assert(selected == "a8w4" || selected == "a8w8");

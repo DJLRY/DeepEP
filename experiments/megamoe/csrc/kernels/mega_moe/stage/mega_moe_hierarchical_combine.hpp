@@ -30,6 +30,7 @@ struct HierarchicalCombineProgress {
     uint32_t sentRows = 0U;
     uint32_t nextRow = 0U;
     bool initialized = false;
+    bool retryDeferred = false;
 };
 
 // The default retains a full sweep for callers with infrequent progress points.
@@ -37,10 +38,13 @@ struct HierarchicalCombineProgress {
 struct HierarchicalCombineProgressBudget {
     uint32_t maxPosts = 0xffffffffU;
     uint32_t maxScannedRows = 0xffffffffU;
-    // Zero disables coalescing, including the final producer-complete drain.
-    // A short run with a still-pending neighbour is deferred at most once per
-    // start row. Never wait inside a call: the owner may be its next producer.
-    uint32_t minRunRows = 0U;
+    // Hold any incomplete contiguous region at most once per start row, even
+    // when its ready fragment is large. Route/sent gaps end a region; a complete
+    // region posts immediately. Never wait here: the owner may be its producer.
+    bool deferPartialRuns = false;
+    // After an empty full sweep, let one scheduler visit pass without flag DMA.
+    // Partial sweeps keep advancing; the final drain disables both policies.
+    bool backoffAfterEmptySweep = false;
 };
 
 // The caller has already acquired the paired source's metadata during Dispatch.
@@ -229,6 +233,10 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
     if (progress.sentRows == progress.expectedRows) {
         return false;
     }
+    if (budget.backoffAfterEmptySweep && progress.retryDeferred) {
+        progress.retryDeferred = false;
+        return false;
+    }
     const uint32_t pendingBefore = progress.expectedRows - progress.sentRows;
     AscendTimerCombineProgressScope timing(timer, AscendTimer::AIV_COMBINE_PROGRESS);
     timing.StartScan();
@@ -272,7 +280,7 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
         // 0=tensor end, 1=route/sent gap, 2=producer not ready, 3=scan budget.
         const uint32_t stopReason = cursor.row == rowCount ? 0U : (skippedHole ? (nextPending ? 2U : 1U) : 3U);
         bool defer = false;
-        if (runRows < budget.minRunRows && !alreadyDeferred) {
+        if (budget.deferPartialRuns && !alreadyDeferred) {
             const uint32_t previous = runStart == progress.firstRow ? progress.firstRow : runStart - 1U;
             const bool previousPending =
                 runStart != progress.firstRow &&
@@ -309,6 +317,7 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
         }
     }
     progress.nextRow = cursor.row;
+    progress.retryDeferred = budget.backoffAfterEmptySweep && posts == 0U && scanned == ownedRows;
     timing.Finish(pendingBefore, progress.expectedRows - progress.sentRows, posts, scanned);
     return posts != 0U;
 }

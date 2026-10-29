@@ -35,7 +35,7 @@ def gateway_readiness_binaries(tmp_path_factory):
 
 @pytest.mark.parametrize(
     "scenario",
-    ["distribution", "late-arrival", "epochs", "late-consumer", "telemetry", "guards"],
+    ["distribution", "late-arrival", "epochs", "no-local-consumers", "late-consumer", "telemetry", "guards"],
 )
 def test_gateway_readiness_protocol(gateway_readiness_binaries, scenario):
     result = subprocess.run(

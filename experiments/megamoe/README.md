@@ -591,13 +591,13 @@ A8W8 当前只运行路由专家，`num_shared_experts` 必须为0，不能传�
 每 rank 31×10=310个渠道；这项资源开销需要在目标设备验证。
 每个 owner 使用自己核内的256 B UB scratch，并独占其 QP 的 Put、CQ 回收及 quiet。
 
-Dispatch 打包核在已有 Top-k UB 数据上一次生成有效 token mask：至少一个有效专家位于对端主机
-才发送该 token，并且只发送一次。连续有效 token 合并成段；按8路 token 配额切分较长段，
-各路行数最多相差一行，多个可用 lane 之间优先选择已分配 Put 次数少的 lane。
-计划只含8个32位 mask，写入 GM 后由 `LocalRailPacked` 发布，各 sender 只读取自己的 mask。
-发送保持原 token 偏移，不增加压紧/解包步骤；空 lane 仍发送本轮 commit。
-H=3584、B=32、K=8 的 balanced 路由形成8段连续2-token，每 QP 一次7424 B payload Put，
-总 payload 59392 B；全本地路由不发送 payload。
+Dispatch 不再预处理有效 token mask 或发送计划。8个 payload owner 按
+`[B * lane / 8, B * (lane + 1) / 8)` 均分整个 batch，每个非空区间一次 Put，
+保留原 token 偏移，并发送全部行；空 lane 仍发送本轮 commit。
+量化后的全 AIV 同步已保证 payload 就绪，sender 无需等待路由打包完成。
+只有提交 commit 前才获取打包核发布的本轮 `Sequence`，保证 commit 源不是旧 epoch。
+H=3584、B=32、K=8 时每 QP 发送连续4个 token、14848 B，合计118784 B，
+包括全本地路由场景。打包核独立发送 metadata，不扫描远端有效 token 或生成分配计划。
 
 路由在 QP9 上通过独立 `NetMetaCommit` 放行。接收 leader 只获取路由 commit，发布 `MetaReady`
 并开始机内 Relay、路由及计数构造，不等待 payload。56个 AIV 中，打包核和8个 sender 不参与
@@ -605,18 +605,23 @@ Relay，其余47个核用连续逻辑编号划分专家。各 sender 在公共�
 `NetPayloadCommit[lane]`，不能把入站 payload 等待放回 Relay 或输入 barrier 之前。
 每个网络 commit 独占512 B缓存行，metadata、Dispatch 各 lane、Combine 各 lane 使用不同槽。
 
-跨机 payload 依赖仍由每个 source 的唯一 AIV1 检查者获取。它在有效 count 被前缀和覆盖前
-保存依赖 mask，先发布 count-ready，使 AIC/AIV0 能准备计算状态及权重；再直接检查本机 gateway
-上的8个 `NetPayloadCommit`。全部等于完整32位 sequence 后执行 `DataSyncBarrier<DDR>`，
-向本卡独立512 B槽发布该 source 的就绪 epoch。各检查者先完成自己的发布，再消费所需的
-本卡通知；AIV1 保留 scalar→MTE2 acquire，实际 token 搬运以及 GMM tile-ready 都在此之后。
-本卡16个通知槽继续由输入屏障前的 workspace reset 清零，不新增全核屏障。
+跨机 payload 在公共输入屏障之后汇总：每张 gateway 的 group0/AIV1 在本卡依次获取8个
+`NetPayloadCommit`，全部匹配本轮完整32位 sequence 后执行 `DataSyncBarrier<DDR>`，
+再发布独立512 B槽中的 `RelayPayloadReady`。即使本卡没有远端专家输入依赖，也必须发布
+这个汇总标记，供同主机其他卡使用；汇总发生在该核等待其他 gateway 之前，避免相互等待。
+
+每个 source 的唯一 AIV1 检查者只获取对应 gateway 的一个汇总标记，再向本卡独立512 B槽
+发布该 source 的就绪 epoch。依赖 mask 在有效 count 被前缀和覆盖前保存；count-ready 先于
+payload 检查发布，使 AIC/AIV0 能准备计算状态和权重。各检查者先完成自己的发布，再消费
+所需的本卡通知；AIV1 保留 scalar→MTE2 acquire，实际 token 搬运和 GMM tile-ready 在此之后。
+本卡16个通知槽仍由输入屏障前的 workspace reset 清零，不新增全核屏障；gateway 汇总槽
+使用 epoch 判定，不由消费者清零。路由 Relay 和输入屏障之前均不等待 payload。
 
 Combine 的8个 payload owner 各自负责连续 token 范围，BS32 时每人4个 token。
 每核只解析自己的 Top-k 范围，独立维护 pending、扫描游标和计数，只回传本机负责的有效专家行。
 这些 AIV1 保留 activation、dispatch 和本地 Combine 工作，在任务间隙做有预算的远端推进。
 前台任务未完成时每次最多2个 Put/64个槽；之后最多8个 Put并扫描自己的完整范围。
-连续就绪行仍按原合包规则发送；扫描及合包不跨 owner 边界。
+连续就绪行按下述有限延期规则合包；扫描及合包不跨 owner 边界。
 
 最终16-rank host barrier 关闭本机生产者及旧 Dispatch 读取，各 payload owner drain 自己的范围，
 在自己的 QP 上发布 `CombineCommit[lane]`，再等待同 lane 的入站 commit。空范围也执行这个协议。
@@ -632,15 +637,18 @@ HNS1825 使用同一 QP 上已确认的 SO 顺序合同：4 B commit 可跟在�
 
 扫描在单次调用内缓存当前 token 的 pending mask，通过递增槽位推进，避免逐行除模；
 连续发送段在 Put 返回后按 token 清除对应位。扫描仍逐槽计数，保留洞、游标绕回、
-预算截断和相邻行合并。少于4行且前后仍有待发行的短段，允许同一起点最多延后一次，
-继续扫描其他位置并返回计算；再次遇到该起点就允许发送，不等待邻行的生产者。
-没有相邻待发行的孤立段立即发送。最终 drain 关闭延后和预算限制，立即提交所有已就绪段。
-这些规则不以 timer 结果决定调度。完成当次扫描或达到 Put 预算后返回，
-后续调用在全部行已提交时直接返回。提交完成不代表传输完成，后者仍由后续 quiet 保证。
+预算截断和相邻行合并。只要就绪段前后仍有相邻待发行，即使该段已超过4行，
+同一起点也允许最多延后一次，继续扫描其他位置并返回计算；再次遇到该起点即允许发送。
+完整连续区间及没有相邻待发行的孤立段立即发送。一次完整 owner 扫描没有提交时，
+仅跳过下一次前台 progress 调用，减少紧邻的重复 DMA 探测；部分扫描不触发此退避。
+最终 drain 关闭延期、退避和预算限制，立即提交所有已就绪段。
+这些规则不以 timer 结果决定调度，也不在计算期间阻塞等待生产者。后续调用在全部行已提交时
+直接返回。提交完成不代表传输完成，后者仍由后续 quiet 保证。
 
-HNS1825 每轮显式 quiet 从4次减为1次，包含在 kernel 总计时内；不能将 quiet 的耗时简单乘以
-删除次数当作端到端收益。SDK 的队列回压回收仍保留，每个 WQE 继续产生 CQE。
-每轮 WQE 数最多为 `B * topK + 4`，是否触发内部回收取决于实际 SQ/CQ 深度和预留空间。
+HNS1825 每个 QP owner 仅在尾部显式 quiet 一次，8路 payload 与1路 metadata 并行收尾，
+包含在 kernel 总计时内；不能把跨核 quiet 累计时间当作串行时延。SDK 的队列回压回收仍保留，
+实际 SQ/CQ 工作量取决于数据分片和提交次数。
+
 网络 commit、Dispatch 本地就绪、host 握手及最终 Combine 行等待加入60秒停滞超时诊断；只有 QP owner
 能在等待期间稀疏检查已 ready 的 CQE，不等待尚未完成的 CQE，不允许接收 leader 并发消费 CQ。
 正常短等待不增加 CQ DMA，最终 quiet 负责统一完成检查和队列回收。硬件 `SyncAll` 本身没有新增
@@ -656,8 +664,8 @@ ready 探测通过一次跨步 DMA，将最多8个512 B flag 槽的首32 B收集
 静态全待发场景下64行由8次 DMA读取，逻辑扫描计数仍为64；这不是设备耗时的八倍加速承诺。
 
 Combine 路由首次初始化使用 owner 专用256 B UB 分块 DMA 读取已接收的 rail 元数据；
-BS32、K8 时为5次256 B DMA，跳过每个512 B packet 的末尾 marker。
-该初始化优化也适用于 A8W8，其 Combine 使用最多8个 Put、一次完整扫描和相同的短段合并规则。
+每个 owner 只加载自己连续 token 区间所覆盖的256 B块，跳过512 B packet 的末尾 marker。
+该初始化优化也适用于 A8W8，其 Combine 使用最多8个 Put、一次完整扫描和相同的有限延期和无进展退避规则。
 更新后两台均需重新构建安装 timer OFF 版本；按上述 BS32 流程先执行 `run` 校验精度，
 再执行一次 `perf`（默认20次 warmup、100次采样，统计后50次），将两个指标与前一版本比较。
 本轮 ready 批量探测的比较基线为 owner 搬运卸载版本的241.830/281.499 μs

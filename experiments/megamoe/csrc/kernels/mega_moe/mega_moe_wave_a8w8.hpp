@@ -101,7 +101,7 @@ private:
             if (UseHierarchicalRoce(params_.tilingData) && IsHierarchicalPayloadOwner(aivJob_.jobIndex)) {
                 return TryProgressHierarchicalCombine(
                     commonConfig_, params_, hierarchicalCombine_, HierarchicalRoceScratch(params_), nullptr,
-                    {8U, HIERARCHICAL_MAX_TOKENS * commonConfig_.topK, 4U}, aivJob_.jobIndex / 2U);
+                    {8U, HIERARCHICAL_MAX_TOKENS * commonConfig_.topK, true, true}, aivJob_.jobIndex / 2U);
             }
         }
         return false;

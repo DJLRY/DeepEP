@@ -64,8 +64,8 @@ def input_records(bs, seed):
 
 
 def hierarchical_dispatch(ids, records):
-    """Stage only tokens with a remote consumer, retaining original offsets."""
-    transfer_keys = {(key[0], key[1], host(owner)) for key, owner, _ in routes(ids) if host(owner) != host(key[0])}
+    """Stage the whole batch on each paired gateway, retaining original offsets."""
+    transfer_keys = {(source, token, 1 - host(source)) for source, token in records}
     relayed = {(pair(source), token): records[source, token] for source, token, _ in transfer_keys}
     consumers = {}
     for key, owner, expert in routes(ids):
@@ -175,21 +175,16 @@ def test_hierarchical_messages_match_direct_routing(bs, topk, pattern):
     transfers, consumers = hierarchical_dispatch(ids, records)
     direct = {(owner, expert, key): records[key[:2]] for key, owner, expert in routes(ids)}
     assert consumers == direct
-    expected_tokens = {
-        (source, token, 1 - host(source))
-        for source in range(WORLD)
-        for token in range(bs)
-        if any(host(int(expert) // EXPERTS_PER_RANK) != host(source) for expert in ids[source, token])
-    }
+    expected_tokens = {(source, token, 1 - host(source)) for source in range(WORLD) for token in range(bs)}
     assert transfers == expected_tokens
-    assert len(transfers) <= WORLD * bs
-    # Filtering must not change the expert invocations.
+    assert len(transfers) == WORLD * bs
+    # Sending unused rows must not create extra expert invocations.
     remote_consumers = {key for key in consumers if host(key[0]) != host(key[2][0])}
     assert remote_consumers == {
         (owner, expert, key) for key, owner, expert in routes(ids) if host(owner) != host(key[0])
     }
     if pattern == "local":
-        assert not remote_consumers and not transfers
+        assert not remote_consumers
     if pattern == "duplicate-rank":
         assert len(transfers) == WORLD * bs
         assert all(len(set(token_ids // EXPERTS_PER_RANK)) == 1 for token_ids in ids.reshape(-1, topk))

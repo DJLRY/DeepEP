@@ -34,9 +34,10 @@ constexpr uint32_t kWorld = 32U;
 constexpr uint32_t kExperts = 3U;
 constexpr uint32_t kLineBytes = 512U;
 constexpr uint32_t kLineWords = kLineBytes / sizeof(int32_t);
-constexpr uint32_t kWindowBytes = 12288U;
+constexpr uint32_t kWindowBytes = 16384U;
 constexpr uint32_t kControlOffset = 4096U;
-constexpr uint32_t kReadyOffset = kControlOffset + 4U * kLineBytes;
+constexpr uint32_t kCommitOffset = kControlOffset + 4U * kLineBytes;
+constexpr uint32_t kReadyOffset = kControlOffset + 20U * kLineBytes;
 constexpr uint32_t kMaxGroups = 32U;
 constexpr uint32_t kSparse = 0x8429U;  // Sources 0, 3, 5, 10 and 15 of the other host.
 thread_local uint32_t currentGroup = 0U;
@@ -60,6 +61,10 @@ struct State {
     bool aborted = false;
     std::exception_ptr failure;
     uint64_t order = 0U;
+    uint32_t commitWaits = 0U;
+    std::array<uint64_t, 8U> commitObservedAt{};
+    uint64_t commitBarrierAt = 0U;
+    uint64_t aggregatePublishedAt = 0U;
     std::array<uint32_t, kSlots> remoteWaits{};
     std::array<uint32_t, kSlots> remoteBarriers{};
     std::array<uint32_t, kSlots> publications{};
@@ -85,6 +90,10 @@ struct State {
         const uint32_t gateway = (rank < kSlots ? 0U : kSlots) + slot;
         return windows[gateway].data() + kReadyOffset / sizeof(int32_t);
     }
+    int32_t* Commit(uint32_t lane)
+    {
+        return windows[rank].data() + kCommitOffset / sizeof(int32_t) + lane * kLineWords;
+    }
     bool Needed(uint32_t slot) const
     {
         return (needed & (uint32_t(1) << slot)) != 0U;
@@ -96,6 +105,7 @@ struct Address {
     bool local;
     uint32_t slot;
     uint32_t qpLane = 0U;
+    bool commit = false;
 };
 
 // Bounds/line checks do not emulate the production work distribution.
@@ -111,11 +121,13 @@ inline Address Decode(const int32_t* pointer)
     for (uint32_t rank = 0U; rank < kWorld; ++rank) {
         const auto begin = reinterpret_cast<uintptr_t>(s.windows[rank].data());
         if (address >= begin && address < begin + kWindowBytes) {
-            Check(address >= begin + kReadyOffset && address < begin + kReadyOffset + 8U * kLineBytes &&
-                      (address - begin - kReadyOffset) % kLineBytes == 0U,
-                  "wrong payload commit offset");
             Check(rank / kSlots == s.rank / kSlots, "gateway read addressed the source host");
-            return {false, rank % kSlots, static_cast<uint32_t>((address - begin - kReadyOffset) / kLineBytes)};
+            if (address == begin + kReadyOffset) return {false, rank % kSlots};
+            Check(rank == s.rank && address >= begin + kCommitOffset &&
+                      address < begin + kCommitOffset + 8U * kLineBytes &&
+                      (address - begin - kCommitOffset) % kLineBytes == 0U,
+                  "payload commits must be acquired only on the gateway's own card");
+            return {false, rank % kSlots, static_cast<uint32_t>((address - begin - kCommitOffset) / kLineBytes), true};
         }
     }
     throw std::runtime_error("flag access exceeded the declared workspace/window ranges");
@@ -126,14 +138,18 @@ inline void WaitFlag(int32_t* pointer, int32_t expected)
     auto& s = *state;
     std::unique_lock<std::mutex> lock(s.mutex);
     const auto address = Decode(pointer);
-    Check(currentGroup < s.groups && s.Needed(address.slot), "wait accessed an unused source or invalid group");
+    Check(currentGroup < s.groups && (address.commit || s.Needed(address.slot)),
+          "wait accessed an unused source or invalid group");
     Check(expected == s.sequence, "wait did not compare the complete invocation epoch");
     if (address.local) {
         ++s.localWaits[currentGroup];
+    } else if (address.commit) {
+        Check(currentGroup == 0U, "more than one local aggregator joined payload commits");
+        Check(++s.commitWaits == address.qpLane + 1U, "duplicate or skipped local QP acquire");
     } else {
         Check(currentGroup == address.slot % s.groups, "gateway had a duplicate or incorrect checker");
         ++s.remoteWaits[address.slot];
-        Check(s.remoteWaits[address.slot] == address.qpLane + 1U, "duplicate or skipped QP acquire");
+        Check(s.remoteWaits[address.slot] == 1U, "duplicate aggregate acquire");
     }
     s.changed.notify_all();
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
@@ -146,6 +162,8 @@ inline void WaitFlag(int32_t* pointer, int32_t expected)
     if (address.local) {
         Check(s.publishedAt[address.slot] != 0U, "consumer accepted a stale/unpublished local epoch");
         s.localObservedAt[currentGroup][address.slot] = ++s.order;
+    } else if (address.commit) {
+        s.commitObservedAt[address.qpLane] = ++s.order;
     } else {
         s.remoteObservedAt[currentGroup][address.slot] = ++s.order;
         s.lastRemoteSlot[currentGroup] = address.slot;
@@ -157,6 +175,13 @@ inline void RemoteAcquire()
     auto& s = *state;
     std::lock_guard<std::mutex> lock(s.mutex);
     const uint32_t slot = s.lastRemoteSlot[currentGroup];
+    if (slot == kSlots) {
+        Check(currentGroup == 0U && s.commitWaits == 8U && s.commitBarrierAt == 0U,
+              "invalid local aggregate DDR ordering");
+        for (auto observed : s.commitObservedAt) Check(observed != 0U, "aggregate omitted an independent QP");
+        s.commitBarrierAt = ++s.order;
+        return;
+    }
     Check(slot < kSlots && s.remoteObservedAt[currentGroup][slot] != 0U,
           "DDR ordering preceded a successful gateway epoch observation");
     Check(++s.remoteBarriers[slot] == 1U, "DDR ordering repeated without another gateway dependency");
@@ -168,6 +193,17 @@ inline void Publish(int32_t* pointer, int32_t value)
     auto& s = *state;
     std::lock_guard<std::mutex> lock(s.mutex);
     const auto address = Decode(pointer);
+    if (!address.local) {
+        Check(!address.commit && address.slot == s.rank % kSlots && currentGroup == 0U,
+              "aggregate publisher wrote another gateway or a network commit");
+        Check(value == s.sequence && s.aggregatePublishedAt == 0U, "aggregate epoch was cleared or duplicated");
+        Check(s.commitBarrierAt > s.commitObservedAt[7U] && s.commitObservedAt[7U] != 0U,
+              "aggregate publication preceded acquisition of all eight commits");
+        *pointer = value;
+        s.aggregatePublishedAt = ++s.order;
+        s.changed.notify_all();
+        return;
+    }
     Check(address.local && s.Needed(address.slot), "helper wrote a remote or unused flag");
     Check(value == s.sequence, "helper cleared or truncated a notification epoch");
     Check(currentGroup == address.slot % s.groups, "non-owner published a gateway notification");
@@ -242,7 +278,7 @@ namespace MegaMoeImpl {
 constexpr uint32_t HIERARCHICAL_RANKS_PER_HOST = 16U;
 constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
 constexpr uint32_t HIERARCHICAL_PAYLOAD_LANES = 8U;
-enum class HierarchicalSignal : uint32_t { NetPayloadCommit = 4U };
+enum class HierarchicalSignal : uint32_t { NetPayloadCommit = 4U, RelayPayloadReady = 20U };
 enum class HardEvent { S_MTE2 };
 struct MoeStageCommonConfig {
     uint32_t rankId = 0U;
@@ -380,6 +416,10 @@ struct Fixture {
         s.needed = needed;
         tiling.hierarchicalSequence = sequence;
         s.order = 0U;
+        s.commitWaits = 0U;
+        s.commitObservedAt = {};
+        s.commitBarrierAt = 0U;
+        s.aggregatePublishedAt = 0U;
         s.remoteWaits = {};
         s.remoteBarriers = {};
         s.publications = {};
@@ -403,14 +443,19 @@ struct Fixture {
     void PublishRemote(uint32_t slot)
     {
         std::lock_guard<std::mutex> lock(s.mutex);
-        Check(s.Needed(slot), "test publisher selected an unused gateway");
-        for (uint32_t lane = 0U; lane < 8U; ++lane) s.Remote(slot)[lane * kLineWords] = s.sequence;
+        Check(s.Needed(slot) || slot == s.rank % kSlots, "test publisher selected an unused gateway");
+        if (slot == s.rank % kSlots) {
+            for (uint32_t lane = 0U; lane < 8U; ++lane) *s.Commit(lane) = s.sequence;
+        } else {
+            // Other gateways execute the same aggregation independently.
+            *s.Remote(slot) = s.sequence;
+        }
         s.changed.notify_all();
     }
     void PublishAllExcept(uint32_t held = kSlots)
     {
         for (uint32_t slot = 0U; slot < kSlots; ++slot) {
-            if (s.Needed(slot) && slot != held) PublishRemote(slot);
+            if ((s.Needed(slot) || slot == s.rank % kSlots) && slot != held) PublishRemote(slot);
         }
     }
     void Start(uint32_t group)
@@ -461,13 +506,15 @@ struct Fixture {
         for (auto& worker : workers) worker.join();
         workers.clear();
         if (s.failure) std::rethrow_exception(s.failure);
+        Check(s.commitWaits == 8U && s.aggregatePublishedAt > s.commitBarrierAt && s.commitBarrierAt != 0U,
+              "gateway failed to publish its aggregate independently of local demand");
         for (uint32_t group = 0U; group < s.groups; ++group) {
             Check(s.finishedAt[group] > s.acquiredAt[group] && s.acquiredAt[group] != 0U,
                   "missing consumer completion/acquire");
         }
         for (uint32_t slot = 0U; slot < kSlots; ++slot) {
             const uint32_t expected = s.Needed(slot) ? 1U : 0U;
-            Check(s.remoteWaits[slot] == expected * 8U && s.remoteBarriers[slot] == expected &&
+            Check(s.remoteWaits[slot] == expected && s.remoteBarriers[slot] == expected &&
                       s.publications[slot] == expected,
                   "needed gateways did not each have exactly one checker/publication");
             Check(s.timerStarts[slot] == (timed ? expected : 0U) && s.timerEnds[slot] == (timed ? expected : 0U),
@@ -504,22 +551,23 @@ void Distribution()
 void LateArrival()
 {
     for (uint32_t groups : {1U, 8U, 28U, 32U}) {
-        Fixture f(23U, groups);
+        Fixture f(16U, groups);
         f.Begin(143U, kSparse);
         f.PublishAllExcept(0U);
         f.StartAll();
         {
             std::lock_guard<std::mutex> lock(f.s.mutex);
-            for (uint32_t lane = 0U; lane < 7U; ++lane) f.s.Remote(0U)[lane * kLineWords] = f.s.sequence;
+            for (uint32_t lane = 0U; lane < 7U; ++lane) *f.s.Commit(lane) = f.s.sequence;
             f.s.changed.notify_all();
         }
-        f.Await([&] { return f.s.remoteWaits[0] == 8U; });
+        f.Await([&] { return f.s.commitWaits == 8U; });
         {
             std::lock_guard<std::mutex> lock(f.s.mutex);
             for (uint32_t group = 0U; group < groups; ++group) {
                 Check(f.s.finishedAt[group] == 0U, "late gateway failed to hold every consumer");
             }
             Check(f.s.publications[0] == 0U, "late gateway was published before its payload");
+            Check(f.s.aggregatePublishedAt == 0U, "aggregate ignored the last QP's late commit");
         }
         f.PublishRemote(0U);
         f.JoinAndCheck();
@@ -539,7 +587,7 @@ void Epochs()
         f.Begin(0xffffffffU, kSparse);
         f.PublishAllExcept(15U);
         f.StartAll();
-        f.Await([&] { return f.s.remoteWaits[15] != 0U; });
+        f.Await([&] { return rank % kSlots == 15U ? f.s.commitWaits != 0U : f.s.remoteWaits[15] != 0U; });
         {
             std::lock_guard<std::mutex> lock(f.s.mutex);
             Check(f.s.publications[15] == 0U, "checker accepted an old nonzero remote epoch");
@@ -557,6 +605,22 @@ void Epochs()
         f.PublishRemote(3U);
         f.JoinAndCheck();
     }
+}
+
+void NoLocalConsumers()
+{
+    Fixture f(5U, 28U);
+    f.Begin(144U, 0U);
+    f.StartAll();
+    f.Await([&] { return f.s.commitWaits == 1U; });
+    {
+        std::lock_guard<std::mutex> lock(f.s.mutex);
+        Check(f.s.aggregatePublishedAt == 0U && *f.s.Remote(5U) == 0,
+              "zero local demand incorrectly released other ranks before payload arrival");
+    }
+    f.PublishRemote(5U);
+    f.JoinAndCheck();
+    Check(*f.s.Remote(5U) == f.s.sequence, "zero local demand suppressed the aggregate needed by other ranks");
 }
 
 void LateConsumer()
@@ -626,6 +690,8 @@ int main(int argc, char** argv)
             LateArrival();
         else if (scenario == "epochs")
             Epochs();
+        else if (scenario == "no-local-consumers")
+            NoLocalConsumers();
         else if (scenario == "late-consumer")
             LateConsumer();
         else if (scenario == "telemetry")
