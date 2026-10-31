@@ -37,13 +37,13 @@ template <typename T> T AlignUp(T v, T a) { return CeilDiv(v, a) * a; }
         + """
 int main() {
     for (auto topology : {TOPO_TYPE_MTE, TOPO_TYPE_MTE_ROCE})
-    for (uint32_t bs : {1U, 31U, 32U, 33U, 64U, 138U, 144U})
+    for (uint32_t bs : {1U, 31U, 32U, 33U, 64U, 138U, 144U, 255U, 256U})
     for (uint32_t topk : {1U, 6U, 8U, 32U}) {
         MegaMoeTilingData t{};
         t.topoType = topology; t.bs = t.numMaxTokensPerRank = bs; t.topK = topk;
         t.groupedMatmulMode = GROUPED_MATMUL_MODE_A8W4;
         t.epWorldSize = 32; t.dispatchRanksPerNode = 16; t.blockAivNum = 56;
-        constexpr uint32_t fixed = 32768, ub = 192U * 1024U - 256U;
+        constexpr uint32_t fixed = 32768, ub = 192U * 1024U - HIERARCHICAL_ROCE_UB_BYTES;
         auto c = SendMaskConfig(t, fixed, 8U, ub);
         const uint32_t total = bs * topk;
         const uint32_t capacity = UseDecodeRailRouting(&t) ? RailItemsPerBatch(c) : c.routeItemsPerBatch;

@@ -2,6 +2,7 @@
 
 """Check persisted settings and build/run separation without CANN or devices."""
 
+import csv
 import importlib.util
 import json
 import os
@@ -428,6 +429,9 @@ def test_failed_trace_does_not_print_done_or_summary(saved, monkeypatch, capsys,
 @pytest.mark.parametrize(
     "arguments",
     [
+        ["run", "--extra-bs"],
+        ["trace", "--extra-bs"],
+        ["build", "--extra-bs"],
         ["perf", "--timer"],
         ["perf", "--include-wait"],
         ["build", "--hide-wait"],
@@ -452,8 +456,9 @@ def test_invalid_performance_options_fail_before_launch(saved, monkeypatch, argu
         launcher.main([*arguments, "--config", str(path)])
 
 
+@pytest.mark.parametrize("max_bs,limit", [(32, 32), (256, 32), (256, 144), (256, 256)])
 @pytest.mark.parametrize("requested,compiled", [(False, False), (False, True), (True, False), (True, True)])
-def test_preflight_checks_installed_timer_support(saved, tmp_path, monkeypatch, requested, compiled):
+def test_preflight_checks_installed_timer_support(saved, tmp_path, monkeypatch, requested, compiled, max_bs, limit):
     _, config = saved
     checkout = tmp_path / "checkout"
     library = checkout / "third-party/shmem/install/shmem/lib/libshmem.so"
@@ -484,6 +489,7 @@ def test_preflight_checks_installed_timer_support(saved, tmp_path, monkeypatch, 
     modules["deep_ep"].__file__ = str(installed / "__init__.py")
     modules["deep_ep._native"].require_native = lambda operation: None
     modules["deep_ep_experimental.megamoe._C"].timer_enabled = compiled
+    modules["deep_ep_experimental.megamoe._C"].hierarchical_max_tokens = limit
 
     def execute(command, env):
         monkeypatch.setattr(sys, "argv", ["-c", *command[4:]])
@@ -493,6 +499,92 @@ def test_preflight_checks_installed_timer_support(saved, tmp_path, monkeypatch, 
     env = dict(DEEPEP_MEGAMOE_TIMER="ON" if requested else "OFF")
     if requested and not compiled:
         with pytest.raises(RuntimeError, match="build --timer"):
-            launcher.preflight(config, env)
+            launcher.preflight(config, env, max_bs=max_bs)
+    elif max_bs > limit:
+        with pytest.raises(RuntimeError, match="run run_bs32.sh build"):
+            launcher.preflight(config, env, max_bs=max_bs)
     else:
-        launcher.preflight(config, env)
+        launcher.preflight(config, env, max_bs=max_bs)
+
+
+@pytest.mark.parametrize("node", [0, 1])
+@pytest.mark.parametrize("method", ["legacy", "shmem"])
+def test_extra_batches_keep_independent_capacity_and_aggregate_reports(saved, monkeypatch, node, method):
+    path, config = saved
+    config["node_rank"] = node
+    launcher.save_config(path, config)
+    before = path.read_bytes()
+    monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(launcher, "environment", lambda _: {})
+    probes, outputs, batches = [], [], []
+    monkeypatch.setattr(launcher, "preflight", lambda *a, **kw: probes.append(kw))
+
+    def execute(command, env, log):
+        assert "torch.distributed.run" in command
+        assert "--timer" not in command and env["DEEPEP_MEGAMOE_TIMER"] == "OFF"
+        for option, value in (
+            ("--mode", "perf"),
+            ("--perf-method", method),
+            ("--node-rank", str(node)),
+            ("--input", "fp8"),
+            ("--routing", "balanced"),
+        ):
+            assert command[command.index(option) + 1] == value
+        case_path = Path(command[command.index("--config") + 1])
+        case = json.loads(case_path.read_text())
+        assert len(case["bs_values"]) == 1  # benchmark allocates max(bs_values)
+        bs = case["bs_values"][0]
+        assert case == dict(launcher.CASE, bs_values=[bs], warmup=3, iters=8)
+        output = Path(command[command.index("--output-dir") + 1])
+        assert output == case_path.parent and output.name == f"bs_{bs}"
+        assert log == output / "console.log"
+        outputs.append(output)
+        batches.append(bs)
+        report_dir = output / f"rank_{node * 16}" / f"bs_{bs}"
+        report_dir.mkdir(parents=True)
+        (report_dir / "profiling.json").write_text(
+            json.dumps(
+                dict(perf_method=method, rounds=4, recorded_rounds=8, mean_us=bs * 1.5, rank_max_mean_us=bs * 2.5)
+            )
+        )
+
+    monkeypatch.setattr(launcher, "execute", execute)
+    launcher.main(
+        ["perf", "--extra-bs", "--config", str(path), "--warmup", "3", "--iters", "8", "--perf-method", method]
+    )
+    assert probes == [{"max_bs": 256}]
+    assert batches == [32, 1, 4, 8, 16, 256]
+    assert len(set(outputs)) == 6 and len({p.parent for p in outputs}) == 1
+    root = outputs[0].parent
+    assert json.loads((root / "case.json").read_text())["bs_values"] == batches
+    run = json.loads((root / "run.json").read_text())
+    assert run["extra_bs"] and run["bs_values"] == batches
+    rows = list(csv.DictReader((root / "summary.csv").read_text().splitlines()))
+    assert [int(row["bs"]) for row in rows] == batches
+    for row, bs in zip(rows, batches):
+        assert float(row["rank_max_mean_us"]) == bs * 2.5
+        assert row["perf_method"] == method and row["rounds"] == "4"
+        assert f"EP32 BS{bs};" in (root / "summary.txt").read_text()
+    assert path.read_bytes() == before and launcher.CASE["bs_values"] == [32]
+
+
+def test_extra_batches_stop_on_failure_without_success_summary(saved, monkeypatch, capsys):
+    _, config = saved
+    monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(launcher, "environment", lambda _: {})
+    monkeypatch.setattr(launcher, "preflight", lambda *a, **kw: None)
+    batches, outputs = [], []
+
+    def execute(command, env, log):
+        case = json.loads(Path(command[command.index("--config") + 1]).read_text())
+        batches.extend(case["bs_values"])
+        outputs.append(Path(command[command.index("--output-dir") + 1]))
+        if batches[-1] == 4:
+            raise subprocess.CalledProcessError(7, command)
+
+    monkeypatch.setattr(launcher, "execute", execute)
+    with pytest.raises(subprocess.CalledProcessError):
+        launcher.dispatch("perf", config, extra_bs=True)
+    assert batches == [32, 1, 4]
+    assert not (outputs[0].parent / "summary.txt").exists()
+    assert "[DONE]" not in capsys.readouterr().out

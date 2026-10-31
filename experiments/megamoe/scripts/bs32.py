@@ -4,6 +4,7 @@
 
 import argparse
 from collections import deque
+import csv
 import ipaddress
 import json
 import os
@@ -27,6 +28,8 @@ CASE = {
     "iters": 1,
     "seed": 20260922,
 }
+EXTRA_PERF_BATCHES = (1, 4, 8, 16, 256)
+
 FIELDS = (
     "node_rank",
     "master_addr",
@@ -230,7 +233,7 @@ def execute(command, env, log=None, cwd="/tmp", *, errors_only=False):
         raise subprocess.CalledProcessError(code, command)
 
 
-def preflight(config, env):
+def preflight(config, env, *, max_bs=32):
     library = ROOT / "third-party/shmem/install/shmem/lib/libshmem.so"
     if not library.is_file():
         raise RuntimeError(f"Missing {library}; run 'bash experiments/megamoe/scripts/run_bs32.sh build' first")
@@ -248,11 +251,25 @@ if not info['megamoe']['enabled'] or info['shmem']['rdma_backend'] != sys.argv[2
     raise RuntimeError('Installed wheel does not match MegaMoE/RoCE configuration; run build first')
 if sys.argv[3] == 'ON' and not megamoe.timer_enabled:
     raise RuntimeError('Trace requires a timer-enabled wheel; run run_bs32.sh build --timer on both hosts first')
+if int(sys.argv[4]) > getattr(megamoe, 'hierarchical_max_tokens', 32):
+    raise RuntimeError('Installed wheel does not support requested BS; run run_bs32.sh build on both hosts first')
 if torch.npu.device_count() != 16:
     raise RuntimeError('BS32 requires sixteen visible NPUs on each host')
 print('[CHECK] Python:', sys.executable, 'deep_ep:', deep_ep.__file__, flush=True)
 """
-    execute([config["python"], "-I", "-c", code, str(ROOT), config["rdma_backend"], env["DEEPEP_MEGAMOE_TIMER"]], env)
+    execute(
+        [
+            config["python"],
+            "-I",
+            "-c",
+            code,
+            str(ROOT),
+            config["rdma_backend"],
+            env["DEEPEP_MEGAMOE_TIMER"],
+            str(max_bs),
+        ],
+        env,
+    )
 
 
 def test_commands(config, run_dir, *, mode="accuracy", timer_ranks=None, perf_method="legacy"):
@@ -335,24 +352,41 @@ def parse_timer_ranks(value):
     return sorted(ranks)
 
 
-def performance_summary(config, run_dir):
-    # Every rank's profiling.json contains the same all-EP statistics. Read a
-    # local rank so separate node output disks work without copying reports.
+def performance_summary(config, run_dir, bs_values=(32,)):
+    # All-rank statistics are replicated on every rank; each host reads its own disk.
     rank = config["node_rank"] * 16
-    path = run_dir / f"rank_{rank}" / "bs_32" / "profiling.json"
-    report = json.loads(path.read_text(encoding="utf-8"))
-    lines = [
-        "[PERF SUMMARY] EP32 BS32; FP8 input / FP4 weights; balanced routing",
-        f"Performance method: {report.get('perf_method', 'legacy')}",
-        f"All-rank kernel Duration; {report['rounds']}/{report['recorded_rounds']} rounds (tail half)",
-        f"Mean of per-round minimum rank: {report['mean_us']:.3f} us",
-        f"Mean of per-round maximum rank: {report['rank_max_mean_us']:.3f} us",
-        "These are rank-local kernel durations, not a cross-device timestamp span or Python wall time.",
-        f"All-rank statistics: {path}",
-        f"Local raw samples/profiler: {run_dir}/rank_<rank>/bs_32/",
-    ]
-    summary = "\n".join(lines) + "\n"
+    summaries, rows = [], []
+    for bs in bs_values:
+        case_dir = run_dir / f"bs_{bs}" if len(bs_values) > 1 else run_dir
+        path = case_dir / f"rank_{rank}" / f"bs_{bs}" / "profiling.json"
+        report = json.loads(path.read_text(encoding="utf-8"))
+        lines = [
+            f"[PERF SUMMARY] EP32 BS{bs}; FP8 input / FP4 weights; balanced routing",
+            f"Performance method: {report.get('perf_method', 'legacy')}",
+            f"All-rank kernel Duration; {report['rounds']}/{report['recorded_rounds']} rounds (tail half)",
+            f"Mean of per-round minimum rank: {report['mean_us']:.3f} us",
+            f"Mean of per-round maximum rank: {report['rank_max_mean_us']:.3f} us",
+            "These are rank-local kernel durations, not a cross-device timestamp span or Python wall time.",
+            f"All-rank statistics: {path}",
+            f"Local raw samples/profiler: {case_dir}/rank_<rank>/bs_{bs}/",
+        ]
+        summaries.append("\n".join(lines) + "\n")
+        rows.append(
+            dict(
+                bs=bs,
+                perf_method=report.get("perf_method", "legacy"),
+                rounds=report["rounds"],
+                recorded_rounds=report["recorded_rounds"],
+                mean_us=report["mean_us"],
+                rank_max_mean_us=report["rank_max_mean_us"],
+            )
+        )
+    summary = "\n".join(summaries)
     (run_dir / "summary.txt").write_text(summary, encoding="utf-8")
+    with (run_dir / "summary.csv").open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
     print(summary, end="", flush=True)
 
 
@@ -386,7 +420,10 @@ def dispatch(
     timer_ranks=None,
     include_wait=False,
     perf_method="legacy",
+    extra_bs=False,
 ):
+    if extra_bs and action != "perf":
+        raise ValueError("--extra-bs requires perf")
     if platform.system() != "Linux":
         raise RuntimeError("Build/run require Linux; configure/show-config can run without devices")
     env = environment(config)
@@ -409,13 +446,18 @@ def dispatch(
             raise
         print(f"[DONE] Build/install completed; full log: {log}", flush=True)
         return
-    preflight(config, env)
+    if extra_bs:
+        preflight(config, env, max_bs=max(EXTRA_PERF_BATCHES))
+    else:
+        preflight(config, env)
     directory = Path(config["case_dir"])
     directory.mkdir(parents=True, exist_ok=True)
     sampling = action in ("perf", "trace")
     prefix = f"{action}_node_" if sampling else "node_"
     run_dir = Path(tempfile.mkdtemp(prefix=f"{prefix}{config['node_rank']}_", dir=directory))
     case = dict(CASE)
+    if extra_bs:
+        case["bs_values"] = [32, *EXTRA_PERF_BATCHES]
     if sampling:
         default_warmup, default_iters = (2, 1) if action == "trace" else (20, 100)
         case.update(
@@ -434,6 +476,8 @@ def dispatch(
                 iters=case["iters"],
                 include_wait=include_wait,
                 perf_method=perf_method,
+                extra_bs=extra_bs,
+                bs_values=case["bs_values"],
             ),
             indent=2,
         )
@@ -441,6 +485,20 @@ def dispatch(
         encoding="utf-8",
     )
     print(f"[RUN] node={config['node_rank']} master={config['master_addr']} output={run_dir}", flush=True)
+    if action == "perf":
+        # Each BS gets its own process group and exact-size symmetric buffer.
+        # Adding BS256 must not change BS32's capacity, layout or reset work.
+        for bs in case["bs_values"]:
+            case_dir = run_dir / f"bs_{bs}" if extra_bs else run_dir
+            case_dir.mkdir(exist_ok=True)
+            single_case = dict(case, bs_values=[bs])
+            (case_dir / "case.json").write_text(json.dumps(single_case, indent=2) + "\n", encoding="utf-8")
+            _, benchmark = test_commands(config, case_dir, mode="perf", perf_method=perf_method)
+            print(f"[PERF] EP32 BS={bs} output={case_dir}", flush=True)
+            execute(benchmark, env, case_dir / "console.log")
+        performance_summary(config, run_dir, case["bs_values"])
+        print(f"[DONE] {action}: {run_dir}", flush=True)
+        return
     golden, benchmark = test_commands(
         config, run_dir, mode=action if sampling else "accuracy", timer_ranks=selected, perf_method=perf_method
     )
@@ -465,9 +523,7 @@ def dispatch(
             env,
             run_dir / "parse_timer.log",
         )
-    if action == "perf":
-        performance_summary(config, run_dir)
-    elif action == "trace":
+    if action == "trace":
         trace_summary(run_dir, case, local_ranks)
     print(f"[DONE] {action}: {run_dir}", flush=True)
 
@@ -488,6 +544,11 @@ def main(argv=None):
         "--errors-only",
         action="store_true",
         help="build only: show errors with nearby context; retain all output in build.log",
+    )
+    parser.add_argument(
+        "--extra-bs",
+        action="store_true",
+        help="perf only: after BS32, also measure BS1,4,8,16,256 with identical performance options",
     )
     parser.add_argument("--timer", action="store_true", help="build only: enable device timer support for trace")
     waits = parser.add_mutually_exclusive_group()
@@ -532,6 +593,8 @@ def main(argv=None):
         parser.error("--rebuild-shmem requires build")
     if args.errors_only and args.action != "build":
         parser.error("--errors-only requires build")
+    if args.extra_bs and args.action != "perf":
+        parser.error("--extra-bs requires perf")
     if args.timer and args.action != "build":
         parser.error("--timer requires build; use the trace action for collection")
     if args.timer_ranks is not None and args.action != "trace":
@@ -560,6 +623,8 @@ def main(argv=None):
         print(json.dumps(config, indent=2, ensure_ascii=False))
         return
     options = dict(rebuild_shmem=args.rebuild_shmem, errors_only=args.errors_only)
+    if args.extra_bs:
+        options["extra_bs"] = True
     if args.timer:
         options["timer"] = True
     if args.action in ("perf", "trace"):

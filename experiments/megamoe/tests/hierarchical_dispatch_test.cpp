@@ -394,6 +394,8 @@ int main()
                     CheckDispatch(rank, shape[0], shape[1], 3584U, 8U, pattern);
                 }
             }
+            CheckDispatch(rank, 256U, 256U, 3584U, 8U, "mixed");
+            CheckDispatch(rank, 256U, 256U, 1024U, 32U, "last");
             CheckDispatch(rank, 31U, 64U, 1024U, 1U, "last");
             CheckDispatch(rank, 32U, 32U, 8192U, 32U, "remote");
             CheckDispatch(rank, 1U, 64U, 3584U, 32U, "local");

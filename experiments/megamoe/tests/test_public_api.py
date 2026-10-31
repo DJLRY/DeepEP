@@ -171,7 +171,7 @@ def backend(monkeypatch):
         timer_enabled=True,
         timer_numel=64,
         small_batch_max_tokens=256,
-        hierarchical_max_tokens=144,
+        hierarchical_max_tokens=256,
     )
     monkeypatch.setattr(api, "_extension", lambda: ext)
     buffer = api.SymmBuffer(Group(), 4, 17, 2, 1024, 256)
@@ -480,7 +480,7 @@ def hierarchical_buffer(backend, *, size=32, mma_type="fp8xfp4"):
 
     group = StoreGroup(None, 0, size, prefix="hierarchical-api-test")
     group.all_gather = lambda value, stage: [value] * size
-    buffer = api.SymmBuffer(group, size * 2, 145, 2, 1024, 256, ranks_per_node=16, mma_type=mma_type)
+    buffer = api.SymmBuffer(group, size * 2, 257, 2, 1024, 256, ranks_per_node=16, mma_type=mma_type)
     buffer.topk_idx.data[:] = [0, size]
     buffer.topk_weights.data[:] = [0.4, 0.6]
     return buffer
@@ -493,7 +493,7 @@ def test_hierarchical_sequence_survives_plan_recreation_and_old_epoch_wrap(backe
     pairs = weights() if mma_type == "fp8xfp4" else fp8_weights()
     try:
         for sequence in range(1, 260):
-            bs = (1, 31, 32, 33, 138, 144)[sequence % 6]
+            bs = (1, 31, 32, 33, 138, 144, 255, 256)[sequence % 8]
             api.mega_moe(
                 (b.x[:bs], b.x_sf[:bs]),
                 b.topk_idx[:bs],
@@ -505,8 +505,8 @@ def test_hierarchical_sequence_survives_plan_recreation_and_old_epoch_wrap(backe
             launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
             assert launch[-2] == sequence and b._sequence == sequence
             assert b._plan_bs == bs
-        with pytest.raises(ValueError, match=r"BS in \[1,144\]"):
-            b.prepare(145)
+        with pytest.raises(ValueError, match=r"BS in \[1,256\]"):
+            b.prepare(257)
         assert b._sequence == 259
     finally:
         b.destroy()

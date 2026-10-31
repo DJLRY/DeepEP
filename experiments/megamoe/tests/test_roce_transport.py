@@ -28,6 +28,7 @@ def test_hierarchical_dispatch_full_batch_and_completion_contract(tmp_path, back
         backend,
         "hierarchical_dispatch_test.cpp",
         stub_directories=("dispatch_stubs", "roce_stubs", "layout_stubs"),
+        run_timeout=30,  # BS256 also compares the full production heap and untouched regions.
     )
 
 
@@ -52,7 +53,7 @@ def test_startup_detail_timer_preserves_spans_and_does_not_add_barriers(tmp_path
     compile_and_run(tmp_path, None, "startup_detail_timer_test.cpp", timer)
 
 
-def compile_and_run(tmp_path, backend, source_name, timer=False, stub_directories=("roce_stubs",)):
+def compile_and_run(tmp_path, backend, source_name, timer=False, stub_directories=("roce_stubs",), run_timeout=10):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         pytest.skip("Transport helper compilation requires g++ or clang++")
@@ -67,5 +68,5 @@ def compile_and_run(tmp_path, backend, source_name, timer=False, stub_directorie
     command += [str(source), "-o", str(binary)]
     result = subprocess.run(command, capture_output=True, text=True, timeout=60)
     assert result.returncode == 0, result.stderr
-    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+    result = subprocess.run([str(binary)], capture_output=True, text=True, timeout=run_timeout)
     assert result.returncode == 0, result.stderr

@@ -74,7 +74,7 @@ buffer = SymmBuffer(
 
 约束：EP=2～128，E 可整除 EP 且每卡最多 128 个路由专家；S=0～8；B=1～65536；
 H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(32,E)。
-下面的 16 卡跨机路径另限 EP32、W4A8（A8W4）或 A8W8 和实际 B=1～144。
+下面的 16 卡跨机路径另限 EP32、W4A8（A8W4）或 A8W8 和实际 B=1～256。
 各 rank 必须同序、同 B 调用；仅推理，不支持反向、空/不等长 B 或图捕获。
 `mma_type="fp8xfp8"` 使用 A8W8 路由专家，不支持共享专家/timer；**下文 benchmark 固定测试 W4A8，不提供权重 dtype 开关**。
 
@@ -217,10 +217,20 @@ bash experiments/megamoe/scripts/run_bs32.sh perf --perf-method legacy
 bash experiments/megamoe/scripts/run_bs32.sh perf --perf-method shmem
 # 可选：两台使用相同的预热、采样次数。
 bash experiments/megamoe/scripts/run_bs32.sh perf --warmup 20 --iters 100
+# 可选：在 BS32 后追加 BS1、4、8、16、256。两台必须同时使用此开关。
+bash experiments/megamoe/scripts/run_bs32.sh perf --extra-bs --warmup 20 --iters 100
 ```
 
 `perf` 不生成或读取 Golden，不重新编译。默认预热20轮、采集100轮，并统计后50轮；
 模型、BS32、FP8输入、FP4权重、balanced路由均与精度用例一致。
+`--extra-bs` 仅用于 `perf`，默认关闭；开启后按 BS32、1、4、8、16、256 的顺序逐项测试。
+各项沿用相同模型、seed、路由、`--perf-method`、`--warmup` 和 `--iters`，每项独立启动进程组，
+按本项 BS 分配对称窗口，避免 BS256 改变原 BS32 的容量和内存布局。
+追加模式下，每项日志和原始结果保存在运行目录的 `bs_<BS>/` 子目录，根目录的
+`summary.txt` / `summary.csv` 汇总全部六项的 rank-min-mean 和 rank-max-mean；任一项失败即停止。
+两端必须使用相同开关、性能参数和支持 BS256 的新 wheel；首次使用需两端重新执行 `build`
+（无需为此增加 `--rebuild-shmem`）。启动前检查已安装 wheel 的 BS 上限，旧 wheel 会提示重建。
+BS256 的本地协议及容量回归不替代 NPU 精度和性能验证。
 `--perf-method legacy` 保留连续批次方法：整批开始前通过 TCPStore 会合，排入一次 Exp 前置计算，
 随后连续下发 MegaMoE。`alignment.repeats` 默认从800回退为20，复用约12 GB显存/卡；
 轮间不插入同步或额外计算。`iteration_sync=none`，`alignment_scope=once_before_batch`。
@@ -586,7 +596,7 @@ python3 experiments/megamoe/scripts/trace_text.py restore part1.txt part2.txt \
 `ranks_per_node=0` 保留原有默认行为，不自动检测16卡平台。两机路径要求一台机器对应 rank 0～15、
 另一台对应 rank 16～31，gateway 配对为 `0↔16`、`1↔17`、…、`15↔31`。
 初始化会集体验证 Linux 主机身份、设备唯一性、rank 分组、SDK 后端及库身份；不匹配即报错。
-两机路径支持 `mma_type="fp8xfp4"`（W4A8/A8W4）或 `"fp8xfp8"`（A8W8），实际每卡 B=1～144；
+两机路径支持 `mma_type="fp8xfp4"`（W4A8/A8W4）或 `"fp8xfp8"`（A8W8），实际每卡 B=1～256；
 FP8 和内部量化的 BF16 输入均沿用原接口，容量可大于实际 B。B>32 及更多16卡主机暂不支持。
 A8W8 当前只运行路由专家，`num_shared_experts` 必须为0，不能传入 timer。
 
@@ -599,7 +609,7 @@ AIV1 在 Dispatch 和 Combine 全程独占 QP1，包括 Put、quiet 和 commit�
 跨机输入 payload 在本卡全部 token/scale 准备完成后，按实际 B 一次 Put 到配对 gateway，
 不再扫描路由并拆成多个连续 token 段；B 小于预分配容量时只发送实际 B 行。
 接收区保留原 token 编号，专家仍按路由元数据读取，多传的行不会增加计算。
-该策略用于上述 B≤144 的 A8W4/A8W8 路径，包括没有远端路由的批次。
+该策略用于上述 B≤256 的 A8W4/A8W8 路径，包括没有远端路由的批次。
 两机路径保留每包127个路由项加1个标记的512 B布局，但标记改为完整32位 `hierarchicalSequence`，
 避免变长发送遗留的末包在短 epoch 回绕后被误认为本轮数据。公开接口要求所有 rank 的实际 B、Top-k
 一致，接收端据此定位实际末包，不读取容量末尾，也不再从标记解码长度。普通 MTE 路径仍使用

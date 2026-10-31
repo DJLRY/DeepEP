@@ -58,7 +58,7 @@ constexpr uint32_t HIERARCHICAL_RANKS_PER_HOST = 16U;
 constexpr uint32_t HIERARCHICAL_WORLD_SIZE = 32U;
 // Covers the DSV41 sweep (original BS 1..24, six tokens per sequence).
 // Per-token Combine state has one uint32 top-k mask, not one bit per token.
-constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 144U;
+constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 256U;
 constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
 // The QP backend uses the first 256B; startup consumers reuse this reservation
 // for a single strided snapshot of sixteen 32B flag heads (512B total).

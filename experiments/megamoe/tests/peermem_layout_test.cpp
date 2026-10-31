@@ -79,7 +79,7 @@ void check_hybrid(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch, u
     assert(CalcSendMaskExpertCapacity(&t, 46) >= 16 * t.moeExpertPerRank);
 
     // Switching actual BS must leave persistent regions at identical addresses.
-    for (uint32_t bs : {1U, 7U, 17U, 31U, 32U, 33U, 138U, 144U, 1U, 32U}) {
+    for (uint32_t bs : {1U, 7U, 17U, 31U, 32U, 33U, 138U, 144U, 255U, 256U, 1U, 32U}) {
         if (bs > capacity) continue;
         t.bs = bs;
         assert(UseDecodeRailRouting(&t));
@@ -199,7 +199,7 @@ int main(int argc, char** argv)
     const std::string_view selected(argv[1]);
     assert(selected == "a8w4" || selected == "a8w8");
     const uint8_t mode = selected == "a8w4" ? GROUPED_MATMUL_MODE_A8W4 : GROUPED_MATMUL_MODE_GENERAL;
-    assert(HIERARCHICAL_MAX_TOKENS == 144);
+    assert(HIERARCHICAL_MAX_TOKENS == 256);
     for (uint32_t capacity : {1U, 17U, 31U, 32U, 64U}) {
         for (uint32_t h : {1024U, 7168U, 8192U}) {
             for (uint32_t topk : {1U, 6U, 32U}) {
@@ -208,6 +208,8 @@ int main(int argc, char** argv)
         }
     }
     check_hybrid(4096, 1024, 1, true, mode);
+    check_hybrid(256, 3584, 8, false, mode);
+    check_hybrid(256, 1024, 32, true, mode);
     check_hybrid(144, 5120, 6, false, mode);
     check_hybrid(144, 1024, 32, true, mode);
     check_workspace_ready_region(mode);
