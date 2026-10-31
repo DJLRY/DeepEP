@@ -41,6 +41,7 @@ inline uint32_t relayCalls = 0U;
 inline uint32_t receiveLeaderJob = 0U;
 inline uint32_t progressCalls = 0U;
 inline std::function<void()> completePacking;
+inline std::function<void()> completeIncomingPayload;
 constexpr uint32_t kScratchOffset = 4096U;
 
 inline void Check(bool condition, const char* message)
@@ -139,6 +140,12 @@ inline int aclshmem_int32_test(int32_t* address, int comparison, int32_t value)
     }
     const auto offset = Offset(reinterpret_cast<uint8_t*>(address), sizeof(int32_t));
     Check(comparison == ACLSHMEM_CMP_EQ && static_cast<uint32_t>(value) == sequence, "incorrect invocation wait");
+    if (offset == payloadCommit && ReadWord(local, offset) != sequence && completeIncomingPayload) {
+        auto arrive = std::move(completeIncomingPayload);
+        completeIncomingPayload = nullptr;
+        arrive();
+        return 0;
+    }
     if (ReadWord(local, offset) != sequence) return 0;
     if (offset == payloadCommit) ++waits;
     if (offset == metadataMarker || offset == metaCommit) ++metadataWaits;
@@ -148,9 +155,11 @@ inline int aclshmem_int32_test(int32_t* address, int comparison, int32_t value)
 
 inline int32_t aclshmem_signal_wait_until(int32_t* address, int comparison, int32_t value)
 {
-    DispatchTest::Check(
-        DispatchTest::Offset(reinterpret_cast<uint8_t*>(address), sizeof(int32_t)) == DispatchTest::metaCommit,
-        "XSCALE receiver did not wait on the separate metadata commit");
+    const auto offset = DispatchTest::Offset(reinterpret_cast<uint8_t*>(address), sizeof(int32_t));
+    DispatchTest::Check(offset == DispatchTest::metaCommit || offset == DispatchTest::payloadCommit,
+                        "XSCALE receiver did not wait on an independent commit");
+    if (offset == DispatchTest::payloadCommit && DispatchTest::completeIncomingPayload)
+        aclshmem_int32_test(address, comparison, value);  // first failed poll, then arrival
     DispatchTest::Check(aclshmem_int32_test(address, comparison, value) != 0, "receiver accepted a stale invocation");
     return value;
 }

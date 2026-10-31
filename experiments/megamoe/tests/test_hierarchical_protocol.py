@@ -583,7 +583,9 @@ def a8w8_qp_phase_dependencies(*, backend, combine_owner=1, input_barrier=True):
         "input-finish-aiv0": set(),
         "all-core-input-barrier": {"dispatch-receive", "input-finish-aiv0", "input-finish-aiv1"},
         "input-count-ready": {"all-core-input-barrier"},
-        "gateway-payload-acquire": {"input-count-ready", "incoming-payload-commit"},
+        "gateway-broadcast": {"dispatch-payload-receive"},
+        "other-local-gateway-broadcasts": set(),
+        "gateway-payload-acquire": {"input-count-ready", "gateway-broadcast", "other-local-gateway-broadcasts"},
         "aic-fix-next-wave-aiv0": {"all-core-input-barrier"},
         # The same AIV finishes Dispatch before entering Combine, even without
         # the barrier that additionally closes every other core's input work.
@@ -599,7 +601,8 @@ def a8w8_qp_phase_dependencies(*, backend, combine_owner=1, input_barrier=True):
         graph.update(
             {
                 "dispatch-commit": {"dispatch-put"},
-                "input-finish-aiv1": {"dispatch-commit"},
+                "dispatch-payload-receive": {"dispatch-commit", "incoming-payload-commit"},
+                "input-finish-aiv1": {"gateway-broadcast"},
                 "combine-commit": {"combine-final-drain"},
                 "combine-receive": {"combine-commit", "incoming-combine-commit"},
                 "tail-quiet": {"output-aiv-barrier"},
@@ -616,7 +619,8 @@ def a8w8_qp_phase_dependencies(*, backend, combine_owner=1, input_barrier=True):
                 "dispatch-payload-quiet": {"dispatch-put"},
                 "dispatch-commit": {"dispatch-payload-quiet"},
                 "dispatch-commit-quiet": {"dispatch-commit"},
-                "input-finish-aiv1": {"dispatch-commit-quiet"},
+                "dispatch-payload-receive": {"dispatch-commit-quiet", "incoming-payload-commit"},
+                "input-finish-aiv1": {"gateway-broadcast"},
                 "combine-payload-quiet": {"combine-final-drain"},
                 "combine-commit": {"combine-payload-quiet"},
                 "combine-commit-quiet": {"combine-commit"},
@@ -634,6 +638,7 @@ def a8w8_qp_phase_dependencies(*, backend, combine_owner=1, input_barrier=True):
         "dispatch-payload-quiet",
         "dispatch-commit",
         "dispatch-commit-quiet",
+        "dispatch-payload-receive",
         "combine-progress",
         "combine-final-drain",
         "combine-payload-quiet",
@@ -676,7 +681,10 @@ def test_a8w8_fixed_qp_owner_and_aiv1_scratch_allow_next_wave_fix_overlap(backen
     assert dispatch_finished in ancestors(graph, "combine-progress")
     assert dispatch_finished not in ancestors(graph, "dispatch-receive")
     assert "incoming-payload-commit" not in ancestors(graph, "dispatch-receive")
-    assert "incoming-payload-commit" not in ancestors(graph, "input-count-ready")
+    assert "incoming-payload-commit" in ancestors(graph, "input-count-ready")
+    assert dispatch_finished in ancestors(graph, "gateway-broadcast")
+    assert "input-count-ready" not in ancestors(graph, "gateway-broadcast")
+    assert "all-core-input-barrier" not in ancestors(graph, "gateway-broadcast")
     assert "incoming-payload-commit" in ancestors(graph, "gateway-payload-acquire")
     assert "input-count-ready" in ancestors(graph, "gateway-payload-acquire")
     assert "all-core-input-barrier" in ancestors(graph, "combine-progress")

@@ -750,13 +750,8 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
             }
         }
     }
-    uint32_t neededGatewayMask = 0U;
     {
         AscendTimerFixedScope prefix(timer, AscendTimer::AIV_COUNT_PREFIX_BUILD);
-        if (UseHierarchicalRoce(params.tilingData)) {
-            neededGatewayMask =
-                BuildHierarchicalGatewayNeededMask(common, countWorkspace, params, scratch.cumsumInfoTensor);
-        }
         SyncFuncStatic<AscendC::HardEvent::S_V, SYNC_EVENT_ID2>();
         ComputeExpertCountTables(scratch.cumsumInfoTensor, scratch.expertTokenNumsOutTensor, common.moeExpertPerRank,
                                  common.worldSize, params.tilingData->maxOutputSize);
@@ -783,7 +778,7 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
     // while AIV1 acquires payload. Dispatch still starts only after this wait.
     if (UseHierarchicalRoce(params.tilingData)) {
         AscendTimerFixedScope payload(timer, AscendTimer::AIV_GATEWAY_PAYLOAD_CHECK);
-        AcquireHierarchicalGatewayPayload(common, countWorkspace, params, g_winRankAddr_, neededGatewayMask, timer);
+        AcquireHierarchicalGatewayPayload(countWorkspace, params);
     }
 }
 

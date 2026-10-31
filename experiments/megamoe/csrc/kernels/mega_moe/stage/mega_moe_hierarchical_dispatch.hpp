@@ -94,7 +94,8 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
     // The leader acquires metadata only and never touches the sender's CQ.
     // HNS exposes each aligned 512B packet as a unit; every packet in the final
     // 2KiB fragment has SO. Its last marker certifies all preceding metadata.
-    // Do not wait for payload here or put that dependency on the input barrier.
+    // Relay does not wait for payload; the independent send owner acquires it
+    // and broadcasts readiness before entering the input barrier.
     if (job.jobIndex == 2U + otherHost) {
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
         const uint64_t markerOffset = otherHost * config.railTopkIdsSlotBytes +
@@ -145,8 +146,26 @@ __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, cons
 #if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
     PublishHierarchicalLocalSignal(params, HierarchicalSignal::TxDone);
 #endif
-    // Expert ranks acquire this network flag directly at the gateway after
-    // their counts are ready. No gateway AIV must republish payload readiness.
+    // Both hosts post before waiting, so this receive cannot depend on Relay,
+    // count preparation or another owner's broadcast. Empty/all-local routing
+    // still takes this path. Acquire the receive before forwarding its epoch.
+    RoceWaitCommit(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit),
+                   params.tilingData->hierarchicalSequence, timer, AscendTimer::RdmaPhase::DispatchPayload, gateway,
+                   HierarchicalRoceScratch(params));
+    AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+    AscendTimerFixedScope broadcast(timer, AscendTimer::AIV_GATEWAY_PAYLOAD_BROADCAST);
+    const uint32_t firstRank = HierarchicalHost(common.rankId) * HIERARCHICAL_RANKS_PER_HOST;
+    const uint32_t slot = common.rankId - firstRank;
+    const uint64_t offset = params.peermemInfo.gatewayPayloadReadyPtr - params.peermemInfo.rankSyncInWorldPtr +
+                            static_cast<uint64_t>(slot) * HIERARCHICAL_FLAG_BYTES;
+    for (uint32_t localRank = 0U; localRank < HIERARCHICAL_RANKS_PER_HOST; ++localRank) {
+        const uint32_t peer = firstRank + localRank;
+        auto* ready = reinterpret_cast<__gm__ int32_t*>(
+            (peer == common.rankId ? params.peermemInfo.rankSyncInWorldPtr : g_winRankAddr_[peer]) + offset);
+        WriteGmByPassDCache(ready, static_cast<int32_t>(params.tilingData->hierarchicalSequence));
+    }
+    // Complete the notification stores before entering the input barrier.
+    AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
 }
 
 // All producers have drained before this call. Only local peer pointers are

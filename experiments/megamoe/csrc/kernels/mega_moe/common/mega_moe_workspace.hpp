@@ -19,15 +19,6 @@ constexpr int64_t SIZE_INT_8 = 1U;
 constexpr int64_t SIZE_INT_32 = 4U;
 constexpr int64_t SIZE_BF_16 = 2U;
 
-// The contiguous flag region starts on a 512B boundary. Shared by the device
-// layout and host reset-UB budgeting so alignment padding is counted identically.
-HOST_DEVICE int64_t CalcGatewayPayloadReadyFlagEnd(int64_t priorFlagElements)
-{
-    const int64_t flagLineElements = HIERARCHICAL_FLAG_BYTES / SIZE_INT_32;
-    return Ops::Base::CeilAlign(priorFlagElements, flagLineElements) +
-           HIERARCHICAL_RANKS_PER_HOST * flagLineElements;
-}
-
 struct WorkspaceInfo {
     GM_ADDR dispatchRevDataPtr;
     GM_ADDR dispatchRevScalePtr;
@@ -66,7 +57,6 @@ struct WorkspaceInfo {
     GM_ADDR flagRoutedFfnDonePtr{nullptr};
     GM_ADDR flagSharedActivationDonePtr{nullptr};
     GM_ADDR flagSharedGmm1DonePtr{nullptr};
-    GM_ADDR gatewayPayloadReadyPtr{nullptr};
     int64_t flagResetElementCount{0};
     // prefetch 软同步 GMM1 tile 状态区的 int32 元素总数（未分配时为 0）。
     int64_t gmm1TileStatusElementCount{0};
@@ -197,12 +187,6 @@ private:
             workspaceSize += coreFlagBytes;
             flagSharedGmm1DonePtr = base + workspaceSize;
             workspaceSize += coreFlagBytes;
-        }
-        if (UseHierarchicalRoce(tilingData)) {
-            const int64_t priorFlagElements = (workspaceSize - flagRegionBeginOffset) / SIZE_INT_32;
-            workspaceSize = flagRegionBeginOffset + CalcGatewayPayloadReadyFlagEnd(priorFlagElements) * SIZE_INT_32;
-            gatewayPayloadReadyPtr =
-                base + workspaceSize - static_cast<int64_t>(HIERARCHICAL_RANKS_PER_HOST) * HIERARCHICAL_FLAG_BYTES;
         }
         flagResetElementCount = (workspaceSize - flagRegionBeginOffset) / SIZE_INT_32;
 

@@ -4,92 +4,50 @@
 #define MEGA_MOE_GATEWAY_READINESS_H
 
 #include "../common/mega_moe_utils.hpp"
-#include "../common/ascend_timer_v2_device.hpp"
 
 namespace MegaMoeImpl {
 
-// Snapshot dependencies before the count table is replaced by inclusive
-// prefixes. The mask describes the whole rank, not only this block's tiles,
-// and remains valid after count-ready is published to AIC/AIV0.
-template <typename CountTensor>
-__aicore__ inline uint32_t BuildHierarchicalGatewayNeededMask(const MoeStageCommonConfig& common,
-                                                              const BlockWorkspaceContext& workspace,
-                                                              const Params& params, CountTensor& counts)
+// Every gateway broadcasts its complete invocation sequence before its input
+// barrier. Consumers read only their own persistent peer-memory slots. The
+// host-wide output barrier drains all Dispatch readers before another launch
+// may overwrite these slots; sequence equality rejects notifications left by
+// earlier launches. No routing-dependent mask or shared atomic RMW is needed.
+__aicore__ inline void AcquireHierarchicalGatewayPayload(const BlockWorkspaceContext& workspace, const Params& params)
 {
     if constexpr (g_coreType == AIC) {
-        return 0U;
+        return;
     }
     if (GetSubBlockIdx() != 1U || !UseHierarchicalRoce(params.tilingData) || workspace.blockNum == 0U ||
         workspace.blockIdx >= workspace.blockNum) {
-        return 0U;
+        return;
     }
-    const uint32_t sourceFirst = HierarchicalHost(HierarchicalGateway(common.rankId)) * HIERARCHICAL_RANKS_PER_HOST;
-    uint32_t neededMask = 0U;
-    for (uint32_t slot = 0U; slot < HIERARCHICAL_RANKS_PER_HOST; ++slot) {
-        const uint32_t source = sourceFirst + slot;
-        for (uint32_t expert = 0U; expert < common.moeExpertPerRank; ++expert) {
-            if (counts.GetValue(expert * common.worldSize + source) != 0) {
-                neededMask |= uint32_t(1) << slot;
-                break;
+    constexpr uint32_t blockBytes = 32U;
+    constexpr uint32_t wordsPerBlock = blockBytes / sizeof(int32_t);
+    constexpr uint32_t fullReadyMask = (uint32_t(1) << HIERARCHICAL_RANKS_PER_HOST) - 1U;
+    static_assert(HIERARCHICAL_ROCE_UB_BYTES >= HIERARCHICAL_RANKS_PER_HOST * blockBytes);
+    GlobalTensor<int32_t> flags;
+    flags.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.gatewayPayloadReadyPtr));
+    LocalTensor<int32_t> snapshot(TPosition::VECCALC, params.tilingData->roceScratchUbOffset,
+                                  HIERARCHICAL_RANKS_PER_HOST * wordsPerBlock);
+    uint32_t readyMask;
+    do {
+        SyncFuncStatic<HardEvent::S_MTE2, 7U>();
+        // One DMA, sixteen independent 512B lines; only each line's first 32B
+        // is copied. Strides are in 32B units, not bytes.
+        DataCopy(snapshot, flags,
+                 DataCopyParams{static_cast<uint16_t>(HIERARCHICAL_RANKS_PER_HOST), 1U,
+                                static_cast<uint16_t>(HIERARCHICAL_FLAG_BYTES / blockBytes - 1U), 0U});
+        SyncFuncStatic<HardEvent::MTE2_S, 7U>();
+        readyMask = 0U;
+        for (uint32_t slot = 0U; slot < HIERARCHICAL_RANKS_PER_HOST; ++slot) {
+            if (static_cast<uint32_t>(snapshot.GetValue(slot * wordsPerBlock)) ==
+                params.tilingData->hierarchicalSequence) {
+                readyMask |= uint32_t(1) << slot;
             }
         }
-    }
-    return neededMask;
-}
-
-// One checker per source acquires the gateway's network commit directly and
-// publishes a local epoch. NIC readiness is independent of gateway Relay/count
-// progress; there is no intermediate gateway-AIV readiness publication.
-// The local slots are reset BEFORE the existing input barrier. Never clear them
-// here: another checker may have published. AIV1 must finish this acquire before
-// dispatching payload, even though AIC/AIV0 may already consume the count table.
-__aicore__ inline void AcquireHierarchicalGatewayPayload(const MoeStageCommonConfig& common,
-                                                         const BlockWorkspaceContext& workspace, const Params& params,
-                                                         GM_ADDR* winRankAddr, uint32_t neededMask,
-                                                         AscendTimerDevice* timer = nullptr)
-{
-    if constexpr (g_coreType == AIC) {
-        return;
-    }
-    if (GetSubBlockIdx() != 1U || !UseHierarchicalRoce(params.tilingData) || workspace.blockNum == 0U ||
-        workspace.blockIdx >= workspace.blockNum) {
-        return;
-    }
-    const uint32_t sourceFirst = HierarchicalHost(HierarchicalGateway(common.rankId)) * HIERARCHICAL_RANKS_PER_HOST;
-    const int32_t sequence = static_cast<int32_t>(params.tilingData->hierarchicalSequence);
-    const uint64_t readyOffset = params.peermemInfo.hierarchicalControlPtr - params.peermemInfo.rankSyncInWorldPtr +
-                                 HierarchicalSignalOffset(HierarchicalSignal::NetPayloadCommit);
-    // All checkers publish before consuming anyone else's local notification.
-    // Interleaving local waits with this loop would serialize the distributed
-    // gateway checks. Striding also covers devices with fewer than 16 blocks.
-    for (uint32_t slot = workspace.blockIdx; slot < HIERARCHICAL_RANKS_PER_HOST; slot += workspace.blockNum) {
-        if ((neededMask & (uint32_t(1) << slot)) == 0U) {
-            continue;
-        }
-        const uint32_t source = sourceFirst + slot;
-        const uint32_t gateway = HierarchicalGateway(source);
-        {
-            AscendTimerGatewayWaitScope wait(timer, source, gateway, params.tilingData->hierarchicalSequence);
-            auto* ready = reinterpret_cast<__gm__ int32_t*>(winRankAddr[gateway] + readyOffset);
-            WaitUntilGmFlagEquals(ready, sequence);
-            // Order the acquired GM notification before forwarding it to local
-            // consumers. Payload completion is certified by the gateway's
-            // existing quiet/commit protocol; this hop does not copy payload.
-            AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
-        }
-        auto* localReady = reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.gatewayPayloadReadyPtr +
-                                                             static_cast<uint64_t>(slot) * HIERARCHICAL_FLAG_BYTES);
-        WriteGmByPassDCache(localReady, sequence);
-    }
-    for (uint32_t slot = 0U; slot < HIERARCHICAL_RANKS_PER_HOST; ++slot) {
-        if ((neededMask & (uint32_t(1) << slot)) == 0U) {
-            continue;
-        }
-        auto* localReady = reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.gatewayPayloadReadyPtr +
-                                                             static_cast<uint64_t>(slot) * HIERARCHICAL_FLAG_BYTES);
-        WaitUntilGmFlagEquals(localReady, sequence);
-    }
-    // Preserve each consumer's scalar-ready -> payload DMA ordering.
+    } while (readyMask != fullReadyMask);
+    // Order the successful snapshot/scalar comparison before payload DMA and
+    // before this AIV reuses the reserved UB for later RoCE/Combine operations.
     SyncFuncStatic<HardEvent::S_MTE2, 7U>();
 }
 

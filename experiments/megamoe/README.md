@@ -416,17 +416,19 @@ python -I -m deep_ep_experimental.megamoe.timer.trace_parser \
 | `AIV_INPUT_PREP_BARRIER_WAIT` | 输入准备后的既有 PIPE_ALL 排空和 AIC/AIV 屏障；AIC 对应原有 `AIC_WAIT_INPUT_PREP` |
 | `AIV_COUNT_TABLE_PREPARE` | AIV1 准备 count/prefix 表的完整父区间 |
 | `AIV_COUNT_METADATA_WAIT` | 获取所有来源的有效 count：包含 DMA、epoch 校验、转置、重试与退避，并非纯网络延迟 |
-| `AIV_GATEWAY_PAYLOAD_CHECK` | count-ready 发布后，按保存的来源集合检查本核负责的 gateway、发布并等待本卡就绪槽的父区间 |
-| `AIV_GATEWAY_PAYLOAD_WAIT` | 唯一检查者直接获取所需 gateway 的 `NetPayloadCommit` 及本地通知发布前的 GM 顺序保障；显示 source rank、gateway rank 和 sequence |
-| `AIV_COUNT_PREFIX_BUILD` | 从原始 count 保存 gateway 依赖集合，再计算专家 token 总数和 prefix 表，包含既有向量完成同步 |
+| `AIV_GATEWAY_PAYLOAD_CHECK` | count-ready 发布后，消费者批量获取本卡全部16个网关序号槽，并完成 payload DMA 前的同步 |
+| `AIV_GATEWAY_PAYLOAD_BROADCAST` | owner 确认本卡入站 payload 后，向同机其他15卡及自身发布序号并完成 DDR 同步；不含此前的入站等待 |
+| `AIV_GATEWAY_PAYLOAD_WAIT` | 保留旧 trace 的来源、网关、序号解析；提前广播路径不再生成此事件 |
+| `AIV_COUNT_PREFIX_BUILD` | 计算专家 token 总数和 prefix 表，包含既有向量完成同步 |
 | `AIV_COUNT_TABLE_PUBLISH` | count/prefix 写回、既有 MTE3 完成同步和 count-ready 发布 |
 | `AIC/AIV_COUNT_READY_WAIT` | AIC/AIV0 等待对应 block 的 AIV1 发布 count-ready |
 
 这些观测不新增 PIPE_ALL、跨核屏障或通信。`AIC/AIV_MOE_STARTUP` 是启动总区间，
 不能与其子事件相加；首个 GMM tile 内部的输入等待仍由原 `AIC_GMM1_WAIT` 记录。
-网关由 AIV1 分工检查，单条 WAIT 是检查者开始时的剩余等待，不能当作该来源的完整传输耗时。
-其他核等待本卡就绪槽的时间只计入 `AIV_GATEWAY_PAYLOAD_CHECK`，不重复记作 gateway WAIT；
-本卡消费者的父区间减去 gateway WAIT 仍包含集合构造和发布，不能当作纯本卡等待。
+owner 的入站检查使用 `AIV_RDMA_RECV_WAIT`（phase=DispatchPayload），广播单独使用
+`AIV_GATEWAY_PAYLOAD_BROADCAST`。前者是开始检查后的剩余等待，不能当作完整网络传输耗时。
+消费者的本地16槽汇合计入 `AIV_GATEWAY_PAYLOAD_CHECK`，不再远端读取网关 commit。
+观察 owner 的广播结束是否早于其他核到达输入屏障，才能判断这项工作是否被原有等待覆盖。
 如果总启动区间长而以上子阶段都短，剩余部分包含专家扫描、调度及 GMM 调用内部首次 tile 前的准备。
 
 解析同时输出 `startup_breakdown.csv`，按 rank/group/core 列出阶段起点、耗时及网关身份，
@@ -610,10 +612,10 @@ Relay 通过该通知直接处理 Top-k，不重复扫描包尾标记，也不�
 256个路由项仍为1536 B，一次 metadata Put，不补齐2 KiB，不增加网络完成标记。
 
 owner 完成 reset/shared-input 后提交4 B `NetPayloadCommit`，其 SO 保证此前 payload 可见。
-这个提交仍在公共输入 barrier 之前；该 barrier 不等待入站 payload。各专家卡在自己的 count-ready
-之后直接读取所需 gateway 的网络 `NetPayloadCommit`，不依赖 gateway AIV 先完成路由、计数或
-再发布中间通知。这样路由计算、count/prefix 准备可与 payload 在途传输重叠，实际 token DMA
-仍须等待 count-ready 和所需 payload 都就绪。接收侧保留 DCache 失效、GM 顺序保障及 scalar→MTE2 acquire。
+这个提交仍在公共输入 barrier 之前。随后 owner 确认配对 rank 发到本卡的 payload commit，
+执行 DDR acquire，再向同机其他15卡广播完整32位序号，并给自身记一个 ready，最后进入输入屏障。
+双方都先提交自己的 commit 再等待入站，广播不依赖 Relay、count/prefix 或其他网关的广播。
+路由处理可与入站检查和广播重叠；若入站或广播晚于其他核，输入屏障会被推迟，收益须实测。
 HNS1825 的 Dispatch、Combine 发送源以及完整32位 `Sequence` 在本轮保持不变；
 Unpermute 只读独立的接收区。输出就绪屏障之后，通信 owner 统一 quiet 一次并发布 `TxDone`，
 其他 AIV 同时执行 Unpermute；kernel 完成等待两部分工作全部结束。
@@ -626,17 +628,19 @@ H=3584、B=32 时 payload 为118784 B；相较已测 EP32/K8 balanced 样本的8
 性能验证应同时检查 payload POST 次数、quiet、输入准备结束及首 GMM 时间，
 并以关闭打点的 `rank-max-mean` 判断整体收益，不能仅由 POST 次数推断加速比例。
 
-跨机输入的 gateway 依赖按 AIV1 block 分工：各核从同一份有效 count 表得到本 rank
-实际需要的来源，并在原始 count 被前缀和覆盖前保存依赖 mask。数量表及前缀写回完成后立即
-发布 count-ready，允许 AIC/AIV0 提前准备 GMM 状态和权重。随后唯一检查者获取对应 gateway
-上的网络 payload commit，向本卡独立的512 B槽发布当前 epoch；AIV1 等到所需本卡槽就绪后才读取 payload。
-各检查者先完成自己的检查和发布，
-再消费本卡通知，避免把并行检查串行化。28个 AIV1 都需要16个来源的用例中，
-gateway 检查调用由448次降为16次；这些是依赖检查调用数，未就绪时仍会轮询。
-新增16×512 B槽及对齐 padding 纳入现有输入屏障前的 workspace reset，
-不改变 peermem 通信布局，也不新增全核屏障。转发前显式执行
-[`DataSyncBarrier<DDR>`](https://www.hiascend.com/document/detail/en/CANNCommunityEdition/910/API/ascendcopapi/docs/en/api/SIMD-API/basic_api/sync_control/intra_core_sync/DataSyncBarrier_ISASI.md)，
-消费者保留 scalar→MTE2 顺序保障。A8W4/A8W8 共用此协议。
+每卡在对称 peermem 通信窗口末尾增加16×512 B ready 槽，每个同机网关独占一槽。
+这些槽不纳入每轮 workspace reset，提前到达的通知不会被接收卡清零；窗口容量检查同步增加8192 B。
+通知比较完整32位 invocation sequence，旧轮次不可放行新轮次。现有 host 输出屏障保证所有
+Dispatch 消费者已完成，kernel 尾部 quiet 关闭发送源生命周期，随后才允许下一轮复用窗口。
+即使没有远端路由，每个网关也无条件广播，消费者始终等待全部16槽。
+
+数量表及前缀写回完成后立即发布 count-ready，允许 AIC/AIV0 准备 GMM 状态和权重。
+AIV1 随后用一次带 stride 的 DMA 获取本卡16个槽的首32 B，共512 B，再在 UB 中比较序号并生成
+私有16位 ready mask，匹配 `0xFFFF` 后完成 scalar→MTE2 同步，才开始 payload DMA。
+失败时重新批量读取；不计算路由依赖 mask，不使用共享原子 OR，也没有专门的本地汇总核。
+每个 AIV 的尾部保留 UB 从256 B扩展到512 B；RoCE backend 和 Combine 仍复用其中前256 B。
+转发前后保留 DDR 顺序保障，A8W4/A8W8 共用此协议；单机 MTE/EP16 不进入该路径。
+稀疏路由也等待全部网关，可能等到并不需要的慢来源；当前优化重点是 EP32、BS32 场景。
 
 A8W4 的跨机 Combine 在 AIV1 的计算间隙分批推进：仍有本核路由或共享 activation 时，每次最多提交2个 Put、
 扫描64个 `[token, top-k]` 槽位；这些前台工作完成后扩大为最多8个 Put和一个完整槽位扫描。

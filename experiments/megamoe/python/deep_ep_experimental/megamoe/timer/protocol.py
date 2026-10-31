@@ -36,7 +36,11 @@ FIXED_NAMES = [
     "AIC_WAIT_INPUT_PREP",
     *STARTUP_FIXED_NAMES,
     *COMBINE_PROGRESS_FIXED_NAMES,
+    "AIV_GATEWAY_PAYLOAD_BROADCAST",
 ]
+
+# Append the new fixed slot without renumbering existing fixed events.
+STARTUP_FIXED_NAMES.append("AIV_GATEWAY_PAYLOAD_BROADCAST")
 
 DYNAMIC_NAMES = [
     "AIV_DISPATCH",

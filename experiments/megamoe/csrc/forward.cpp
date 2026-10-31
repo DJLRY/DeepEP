@@ -156,9 +156,6 @@ uint64_t HostFlagElements(const MegaMoeTilingData& t)
             count += 4ULL * t.aicNum * MegaMoeImpl::INT_CACHELINE;
         }
     }
-    if (MegaMoeImpl::UseHierarchicalRoce(&t)) {
-        count = static_cast<uint64_t>(MegaMoeImpl::CalcGatewayPayloadReadyFlagEnd(static_cast<int64_t>(count)));
-    }
     return count;
 }
 

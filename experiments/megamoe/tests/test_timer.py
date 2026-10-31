@@ -250,6 +250,7 @@ def test_rdma_invalid_metadata_rejected(first, second):
 
 def test_startup_roundtrip_keeps_waits_in_diagnostic_csv(raw_file):
     phases = [
+        (2, "AIV_GATEWAY_PAYLOAD_BROADCAST", 100000, 100400),
         (3, "AIC_MOE_STARTUP", 100000, 110000),
         (3, "AIC_COUNT_READY_WAIT", 101000, 109000),
         (5, "AIV_MOE_STARTUP", 100000, 110000),
@@ -286,12 +287,14 @@ def test_startup_roundtrip_keeps_waits_in_diagnostic_csv(raw_file):
     base = first_start_cycle(raw)
     shown = trace_events(raw, "keep", base, include_wait=True)
     startup = [e for e in shown if e["tid"].endswith("/STARTUP")]
-    assert len(startup) == 9
+    assert len(startup) == 10
     gateway = next(e for e in startup if e["args"].get("granularity") == "startup_dependency")
     assert gateway["name"] == "AIV_GATEWAY_PAYLOAD_WAIT_source17_gateway1_seq130"
     assert gateway["args"]["source_rank"] == 17 and gateway["args"]["gateway_rank"] == 1
     assert gateway["args"]["wave_id"] is None and "expert_id" not in gateway["args"]
     assert gateway["ts"] == 4.5 and gateway["dur"] == 2
+    broadcast = next(e for e in startup if e["name"] == "AIV_GATEWAY_PAYLOAD_BROADCAST")
+    assert broadcast["ts"] == 0 and broadcast["dur"] == 0.4
     hidden = trace_events(raw, "keep", base)
     assert not any("WAIT" in e["name"] for e in hidden)
     for event in hidden:
@@ -301,7 +304,7 @@ def test_startup_roundtrip_keeps_waits_in_diagnostic_csv(raw_file):
     write_startup_breakdown({0: raw}, report)
     with report.open(newline="", encoding="utf-8") as stream:
         rows = list(csv.DictReader(stream))
-    assert len(rows) == 9
+    assert len(rows) == 10
     assert sum("WAIT" in row["event_family"] for row in rows) == 3
     assert sum(row["scope"] == "envelope" for row in rows) == 4
     dependency = next(row for row in rows if row["event_family"] == "AIV_GATEWAY_PAYLOAD_WAIT")

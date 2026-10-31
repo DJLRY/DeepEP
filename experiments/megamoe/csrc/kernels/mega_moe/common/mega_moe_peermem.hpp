@@ -60,7 +60,9 @@ constexpr uint32_t HIERARCHICAL_WORLD_SIZE = 32U;
 // Per-token Combine state has one uint32 top-k mask, not one bit per token.
 constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 144U;
 constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
-constexpr uint32_t HIERARCHICAL_ROCE_UB_BYTES = 256U;
+// The QP backend uses the first 256B; startup consumers reuse this reservation
+// for a single strided snapshot of sixteen 32B flag heads (512B total).
+constexpr uint32_t HIERARCHICAL_ROCE_UB_BYTES = HIERARCHICAL_RANKS_PER_HOST * 32U;
 
 // Every control flag below owns a full L2 line. Embedded rail markers instead
 // travel with their packet's data under a single writer; see RailPacketMarker.
@@ -342,6 +344,7 @@ HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams& params)
         bytes += quantTokenScaleSize + combineSendSize;
         bytes += params.numMaxTokensPerRank * params.topK * HIERARCHICAL_FLAG_BYTES;
         bytes += static_cast<int64_t>(HierarchicalSignal::Count) * HIERARCHICAL_FLAG_BYTES;
+        bytes += HIERARCHICAL_RANKS_PER_HOST * HIERARCHICAL_FLAG_BYTES;
     }
     return bytes;
 }
@@ -360,6 +363,7 @@ struct PeermemInfo {
     GM_ADDR gatewayCombinePtr{nullptr};
     GM_ADDR gatewayCombineReadyPtr{nullptr};
     GM_ADDR hierarchicalControlPtr{nullptr};
+    GM_ADDR gatewayPayloadReadyPtr{nullptr};
 
     HOST_DEVICE PeermemInfo() = default;
     HOST_DEVICE PeermemInfo(GM_ADDR base, const MegaMoeTilingData* tilingData, uint32_t elemsPerByte = 1,
@@ -418,6 +422,10 @@ struct PeermemInfo {
             offset +=
                 static_cast<int64_t>(tilingData->numMaxTokensPerRank) * tilingData->topK * HIERARCHICAL_FLAG_BYTES;
             hierarchicalControlPtr = base + offset;
+            offset += static_cast<int64_t>(HierarchicalSignal::Count) * HIERARCHICAL_FLAG_BYTES;
+            // One persistent, single-writer line per gateway on this host.
+            // Never reset at launch: a peer can broadcast before our reset.
+            gatewayPayloadReadyPtr = base + offset;
         }
     }
 };

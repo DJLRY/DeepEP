@@ -166,13 +166,6 @@ void asc_vf_call(Args... args)
 {
     Function(args...);
 }
-inline uint32_t BuildHierarchicalGatewayNeededMask(const MoeStageCommonConfig&, const BlockWorkspaceContext&,
-                                                   const Params&, Tensor& counts)
-{
-    assert(!published && counts.GetValue(0) == 3 && counts.GetValue(16) == 2);
-    ++maskBuilds;
-    return 1U;
-}
 inline void ComputeExpertCountTables(Tensor counts, Tensor totals, uint32_t experts, uint32_t world, uint32_t)
 {
     for (uint32_t e = 0; e < experts; ++e) {
@@ -180,8 +173,7 @@ inline void ComputeExpertCountTables(Tensor counts, Tensor totals, uint32_t expe
         for (uint32_t s = 0; s < world; ++s) sum += counts.GetValue(e * world + s);
         totals.SetValue(e, sum);
     }
-    // Model the destructive prefix transform; the saved dependency mask must
-    // survive, including when an originally empty source becomes nonzero.
+    // Model the destructive prefix transform before the local readiness acquire.
     std::fill_n(counts.data, experts * world, 999);
 }
 class AscendTimerDevice {};
@@ -205,10 +197,9 @@ struct AscendTimerFixedScope {
         if (event == AscendTimer::AIV_COUNT_TABLE_PUBLISH) publishTimerActive = false;
     }
 };
-inline void AcquireHierarchicalGatewayPayload(const MoeStageCommonConfig&, const BlockWorkspaceContext&, const Params&,
-                                              GM_ADDR*, uint32_t mask, AscendTimerDevice*)
+inline void AcquireHierarchicalGatewayPayload(const BlockWorkspaceContext&, const Params&)
 {
-    assert(mask == 1U && maskBuilds == 1U);
+    assert(maskBuilds == 0U);
     assert(published && flags[INT_CACHELINE] == 1 && pending.empty());
     assert(totalsGm[2] == 5 && totalsGm[3] == 4 && !publishTimerActive);
     assert(!reloadExpected || prefixGm[0] == 999);
@@ -248,7 +239,7 @@ void Run(bool decode, bool hierarchical, uint32_t subblock)
         return;
     }
     assert(published && acquired == hierarchical && scratch.peerRowLimitsCache == 0);
-    assert(maskBuilds == static_cast<uint32_t>(hierarchical));
+    assert(maskBuilds == 0U);
     assert(totalsGm[0] == -1 && totalsGm[1] == -1 && flags[0] == 0);
     assert(Reload || prefixGm[0] == -1);
 }

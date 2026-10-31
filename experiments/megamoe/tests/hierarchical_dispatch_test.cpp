@@ -19,6 +19,24 @@ constexpr int AIC = 0;
 constexpr int AIV = 1;
 constexpr int g_coreType = AIV;
 
+namespace DispatchTest {
+inline uint32_t payloadReadyBase = 0U;
+inline uint32_t ownerSlot = 0U;
+inline uint32_t ddrBarriers = 0U;
+inline std::array<uint32_t, 16> broadcasts{};
+}  // namespace DispatchTest
+namespace AscendC {
+enum class MemDsbT { DDR };
+template <MemDsbT Kind>
+void DataSyncBarrier()
+{
+    static_assert(Kind == MemDsbT::DDR);
+    DispatchTest::Check(RoceTest::mteCanRead && DispatchTest::waits == 1U,
+                        "broadcast ordering preceded the incoming payload acquire");
+    ++DispatchTest::ddrBarriers;
+}
+}  // namespace AscendC
+
 namespace MegaMoeImpl {
 using namespace AscendC;
 struct MoeStageCommonConfig {
@@ -50,6 +68,15 @@ inline void WriteGmByPassDCache(int32_t* address, int32_t value)
 {
     using namespace DispatchTest;
     const auto offset = Offset(reinterpret_cast<uint8_t*>(address), sizeof(value));
+    if (offset >= payloadReadyBase) {
+        const uint32_t window = (offset - payloadReadyBase) / (16U * 512U);
+        const uint32_t slotBytes = (offset - payloadReadyBase) % (16U * 512U);
+        Check(window < 16U && slotBytes == ownerSlot * 512U, "broadcast wrote another gateway slot or host");
+        Check(RoceTest::blockIndex == 1 && waits == 1U && ddrBarriers == 1U && RoceTest::mteCanRead,
+              "broadcast preceded owner receive acquire/DDR boundary");
+        Check(static_cast<uint32_t>(value) == sequence && broadcasts[window]++ == 0U,
+              "broadcast cleared, truncated or duplicated an epoch");
+    }
     Check(offset != relayReady, "payload readiness must come directly from the gateway's network commit");
     if (offset == metaReady) {
         Check(RoceTest::blockIndex == static_cast<int>(receiveLeaderJob),
@@ -160,7 +187,9 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     const PeermemSizeParams sizes{capacity,           topk, hidden, 12U, 32U, 2U, 1U, false, false,
                                   TOPO_TYPE_MTE_ROCE, true, 16U};
     const auto heapBytes = static_cast<size_t>(CalcPeermemLeastSize(sizes));
-    local.assign(heapBytes, 0x7BU);
+    // Append compact mapped ready regions for the other fifteen peers.
+    // Only their ready slots are accessed by this fixture.
+    local.assign(heapBytes + 15U * 16U * 512U, 0x7BU);
     remote.assign(heapBytes, 0xA5U);
     posts.clear();
     queued.clear();
@@ -170,10 +199,20 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     sequence = invocation;
     receiveLeaderJob = 2U + (1U - HierarchicalHost(rank));
     completePacking = nullptr;
+    ddrBarriers = 0U;
+    broadcasts.fill(0U);
     RoceTest::operations.clear();
     RoceTest::signalObserved = RoceTest::scalarEventSet = RoceTest::mteCanRead = false;
     Params params{&t, PeermemInfo(local.data(), &t)};
     MoeStageCommonConfig common{rank, bs, topk, hidden, 12U};
+    payloadReadyBase = Offset(params.peermemInfo.gatewayPayloadReadyPtr, 16U * 512U);
+    ownerSlot = rank % 16U;
+    std::fill_n(g_winRankAddr_, 32U, nullptr);
+    uint32_t nextWindow = 1U;
+    for (uint32_t slot = 0; slot < 16; ++slot) {
+        const uint32_t window = slot == ownerSlot ? 0U : nextWindow++;
+        g_winRankAddr_[HierarchicalHost(rank) * 16U + slot] = local.data() + window * 16U * 512U;
+    }
     SendMaskConfig config{static_cast<uint64_t>(CalcRailTopkIdsSlotBytes(&t))};
     SendMaskScratch scratch;
     const auto flagOffset = [&](HierarchicalSignal signal) {
@@ -299,7 +338,24 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     RoceTest::signalObserved = RoceTest::scalarEventSet = RoceTest::mteCanRead = false;
     Check(payload == std::vector<uint8_t>(local.begin() + source, local.begin() + source + activeBytes),
           "posting changed the quantized source");
+    // Incoming payload arrives only after the owner has posted its outgoing
+    // commit. Exercise the real receive acquire before any local broadcast.
+    completeIncomingPayload = [&] {
+        Check(posts.back().destination == payloadCommit, "receive wait blocked outgoing commit submission");
+        Check(std::all_of(broadcasts.begin(), broadcasts.end(), [](uint32_t n) { return n == 0; }),
+              "notification preceded incoming payload readiness");
+        writeWord(payloadCommit, sequence);
+    };
     FinishHierarchicalDispatch(owner, common, params);
+    Check(waits == 1U && ddrBarriers == 2U, "owner did not acquire receive and drain broadcasts");
+    for (uint32_t window = 0; window < 16; ++window) {
+        Check(broadcasts[window] == 1U, "owner omitted a peer or its own ready slot");
+        for (uint32_t slot = 0; slot < 16; ++slot) {
+            const uint32_t expectedReady = slot == ownerSlot ? sequence : 0x7B7B7B7BU;
+            Check(ReadWord(local, payloadReadyBase + (window * 16U + slot) * 512U) == expectedReady,
+                  "broadcast damaged an independent gateway slot");
+        }
+    }
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
     Check(remote == expected && queued.size() == 3U && quiets == 0U, "HNS payload commit waited for local completion");
     Check((RoceTest::operations == std::vector<int>{1, 1, 1}), "HNS added a commit WQE or quiet");
@@ -313,7 +369,7 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     std::copy(payload.begin(), payload.end(), expected.begin() + destination);
     std::memcpy(expected.data() + payloadCommit, &sequence, sizeof(sequence));
     Check(remote == expected, "transfers changed data, capacity tail, or neighboring regions");
-    Check(queued.empty() && waits == 0U && progressCalls == 0U && posts.back().destination == payloadCommit,
+    Check(queued.empty() && waits == 1U && progressCalls == 0U && posts.back().destination == payloadCommit,
           "Finish lost completion or published the wrong terminal flag");
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
     Check(quiets == 1U && (RoceTest::operations == std::vector<int>{1, 1, 1, 2}),

@@ -65,14 +65,7 @@ int main() {
         WorkspaceInfo workspace(base, &t);
         assert(workspace.workspaceSize < 16 * 1024 * 1024);
         assert(HostFlagElements(t) == static_cast<uint64_t>(workspace.flagResetElementCount));
-        if (topology == TOPO_TYPE_MTE_ROCE) {
-            auto* end = workspace.flagActivationToGmm2Ptr + workspace.flagResetElementCount * 4;
-            assert(workspace.gatewayPayloadReadyPtr >= workspace.flagActivationToGmm2Ptr);
-            assert(reinterpret_cast<uintptr_t>(workspace.gatewayPayloadReadyPtr) % 512 == 0);
-            assert(workspace.gatewayPayloadReadyPtr + 16 * 512 == end);
-        } else {
-            assert(workspace.gatewayPayloadReadyPtr == nullptr);
-        }
+
     }
 }
 """

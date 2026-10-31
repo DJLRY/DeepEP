@@ -48,7 +48,7 @@ void check_hybrid(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch, u
     std::vector<uint8_t> allocation(size + 511);
     auto* base = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(allocation.data()) + 511) & ~uintptr_t{511});
     PeermemInfo hybrid(base, &t);
-    const std::array<uint8_t*, 10> boundaries = {hybrid.maskRecvPtr,
+    const std::array<uint8_t*, 11> boundaries = {hybrid.maskRecvPtr,
                                                  hybrid.expertCountRecvPtr,
                                                  hybrid.railTopkIdsRecvPtr,
                                                  hybrid.quantTokenScalePtr,
@@ -57,6 +57,7 @@ void check_hybrid(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch, u
                                                  hybrid.gatewayCombinePtr,
                                                  hybrid.gatewayCombineReadyPtr,
                                                  hybrid.hierarchicalControlPtr,
+                                                 hybrid.gatewayPayloadReadyPtr,
                                                  base + size};
     assert(hybrid.rankSyncInWorldPtr == base);
     assert(boundaries.front() == base + PEERMEM_DATA_OFFSET);
@@ -69,8 +70,9 @@ void check_hybrid(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch, u
     assert(hybrid.gatewayCombinePtr - hybrid.relayPayloadPtr == hybrid.combineSendPtr - hybrid.quantTokenScalePtr);
     assert(hybrid.hierarchicalControlPtr - hybrid.gatewayCombineReadyPtr ==
            static_cast<int64_t>(capacity) * topk * HIERARCHICAL_FLAG_BYTES);
-    assert(base + size - hybrid.hierarchicalControlPtr ==
+    assert(hybrid.gatewayPayloadReadyPtr - hybrid.hierarchicalControlPtr ==
            static_cast<int64_t>(HierarchicalSignal::Count) * HIERARCHICAL_FLAG_BYTES);
+    assert(base + size - hybrid.gatewayPayloadReadyPtr == 16 * 512);
     assert(hybrid.quantTokenScalePtr - hybrid.railTopkIdsRecvPtr == 2 * CalcRailTopkIdsSlotBytes(&t));
     // Raw counts retain every source rank, even though rail metadata has two slots.
     assert(hybrid.railTopkIdsRecvPtr - hybrid.expertCountRecvPtr == CalcMteExpertCountRecvSize(t.moeExpertPerRank, 32));
@@ -89,6 +91,7 @@ void check_hybrid(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch, u
         assert(next.relayPayloadPtr == hybrid.relayPayloadPtr);
         assert(next.gatewayCombineReadyPtr == hybrid.gatewayCombineReadyPtr);
         assert(next.hierarchicalControlPtr == hybrid.hierarchicalControlPtr);
+        assert(next.gatewayPayloadReadyPtr == hybrid.gatewayPayloadReadyPtr);
         // Dispatch sends actual rows, while the persistent window reserves the
         // declared capacity. Both the GM source and relay destination must fit.
         const auto payloadBytes = static_cast<int64_t>(bs) * CalcQuantTokenScaleBytes(h, 1, topk, false);
@@ -121,6 +124,7 @@ void check_hybrid(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch, u
     assert(otherMode.gatewayCombinePtr == hybrid.gatewayCombinePtr);
     assert(otherMode.gatewayCombineReadyPtr == hybrid.gatewayCombineReadyPtr);
     assert(otherMode.hierarchicalControlPtr == hybrid.hierarchicalControlPtr);
+    assert(otherMode.gatewayPayloadReadyPtr == hybrid.gatewayPayloadReadyPtr);
 
     // Legacy MTE retains its original selection: A8W4 uses rail metadata at
     // these decode sizes; A8W8 must keep its direct-routing layout.
@@ -140,6 +144,7 @@ void check_hybrid(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch, u
         assert(local.quantTokenScalePtr - local.expertCountRecvPtr == CalcExpertCountRecvSize(t.moeExpertPerRank, 32));
         assert(local.quantTokenScalePtr < hybrid.quantTokenScalePtr);
     }
+    assert(local.gatewayPayloadReadyPtr == nullptr);
     assert(local.relayPayloadPtr == nullptr && local.gatewayCombinePtr == nullptr);
     assert(local.gatewayCombineReadyPtr == nullptr && local.hierarchicalControlPtr == nullptr);
 }
@@ -166,25 +171,16 @@ void check_workspace_ready_region(uint8_t mode)
         auto* flagsEnd = hybrid.flagActivationToGmm2Ptr + hybrid.flagResetElementCount * sizeof(int32_t);
         const int64_t readyBytes = static_cast<int64_t>(t.moeExpertPerRank) * groups * 64;
         auto* priorFlagsEnd = hybrid.gmm2ReadyPtr + readyBytes;
-        const int64_t gatewayBytes = HIERARCHICAL_RANKS_PER_HOST * HIERARCHICAL_FLAG_BYTES;
-        assert(hybrid.gatewayPayloadReadyPtr >= priorFlagsEnd);
-        assert(hybrid.gatewayPayloadReadyPtr - priorFlagsEnd < HIERARCHICAL_FLAG_BYTES);
-        assert(reinterpret_cast<uintptr_t>(hybrid.gatewayPayloadReadyPtr) % HIERARCHICAL_FLAG_BYTES == 0);
-        assert(hybrid.gatewayPayloadReadyPtr + gatewayBytes == flagsEnd);
+        assert(priorFlagsEnd == flagsEnd);
         assert(flagsEnd <= hybrid.gmm2MmadResPtr);
         // The reset span must include the final expert's final M-group, while
         // leaving the subsequent data/workspace byte untouched.
         std::fill(hybrid.flagActivationToGmm2Ptr, flagsEnd, uint8_t{0});
         assert(hybrid.gmm2ReadyPtr[readyBytes - 1] == 0);
-        for (uint32_t slot = 0; slot < HIERARCHICAL_RANKS_PER_HOST; ++slot) {
-            assert(hybrid.gatewayPayloadReadyPtr[slot * HIERARCHICAL_FLAG_BYTES] == 0);
-        }
-        assert(hybrid.gatewayPayloadReadyPtr[gatewayBytes - 1] == 0);
         assert(flagsEnd[0] == 0xA5);
 
         t.topoType = TOPO_TYPE_MTE;
         WorkspaceInfo legacy(base, &t);
-        assert(legacy.gatewayPayloadReadyPtr == nullptr);
         const int64_t priorElements = (priorFlagsEnd - hybrid.flagActivationToGmm2Ptr) / sizeof(int32_t);
         if (mode == GROUPED_MATMUL_MODE_GENERAL) {
             assert(legacy.gmm2ReadyPtr == nullptr);
@@ -193,7 +189,7 @@ void check_workspace_ready_region(uint8_t mode)
             assert(legacy.gmm2ReadyPtr == hybrid.gmm2ReadyPtr);
             assert(legacy.flagResetElementCount == priorElements);
         }
-        assert(hybrid.flagResetElementCount == CalcGatewayPayloadReadyFlagEnd(priorElements));
+        assert(hybrid.flagResetElementCount == priorElements);
     }
 }
 
