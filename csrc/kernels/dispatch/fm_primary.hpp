@@ -35,15 +35,19 @@ __aicore__ inline void PublishFmSimtWqes(__ubuf__ uint8_t* wqes, uint32_t count,
     AscendC::LocalTensor<uint8_t> view;
     view.address_.logicPos = static_cast<uint8_t>(AscendC::TPosition::VECOUT);
     view.address_.bufferAddr = reinterpret_cast<uint64_t>(wqes);
-    aclshmemi_udma_copy_wqe_from_ub(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(index) * ctx->wqe_size),
-                                    view, first * ctx->wqe_size, EVENT_ID0);
+    aclshmemi_udma_copy_wqe_from_ub_async(
+        reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr + uint64_t(index) * ctx->wqe_size), view, first * ctx->wqe_size,
+        EVENT_ID0);
+    aclshmemi_udma_wait_wqe_copy_from_ub(EVENT_ID0);
     if (first != count) {
         view.address_.bufferAddr = reinterpret_cast<uint64_t>(wqes + first * ctx->wqe_size);
-        aclshmemi_udma_copy_wqe_from_ub(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), view,
-                                        (count - first) * ctx->wqe_size, EVENT_ID0);
+        aclshmemi_udma_copy_wqe_from_ub_async(reinterpret_cast<__gm__ uint8_t*>(ctx->buf_addr), view,
+                                              (count - first) * ctx->wqe_size, EVENT_ID0);
+        aclshmemi_udma_wait_wqe_copy_from_ub(EVENT_ID0);
     }
-    aclshmemi_udma_post_send_update_info(head + count, ctx, state);
+    // Publish the CQ target with sq_head before the SDK rings the doorbell.
     ++state->cqe_cnt;
+    aclshmemi_udma_post_send_update_info(head + count, ctx, state);
 }
 
 __aicore__ inline void IssueFmPrimaryRows(DeepepPrimaryState& p, uint32_t peer, __ubuf__ uint8_t* scratch,
@@ -86,7 +90,7 @@ __aicore__ inline void IssueFmPrimaryRows(DeepepPrimaryState& p, uint32_t peer, 
     constexpr uint32_t cqe = aclshmemi_udma_build_flag<aclshmemi_udma_opcode_t::UDMA_OP_WRITE, kUdmaDataRoCqeConfig>();
     for (uint32_t first = 0U; first < count; first += 32U) {
         const uint32_t n = count - first < 32U ? count - first : 32U;
-        aclshmemi_udma_poll_before_aggregate_flush(queue, p.fm_slot, 0U, n);
+        aclshmemi_udma_poll_before_aggregate_flush(queue, p.fm_slot, 0U, n, queue->cqe_cnt);
         if (!aclshmemi_udma_sq_has_capacity(queue, n)) {
             aclshmemi_kernel_abort("FM primary SQ capacity exhausted");
             trap();

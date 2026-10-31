@@ -1420,10 +1420,16 @@ template<class... Args> void aclshmemi_kernel_abort(const char*, Args...) {
     if (expect_failure) { failure_observed = true; return; }
     std::abort();
 }
-void aclshmemi_udma_copy_wqe_from_ub(uint8_t* dst, LocalTensor<uint8_t> src, uint32_t bytes, uint32_t) {
+bool wqe_copy_pending = false;
+void aclshmemi_udma_copy_wqe_from_ub_async(uint8_t* dst, LocalTensor<uint8_t> src, uint32_t bytes, uint32_t) {
+    assert(!wqe_copy_pending); wqe_copy_pending = true;
     ++copies; std::memcpy(dst, reinterpret_cast<void*>(src.address_.bufferAddr), bytes);
 }
+void aclshmemi_udma_wait_wqe_copy_from_ub(uint32_t) {
+    assert(wqe_copy_pending); wqe_copy_pending = false;
+}
 void aclshmemi_udma_post_send_update_info(uint32_t head, Context*, aclshmemi_udma_queue_state_t* q) {
+    assert(!wqe_copy_pending);
     assert(uint32_t(head - q->sq_tail) < shm::UDMA_SQ_BASKBLK_CNT); q->sq_head = head;
 }
 constexpr uint32_t PIPE_MTE3 = 0, kCompletionSoConfig = 0;

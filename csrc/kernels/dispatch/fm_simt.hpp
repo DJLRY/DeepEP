@@ -70,7 +70,7 @@ __aicore__ inline void IssueFmRows(DeepepSecondaryState& s, uint32_t peer, __ubu
     }
     auto* ctx = reinterpret_cast<__gm__ aclshmemi_udma_wq_ctx_t*>(s.fm_context);
     auto* state = reinterpret_cast<__gm__ aclshmemi_udma_queue_state_t*>(s.fm_queue);
-    aclshmemi_udma_poll_before_aggregate_flush(state, s.fm_slot, 0U, count);
+    aclshmemi_udma_poll_before_aggregate_flush(state, s.fm_slot, 0U, count, state->cqe_cnt);
     if (!aclshmemi_udma_sq_has_capacity(state, count)) {
         aclshmemi_kernel_abort("FM SIMT SQ capacity exhausted");
         trap();

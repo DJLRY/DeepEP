@@ -1,8 +1,15 @@
 # SHMEM !944 与历史版本复测
 
-本分支固定到 `cann/shmem` master 的 `87b63bd3206214450ef09c32010bf9fd1cbad21b`，即
-[!944](https://gitcode.com/cann/shmem/pull/944) 合入提交。它支持新 HNS1825 固件的 PI-on-chip doorbell。
-锁文件、公有头文件校验和与子模块 gitlink 一起更新；不跟随上游 master 自动升级。
+当前分支固定到 `cann/shmem` master 的 `4c671684e1698aec199619850a3120bfdf85c95e`
+（2026-10-31 查询）。此前固定的 `87b63bd3206214450ef09c32010bf9fd1cbad21b` 是
+[!944](https://gitcode.com/cann/shmem/pull/944) 合入提交；新版本保留其 HNS1825 PI-on-chip 支持，
+并包含 `e658bbc` 的 HNS1825 WQE ULP 修正与 `9c7770c` 的 UDMA 队列状态刷新修正。
+六个锁定公共头文件的内容未变化。锁文件与子模块 gitlink 一起更新，不跟随上游 master 自动升级。
+
+新版将 UDMA WQE 拷贝拆成 async/wait 两个 helper，并给 aggregate credit poll 增加 CQ 目标参数。
+基础 Dispatch/Combine 调用同步适配，保留每段拷贝完成后才复用 UB／敲 doorbell 的顺序；
+FM 有信号批次在发布队列状态前更新 CQ 目标。MegaMoE 路由、计算和通信调度不在本次依赖更新中修改。
+必须重新构建 SHMEM 和完整 wheel，不能仅替换 `libshmem.so`。Ascend 设备编译及精度／性能验证仍须上机完成。
 
 ## 当前分支：两台机器分别重建
 
@@ -74,7 +81,7 @@ bash experiments/megamoe/scripts/run_bs32.sh perf --config "$BS32_CONFIG" --warm
 worktree 的 HEAD 仍是 `OLD_REF`；兼容修改保留为可查看的工作区差异，SHMEM gitlink 单独暂存以供
 `git submodule update` 读取。`shmem-944-migration.json` 记录原提交、新依赖和修改文件校验和。
 同一个输出目录不能重复使用。切换版本需重新构建并安装对应 wheel；不要让两个 worktree 的作业并发
-覆盖同一个 Python 环境。复测记录应写为“原 SHA + SHMEM 87b63bd”，不能标成完全未修改的旧版本。
+覆盖同一个 Python 环境。复测记录应写为“原 SHA + 实际锁定的 SHMEM SHA”，不能标成完全未修改的旧版本。
 
 ## Doorbell 模式与其他接口
 

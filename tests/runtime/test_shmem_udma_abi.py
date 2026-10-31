@@ -141,3 +141,94 @@ def test_host_pass_does_not_require_device_udma_types(tmp_path):
         timeout=90,
     )
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_fm_publisher_waits_for_wrap_copies_and_publishes_cq_target(tmp_path):
+    """Compile the production FM publisher against the pinned SDK signatures."""
+    import re
+
+    compiler = shutil.which("g++") or shutil.which("clang++")
+    if compiler is None:
+        pytest.skip("C++17 compiler required")
+    sdk = sdk_source("src/device/gm2gm/engine/shmem_device_udma.hpp")
+    declarations = []
+    for name in (
+        "aclshmemi_udma_copy_wqe_from_ub_async",
+        "aclshmemi_udma_wait_wqe_copy_from_ub",
+        "aclshmemi_udma_post_send_update_info",
+    ):
+        match = re.search(r"ACLSHMEM_DEVICE void " + name + r"\([^{}]*?\)\s*\{", sdk)
+        assert match is not None, name
+        declarations.append(match[0].rstrip().removesuffix("{").replace("ACLSHMEM_DEVICE", "") + ";")
+    production = (ROOT / "csrc/kernels/dispatch/fm_primary.hpp").read_text(encoding="utf-8")
+    start = production.index("__aicore__ inline void PublishFmSimtWqes(")
+    production = production[start : production.index("\n}", start) + 2]
+    source = tmp_path / "publisher.cpp"
+    source.write_text(
+        r"""
+#include <cassert>
+#include <cstdint>
+#include <cstring>
+#define __aicore__
+#define __gm__
+#define __ubuf__
+constexpr uint32_t EVENT_ID0 = 0;
+namespace AscendC {
+enum class TPosition { VECOUT };
+template<class T> struct LocalTensor {
+    struct { uint8_t logicPos; uint64_t bufferAddr; } address_{};
+};
+}
+struct aclshmemi_udma_wq_ctx_t { uint32_t depth = 32, wqe_size = 64; uintptr_t buf_addr; };
+struct aclshmemi_udma_queue_state_t { uint32_t sq_head, cqe_cnt; };
+"""
+        + "\n".join(declarations)
+        + production
+        + r"""
+bool pending = false;
+uint8_t* destination;
+const uint8_t* origin;
+uint32_t length, copies, doorbells;
+void aclshmemi_udma_copy_wqe_from_ub_async(uint8_t* dst, AscendC::LocalTensor<uint8_t>& src,
+                                         uint32_t bytes, uint32_t event) {
+    assert(event == EVENT_ID0 && !pending);
+    pending = true; destination = dst;
+    origin = reinterpret_cast<const uint8_t*>(src.address_.bufferAddr); length = bytes;
+}
+void aclshmemi_udma_wait_wqe_copy_from_ub(uint32_t event) {
+    assert(event == EVENT_ID0 && pending);
+    std::memcpy(destination, origin, length); pending = false; ++copies;
+}
+void aclshmemi_udma_post_send_update_info(uint32_t head, aclshmemi_udma_wq_ctx_t*,
+                                        aclshmemi_udma_queue_state_t* state) {
+    assert(!pending && state->cqe_cnt == 8); // CQ target visible BEFORE doorbell.
+    state->sq_head = head; ++doorbells;
+}
+int main() {
+    uint8_t input[32 * 64], ring[32 * 64];
+    for (uint32_t i = 0; i < sizeof(input); ++i) input[i] = i % 251;
+    for (uint32_t head : {0U, 31U, 0xfffffff0U})
+    for (uint32_t count : {1U, 4U, 32U}) {
+        std::memset(ring, 0xa5, sizeof(ring)); copies = doorbells = 0;
+        aclshmemi_udma_wq_ctx_t ctx{32, 64, reinterpret_cast<uintptr_t>(ring)};
+        aclshmemi_udma_queue_state_t state{head, 7};
+        PublishFmSimtWqes(input, count, &ctx, &state);
+        assert(!pending && doorbells == 1 && state.sq_head == uint32_t(head + count));
+        assert(copies == (head % 32 + count > 32 ? 2U : 1U));
+        for (uint32_t i = 0; i < count; ++i)
+            assert(std::memcmp(ring + ((head + i) % 32) * 64, input + i * 64, 64) == 0);
+    }
+}
+""",
+        encoding="utf-8",
+    )
+    binary = tmp_path / "publisher.exe"
+    compiled = subprocess.run(
+        [compiler, "-std=c++17", "-include", "initializer_list", str(source), "-o", str(binary)],
+        capture_output=True,
+        encoding="utf-8",
+        timeout=90,
+    )
+    assert compiled.returncode == 0, compiled.stderr
+    executed = subprocess.run([str(binary)], capture_output=True, text=True, timeout=10)
+    assert executed.returncode == 0, executed.stderr
