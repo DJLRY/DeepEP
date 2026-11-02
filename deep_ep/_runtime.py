@@ -80,6 +80,7 @@ class Runtime:
         bootstrap="default",
         combine_only=False,
         ranks_per_node=0,
+        roce_app_qps=1,
     ):
         global _OWNER
         native = require_native("Runtime.__init__")
@@ -130,6 +131,10 @@ class Runtime:
             if size not in WORLD_SIZES:
                 raise ValueError("Runtime supports EP2/4/8/16/32/64/128/256/512")
         self.use_roce = self._megamoe and ranks_per_node == 16 and size > 16
+        if type(roce_app_qps) is not int or roce_app_qps not in (1, 4, 8):
+            raise ValueError("roce_app_qps must be 1, 4 or 8")
+        if roce_app_qps != 1 and not self.use_roce:
+            raise ValueError("Multiple RoCE QPs require the two-host MegaMoE runtime")
         if group is not None and not store_group:
             import torch
             import torch.distributed as dist
@@ -167,7 +172,13 @@ class Runtime:
                             else 0,
                         ]
                     )
-                local_values.append(int(udma) + 2 * int(combine_only) + 4 * int(dense_qps) + 8 * int(self.use_roce))
+                local_values.append(
+                    int(udma)
+                    + 2 * int(combine_only)
+                    + 4 * int(dense_qps)
+                    + 8 * int(self.use_roce)
+                    + 16 * (roce_app_qps - 1)
+                )
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
                 else:
@@ -235,6 +246,8 @@ class Runtime:
                 else (
                     native.Runtime(rank, size, capacity, address, timeout, udma)
                     if udma
+                    else factory(rank, size, capacity, address, timeout, True, roce_app_qps)
+                    if self.use_roce and roce_app_qps != 1
                     else factory(rank, size, capacity, address, timeout, True)
                     if self.use_roce
                     else factory(rank, size, capacity, address, timeout)

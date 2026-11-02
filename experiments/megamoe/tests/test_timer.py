@@ -139,6 +139,7 @@ def test_startup_details_and_combine_decisions_round_trip(raw_file, tmp_path):
         for family, records in (
             ("AIV_RELAY_STEP", [((0 << 32) | 31, (168 << 32) | 12), ((5 << 32) | 31, (168 << 32) | 12)]),
             ("AIV_COMBINE_RUN", [((7 << 32) | 1, 0x302), ((7 << 32) | 16, 0x401)]),
+            ("AIV_COMBINE_REDUCE", [((4 << 32) | 31, (0x85 << 32) | 3584)]),
         ):
             type_id = p.DYNAMIC_NAMES.index(family)
             put(p.N_TIMING_COUNTER + core * p.DYNAMIC_ITER_PER_CORE + type_id, len(records))
@@ -163,6 +164,8 @@ def test_startup_details_and_combine_decisions_round_trip(raw_file, tmp_path):
     runs = [e["args"] for e in visible if e["args"].get("granularity") == "combine_run"]
     assert runs[0]["decision"] == "defer" and runs[0]["stop_reason"] == "producer_not_ready"
     assert runs[1]["run_rows"] == 16 and runs[1]["already_deferred"]
+    reduced = next(e["args"] for e in visible if e["args"].get("granularity") == "combine_reduce")
+    assert (reduced["qp_index"], reduced["token_index"], reduced["expert_rows"], reduced["hidden"]) == (4, 31, 3, 3584)
     hidden = trace_events(raw, "keep", first_start_cycle(raw), include_wait=False)
     assert not any(e["args"].get("relay_step") == "packet_wait" for e in hidden)
     assert any(e["args"].get("relay_step") == "count_publish" for e in hidden)

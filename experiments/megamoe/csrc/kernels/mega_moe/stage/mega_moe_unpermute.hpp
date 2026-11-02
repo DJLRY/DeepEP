@@ -134,6 +134,81 @@ __aicore__ inline void AccumulateMoeExpertsForToken(const TokenUnpermuteConfig& 
     }
 }
 
+// Weighted gateway mode receives one FP32 sum for the remote host. Raw remote
+// top-k slots remain untouched and must never be read or weighted a second time.
+__aicore__ inline void AccumulateHierarchicalReducedToken(const TokenUnpermuteConfig& context,
+                                                          const MoeStageCommonConfig& common, const Params& params,
+                                                          TokenUnpermuteScratch& scratch, int32_t tokenIdx,
+                                                          int32_t localIdx, const GlobalTensor<bfloat16_t>& expandedX,
+                                                          const MegaMoeUnpermuteBufferConfig& bufferConfig)
+{
+    // Borrow an input slot, not the BF16 output slot: the previous token's MTE3
+    // may still be reading that output. Return the slot event before normal use.
+    WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+    auto ids = scratch.dataResFp32Tensor[bufferConfig.fp32SlotElementCount].template ReinterpretCast<int32_t>();
+    GlobalTensor<int32_t> idsGm;
+    idsGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.expertIdxGmAddr));
+    DataCopyPad(ids, idsGm[static_cast<uint64_t>(tokenIdx) * common.topK], {1U, common.topK * 4U, 0U, 0U, 0U},
+                {false, 0U, 0U, 0U});
+    SyncFuncStatic<HardEvent::MTE2_S, EVENT_ID0>();
+    const uint32_t expertsPerHost = HIERARCHICAL_RANKS_PER_HOST * common.moeExpertPerRank;
+    uint32_t localMask = 0U;
+    for (uint32_t k = 0U; k < common.topK; ++k) {
+        if (static_cast<uint32_t>(ids.GetValue(k)) / expertsPerHost == HierarchicalHost(common.rankId)) {
+            localMask |= uint32_t{1} << k;
+        }
+    }
+    SyncFuncStatic<HardEvent::S_MTE2, EVENT_ID0>();
+    SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
+    const uint32_t allMask = 0xffffffffU >> (32U - common.topK);
+    if (localMask == allMask) {
+        AccumulateMoeExpertsForToken<COMBINE_NO_QUANT, false>(context, common, scratch, tokenIdx, localIdx, expandedX,
+                                                              bufferConfig);
+        return;
+    }
+    bool first = true;
+    for (uint32_t k = 0U; k < common.topK; ++k) {
+        if ((localMask & (uint32_t{1} << k)) == 0U) {
+            continue;
+        }
+        const uint32_t index = (localIdx * (common.topK + common.sharedExpertNum) + k) % bufferConfig.inputBufferCount;
+        const TEventID event = static_cast<TEventID>(index);
+        auto inputBf16 = scratch.dataResTensor[(index + 1U) * bufferConfig.bf16SlotElementCount];
+        auto inputFp32 = scratch.dataResFp32Tensor[(index + 1U) * bufferConfig.fp32SlotElementCount];
+        LoadMoeExpertInput<COMBINE_NO_QUANT>(context, common, scratch, expandedX,
+                                             static_cast<uint64_t>(tokenIdx) * common.topK + k, event, inputBf16,
+                                             inputFp32);
+        const float weight = scratch.topKWeightsTensor.GetValue(localIdx * common.topK + k);
+        SyncFuncStatic<HardEvent::S_V, EVENT_ID0>();
+        PipeBarrier<PIPE_V>();
+        if (first) {
+            Muls(scratch.dataResFp32Tensor, inputFp32, weight, common.tokenHiddenDim);
+            first = false;
+        } else {
+            Muls(inputFp32, inputFp32, weight, common.tokenHiddenDim);
+            PipeBarrier<PIPE_V>();
+            Add(scratch.dataResFp32Tensor, scratch.dataResFp32Tensor, inputFp32, common.tokenHiddenDim);
+        }
+        PipeBarrier<PIPE_V>();
+        SetFlag<HardEvent::V_MTE2>(event);
+    }
+    // At least one remote expert exists here. Its received sum already includes
+    // every remote weight. The per-QP commit join precedes this whole stage.
+    WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+    auto partial = scratch.dataResFp32Tensor[bufferConfig.fp32SlotElementCount];
+    GlobalTensor<float> partialGm;
+    partialGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.peermemInfo.combinePartialRecvPtr));
+    DataCopy(partial, partialGm[static_cast<uint64_t>(tokenIdx) * common.tokenHiddenDim], common.tokenHiddenDim);
+    SyncFuncStatic<HardEvent::MTE2_V, EVENT_ID0>();
+    if (first) {
+        DataCopy(scratch.dataResFp32Tensor, partial, common.tokenHiddenDim);
+    } else {
+        Add(scratch.dataResFp32Tensor, scratch.dataResFp32Tensor, partial, common.tokenHiddenDim);
+    }
+    PipeBarrier<PIPE_V>();
+    SetFlag<HardEvent::V_MTE2>(EVENT_ID0);
+}
+
 // 等待该共享专家的 GMM2 结果就绪后累加进当前 token（等待与累加是一体动作，调用方无需分两步）。
 template <uint32_t Gmm1TileM>
 __aicore__ inline void AccumulateSharedExpertForToken(const MoeStageCommonConfig& common, const Params& params,
@@ -194,8 +269,13 @@ __aicore__ inline void ProcessTokenUnpermuteBatch(
     }
     for (int32_t localIdx = 0; localIdx < batchTokenCount; ++localIdx) {
         int32_t tokenIdx = jobOffset + batchTokenOffset + localIdx;
-        AccumulateMoeExpertsForToken<CombineMode, TopkWeightsPrefetch>(context, common, scratch, tokenIdx, localIdx,
-                                                                       expandedX, bufferConfig);
+        if (UseHierarchicalCombineReduction(params.tilingData)) {
+            AccumulateHierarchicalReducedToken(context, common, params, scratch, tokenIdx, localIdx, expandedX,
+                                               bufferConfig);
+        } else {
+            AccumulateMoeExpertsForToken<CombineMode, TopkWeightsPrefetch>(context, common, scratch, tokenIdx, localIdx,
+                                                                           expandedX, bufferConfig);
+        }
         for (uint32_t sharedExpertIdx = 0; sharedExpertIdx < common.sharedExpertNum; ++sharedExpertIdx) {
             AccumulateSharedExpertForToken<Gmm1TileM>(common, params, scratch, tokenIdx, localIdx, sharedExpertIdx,
                                                       bufferConfig);

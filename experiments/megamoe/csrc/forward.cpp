@@ -15,6 +15,7 @@
 #include "tiling/platform/platform_ascendc.h"
 
 #include "check.hpp"
+#include "common/megamoe_combine_config.hpp"
 #include "kernels/mega_moe/common/ascend_timer_v2.hpp"
 #include "kernels/mega_moe/common/mega_moe_constants.hpp"
 #include "kernels/mega_moe/common/mega_moe_workspace.hpp"
@@ -243,7 +244,7 @@ PlatformInfo GetPlatformInfo()
 
 MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t topk, int64_t local_experts,
                              int64_t world, int64_t max_tokens, int64_t max_recv, bool is_a8w4, int64_t shared_experts,
-                             int64_t ranks_per_node, const PlatformInfo& p)
+                             int64_t ranks_per_node, int64_t combine_reduce_qps, const PlatformInfo& p)
 {
     MegaMoeTilingData t{};
     t.moeExpertPerRank = static_cast<uint32_t>(local_experts);
@@ -264,6 +265,15 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     t.dispatchRanksPerNode = static_cast<uint32_t>(ranks_per_node);
     const bool hierarchical = ranks_per_node == MegaMoeImpl::HIERARCHICAL_RANKS_PER_HOST && world > ranks_per_node;
     t.topoType = hierarchical ? MegaMoeImpl::TOPO_TYPE_MTE_ROCE : MegaMoeImpl::TOPO_TYPE_MTE;
+    TORCH_CHECK(combine_reduce_qps >= 0 && combine_reduce_qps <= 8 &&
+                    megamoe_config::ValidReduceQps(static_cast<uint32_t>(combine_reduce_qps)),
+                "combine_reduce_qps must be 0, 4 or 8");
+    TORCH_CHECK(combine_reduce_qps == 0 || (hierarchical && is_a8w4),
+                "Gateway weighted reduction requires two-host EP32 A8W4");
+    TORCH_CHECK(combine_reduce_qps == 0 || (p.aic >= static_cast<uint32_t>(combine_reduce_qps) &&
+                                            p.aiv >= 2U * static_cast<uint32_t>(combine_reduce_qps)),
+                "Not enough AIV1 workers for combine_reduce_qps");
+    t.combineReduceQps = static_cast<uint32_t>(combine_reduce_qps);
     TORCH_CHECK(
         !hierarchical || (world == MegaMoeImpl::HIERARCHICAL_WORLD_SIZE && bs <= MegaMoeImpl::HIERARCHICAL_MAX_TOKENS),
         "MTE+RoCE MegaMoE requires two 16-rank hosts and BS in [1,", MegaMoeImpl::HIERARCHICAL_MAX_TOKENS, "]");
@@ -273,6 +283,8 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     TORCH_CHECK(!hierarchical || p.ub > MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES,
                 "Not enough UB for MegaMoE RoCE scratch");
     const uint32_t stage_ub = hierarchical ? p.ub - MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES : p.ub;
+    TORCH_CHECK(combine_reduce_qps == 0 || stage_ub >= t.h * 10U + AlignUp(t.topK * 4U, 32U),
+                "Not enough UB for FP32 gateway reduction");
     t.roceScratchUbOffset = hierarchical ? stage_ub : 0U;
     t.sharedExpertNum = static_cast<uint32_t>(shared_experts);
     t.combineSyncSlotCountPerExpert = 0;
@@ -313,7 +325,7 @@ void CheckTensor(const torch::Tensor& t, int64_t dims, const char* name)
 
 Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
            int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts,
-           uint64_t symmetric_address, int64_t symmetric_bytes)
+           uint64_t symmetric_address, int64_t symmetric_bytes, int64_t combine_reduce_qps)
     : ffts_(ffts)
 {
     CheckTensor(example, 2, "plan input");
@@ -325,12 +337,13 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
                 "Plan shared experts require W4A8, with count in [0,8]");
     TORCH_CHECK(ranks_per_node == 0 || (ranks_per_node > 0 && ranks_per_node <= world && world % ranks_per_node == 0),
                 "Plan ranks_per_node must divide EP");
-    const auto required = buffer_size(world, experts, max_tokens, topk, example.size(1), ranks_per_node);
+    const auto required =
+        buffer_size(world, experts, max_tokens, topk, example.size(1), ranks_per_node, combine_reduce_qps);
     TORCH_CHECK(symmetric_address != 0 && symmetric_bytes >= required, "MegaMoE symmetric buffer needs ", required,
                 " bytes, got ", symmetric_bytes);
     platform_ = GetPlatformInfo();
     tiling_ = MakeTiling(example.size(0), example.size(1), intermediate * 2, topk, experts, world, max_tokens, 0,
-                         is_a8w4, shared_experts, ranks_per_node, platform_);
+                         is_a8w4, shared_experts, ranks_per_node, combine_reduce_qps, platform_);
     static_assert(sizeof(MegaMoeTilingData) == 232, "MegaMoE tiling ABI changed");
     const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling_);
     const int64_t bytes =
@@ -507,7 +520,7 @@ std::tuple<torch::Tensor, torch::Tensor> Plan::forward(
 }
 
 int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk, int64_t hidden,
-                    int64_t ranks_per_node)
+                    int64_t ranks_per_node, int64_t combine_reduce_qps)
 {
     TORCH_CHECK(world >= 2 && world <= 128 && experts >= 1 && experts <= 128 && tokens >= 1 && tokens <= 65536 &&
                     topk >= 1 && topk <= 32 && topk <= world * experts && hidden >= 1024 && hidden <= 8192 &&
@@ -516,17 +529,28 @@ int64_t buffer_size(int64_t world, int64_t experts, int64_t tokens, int64_t topk
     TORCH_CHECK(ranks_per_node == 0 || (ranks_per_node > 0 && ranks_per_node <= world && world % ranks_per_node == 0),
                 "ranks_per_node must divide EP");
     const bool hierarchical = ranks_per_node == MegaMoeImpl::HIERARCHICAL_RANKS_PER_HOST && world > ranks_per_node;
+    TORCH_CHECK(combine_reduce_qps >= 0 && combine_reduce_qps <= 8 &&
+                    megamoe_config::ValidReduceQps(static_cast<uint32_t>(combine_reduce_qps)) &&
+                    (combine_reduce_qps == 0 || hierarchical),
+                "combine_reduce_qps must be 0, or 4/8 for two-host EP32");
     TORCH_CHECK(!hierarchical || world == MegaMoeImpl::HIERARCHICAL_WORLD_SIZE,
                 "MTE+RoCE MegaMoE currently requires EP32 on two 16-rank hosts");
     // The buffer outlives BS/weight-mode changes. Reserve the decode rail/count
     // layout as well; prefill continues to bind its original device offsets.
     const MegaMoeImpl::PeermemSizeParams params{
-        tokens, topk,
-        hidden, experts,
-        world,  2,
-        1,      false,
-        false,  hierarchical ? MegaMoeImpl::TOPO_TYPE_MTE_ROCE : MegaMoeImpl::TOPO_TYPE_MTE,
-        true,   static_cast<uint32_t>(ranks_per_node)};
+        tokens,
+        topk,
+        hidden,
+        experts,
+        world,
+        2,
+        1,
+        false,
+        false,
+        hierarchical ? MegaMoeImpl::TOPO_TYPE_MTE_ROCE : MegaMoeImpl::TOPO_TYPE_MTE,
+        true,
+        static_cast<uint32_t>(ranks_per_node),
+        static_cast<uint32_t>(combine_reduce_qps)};
     return AlignUp<int64_t>(MegaMoeImpl::EXCEPTION_DUMP_REGION_SIZE + MegaMoeImpl::CalcPeermemLeastSize(params),
                             2LL << 20);
 }

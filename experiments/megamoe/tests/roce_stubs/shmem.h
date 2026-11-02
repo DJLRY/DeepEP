@@ -27,6 +27,7 @@ struct Write {
     std::vector<uint8_t> sourceAtPost;
     bool delivered = false;
     bool commit = false;
+    uint32_t qp = 1U;
 };
 inline std::vector<Write> queued;
 inline uint32_t writes = 0;
@@ -35,12 +36,14 @@ inline uint32_t progressCalls = 0;
 inline uint32_t retired = 0;
 inline uint32_t signalTests = 0;
 inline bool cqError = false;
+inline uint32_t expectedQp = 1U;
+inline std::vector<uint32_t> extraCommitOffsets;
 inline std::function<void()> onProgress;
 inline std::function<void(const Write&)> onCommitVisible;
 
 inline void CheckResource(uint32_t peer, uint32_t qp, uint8_t* ub, uint32_t event)
 {
-    if (peer != kPeer || qp != 1U || ub != scratch.data() || event != 7U) {
+    if (peer != kPeer || qp != expectedQp || ub != scratch.data() || event != 7U) {
         throw std::runtime_error("transport used another owner's peer/QP/UB/event");
     }
 }
@@ -75,14 +78,17 @@ inline void Deliver(Write& write)
 // becomes visible after every preceding WQE. Reverse the data within each
 // group to avoid accidentally relying on their individual execution order.
 // Delivery does not consume CQEs or release the sender's lifetime contract.
-inline void DeliverPosted()
+inline void DeliverPosted(uint32_t qp = 1U)
 {
+    std::vector<size_t> entries;
+    for (size_t i = 0; i < queued.size(); ++i)
+        if (queued[i].qp == qp) entries.push_back(i);
     size_t begin = 0U;
-    while (begin < queued.size()) {
+    while (begin < entries.size()) {
         size_t end = begin;
-        while (end < queued.size() && !queued[end].commit) ++end;
-        for (size_t i = end; i > begin; --i) Deliver(queued[i - 1U]);
-        if (end < queued.size()) Deliver(queued[end++]);
+        while (end < entries.size() && !queued[entries[end]].commit) ++end;
+        for (size_t i = end; i > begin; --i) Deliver(queued[entries[i - 1U]]);
+        if (end < entries.size()) Deliver(queued[entries[end++]]);
         begin = end;
     }
 }
@@ -98,13 +104,15 @@ void aclshmemx_roce_qp_put_nbi(T* destination, T* source, T* scratch, uint32_t c
     CheckResource(static_cast<uint32_t>(peer), qp, scratch, event);
     const uint32_t offset = CheckSymmetric(destination, count);
     CheckSymmetric(source, count);
-    const bool commit = offset == kCommitOffset || offset == kCombineCommitOffset;
+    const bool commit =
+        offset == kCommitOffset || offset == kCombineCommitOffset ||
+        std::find(extraCommitOffsets.begin(), extraCommitOffsets.end(), offset) != extraCommitOffsets.end();
 #if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-    if (commit && !queued.empty()) {
+    if (commit && std::any_of(queued.begin(), queued.end(), [qp](const Write& w) { return w.qp == qp; })) {
         throw std::runtime_error("XSCALE commit can overtake outstanding data writes");
     }
 #endif
-    queued.push_back({offset, source, count, std::vector<uint8_t>(source, source + count), false, commit});
+    queued.push_back({offset, source, count, std::vector<uint8_t>(source, source + count), false, commit, qp});
     ++writes;
     operations.push_back(1);
 }
@@ -116,9 +124,10 @@ void aclshmemx_roce_qp_quiet(uint32_t peer, uint32_t qp, T* scratch, uint32_t ev
     using namespace RoceTest;
     CheckResource(peer, qp, scratch, event);
     if (cqError) throw std::runtime_error("completion error");
-    DeliverPosted();
-    retired += static_cast<uint32_t>(queued.size());
-    queued.clear();
+    DeliverPosted(qp);
+    auto remaining = std::remove_if(queued.begin(), queued.end(), [qp](const Write& w) { return w.qp == qp; });
+    retired += static_cast<uint32_t>(queued.end() - remaining);
+    queued.erase(remaining, queued.end());
     ++quiets;
     operations.push_back(2);
 }
@@ -134,11 +143,16 @@ inline uint32_t RoceProgressReady(uint32_t peer, uint32_t qp, uint8_t* scratch, 
     if (cqError) throw std::runtime_error("ready CQE error");
     if (onProgress) onProgress();
     uint32_t consumed = 0U;
-    while (consumed < queued.size() && queued[consumed].delivered) {
-        CheckSource(queued[consumed]);
+    for (auto it = queued.begin(); it != queued.end();) {
+        if (it->qp != qp) {
+            ++it;
+            continue;
+        }
+        if (!it->delivered) break;
+        CheckSource(*it);
+        it = queued.erase(it);
         ++consumed;
     }
-    queued.erase(queued.begin(), queued.begin() + consumed);
     retired += consumed;
     return consumed;
 #else

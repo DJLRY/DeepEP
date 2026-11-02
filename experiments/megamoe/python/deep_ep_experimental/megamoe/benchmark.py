@@ -119,6 +119,13 @@ def main():
     parser.add_argument("--bs-values", help="Only model config override, e.g. 96,4096")
     parser.add_argument("--mode", choices=("accuracy", "perf", "trace"), default="accuracy")
     parser.add_argument(
+        "--combine-reduce-qps",
+        type=int,
+        choices=(0, 4, 8),
+        default=0,
+        help="0: BF16 forwarding; 4/8: FP32 gateway reduction with that many owned QPs",
+    )
+    parser.add_argument(
         "--perf-method",
         choices=PERF_METHODS,
         default="legacy",
@@ -183,6 +190,7 @@ def run(args, config, group):
             args.timer_ranks,
             args.check_tokens,
             args.relative_rmse,
+            args.combine_reduce_qps,
         ),
     )
     timer_ranks = args.timer_ranks if args.timer_ranks is not None else list(range(min(world, 8)))
@@ -229,7 +237,10 @@ def run(args, config, group):
             "shmem_mte_roce" if int(os.environ["LOCAL_WORLD_SIZE"]) == 16 and world > 16 else "shmem_mte"
         ),
         api="fp8_fp4_mega_moe",
-        numerical_contract="ascend_post_gmm2_route_weight_v1",
+        numerical_contract=(
+            "ascend_post_gmm2_host_reduce_fp32_v1" if args.combine_reduce_qps else "ascend_post_gmm2_route_weight_v1"
+        ),
+        combine_reduce_qps=args.combine_reduce_qps,
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
     )
@@ -239,6 +250,7 @@ def run(args, config, group):
         group,
         num_max_tokens_per_rank=max(config["bs_values"]),
         ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
+        combine_reduce_qps=args.combine_reduce_qps,
         **model,
     )
 
@@ -393,11 +405,13 @@ def run(args, config, group):
             per_rank = group.all_gather(timings, f"profiling BS={bs}")
             report = summarize_rounds(per_rank, int(os.environ["LOCAL_WORLD_SIZE"]))
             report.update(measurement)
+            report["combine_reduce_qps"] = args.combine_reduce_qps
             (case / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             if rank == 0:
                 print(
                     f"[PERF] BS={bs} MegaMoe E2E={report['mean_us']:.3f}us "
                     f"rank-max-mean={report['rank_max_mean_us']:.3f}us "
+                    f"combine-reduce-qps={args.combine_reduce_qps} "
                     f"rounds={report['rounds']}/{report['recorded_rounds']} "
                     f"(last ceil(iters/2); kernel Duration; rank-min mean; timer off; method={args.perf_method})",
                     flush=True,

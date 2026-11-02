@@ -54,6 +54,11 @@ HOST_DEVICE bool UseHierarchicalRoce(const MegaMoeTilingData* t)
     return t->topoType == TOPO_TYPE_MTE_ROCE;
 }
 
+HOST_DEVICE bool UseHierarchicalCombineReduction(const MegaMoeTilingData* t)
+{
+    return UseHierarchicalRoce(t) && t->combineReduceQps != 0U;
+}
+
 constexpr uint32_t HIERARCHICAL_RANKS_PER_HOST = 16U;
 constexpr uint32_t HIERARCHICAL_WORLD_SIZE = 32U;
 // Covers the DSV41 sweep (original BS 1..24, six tokens per sequence).
@@ -100,11 +105,31 @@ HOST_DEVICE uint32_t HierarchicalSendJob()
     return 1U;
 }
 
+HOST_DEVICE uint32_t HierarchicalCombineOwnerCount(const MegaMoeTilingData* t)
+{
+    return UseHierarchicalCombineReduction(t) ? t->combineReduceQps : 1U;
+}
+
+// Physical AIV1,3,... own QP1,2,...; all retain their activation/Dispatch jobs.
+HOST_DEVICE uint32_t HierarchicalCombineLane(const MegaMoeTilingData* t, uint32_t physicalJob)
+{
+    const uint32_t count = HierarchicalCombineOwnerCount(t);
+    const uint32_t lane = physicalJob / 2U;
+    return (physicalJob & 1U) != 0U && lane < count ? lane : count;
+}
+
+HOST_DEVICE bool IsHierarchicalCombineOwner(const MegaMoeTilingData* t, uint32_t physicalJob)
+{
+    return UseHierarchicalRoce(t) && HierarchicalCombineLane(t, physicalJob) < HierarchicalCombineOwnerCount(t);
+}
+
 // Reserve the physical QP owner for completion after the output-ready barrier.
 // Host buffer sizing and device token partitioning must use the same job count.
 HOST_DEVICE uint32_t UnpermuteJobCount(const MegaMoeTilingData* t)
 {
-    return UseHierarchicalRoce(t) && t->blockAivNum > HierarchicalSendJob() ? t->blockAivNum - 1U : t->blockAivNum;
+    return UseHierarchicalRoce(t) && t->blockAivNum > HierarchicalSendJob()
+               ? t->blockAivNum - HierarchicalCombineOwnerCount(t)
+               : t->blockAivNum;
 }
 
 HOST_DEVICE uint32_t UnpermuteJobIndex(const MegaMoeTilingData* t, uint32_t physicalJob)
@@ -112,10 +137,12 @@ HOST_DEVICE uint32_t UnpermuteJobIndex(const MegaMoeTilingData* t, uint32_t phys
     if (UnpermuteJobCount(t) == t->blockAivNum) {
         return physicalJob;
     }
-    if (physicalJob == HierarchicalSendJob()) {
+    if (IsHierarchicalCombineOwner(t, physicalJob)) {
         return UnpermuteJobCount(t);  // Invalid logical job: owns no output rows.
     }
-    return physicalJob > HierarchicalSendJob() ? physicalJob - 1U : physicalJob;
+    const uint32_t before = (physicalJob + 1U) / 2U;
+    const uint32_t count = HierarchicalCombineOwnerCount(t);
+    return physicalJob - (before < count ? before : count);
 }
 
 HOST_DEVICE uint64_t HierarchicalSignalOffset(HierarchicalSignal signal)
@@ -222,11 +249,26 @@ HOST_DEVICE int64_t CalcRailTopkIdsSlotDataBytes(int64_t numMaxTokensPerRank, in
     return packets * RAIL_PACKET_BYTES;
 }
 
+HOST_DEVICE int64_t CalcCombineWeightsBytes(int64_t tokens, int64_t topK)
+{
+    return Ops::Base::CeilAlign(tokens * topK * static_cast<int64_t>(sizeof(float)), ALIGN_512);
+}
+
+// Only the active prefix is transmitted. Capacity fixes the slot stride, while
+// actual B fixes the route offset inside each slot, identically on all ranks.
+HOST_DEVICE int64_t HierarchicalMetadataPrefixBytes(const MegaMoeTilingData* t)
+{
+    return UseHierarchicalCombineReduction(t) ? CalcCombineWeightsBytes(t->bs, t->topK) : 0;
+}
+
 // 不再追加独立 arrival 区：每个包的标记随该包的数据一起发送。
 HOST_DEVICE int64_t CalcRailTopkIdsSlotBytes(const MegaMoeTilingData* tilingData)
 {
     return CalcRailTopkIdsSlotDataBytes(static_cast<int64_t>(tilingData->numMaxTokensPerRank),
-                                        static_cast<int64_t>(tilingData->topK));
+                                        static_cast<int64_t>(tilingData->topK)) +
+           (UseHierarchicalCombineReduction(tilingData)
+                ? CalcCombineWeightsBytes(tilingData->numMaxTokensPerRank, tilingData->topK)
+                : 0);
 }
 
 // 每卡接收来自各 server 同号卡的 topkIds，槽数 = serverNum（含本 server 自己那份，路径统一）。
@@ -307,6 +349,7 @@ struct PeermemSizeParams {
     int64_t topoType;
     bool reserveDecodeRail = false;
     uint32_t ranksPerNode = 0U;
+    uint32_t combineReduceQps = 0U;
 };
 
 /*
@@ -328,9 +371,12 @@ HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams& params)
     const bool rail = UsesMteLayout(params.topoType) && params.reserveDecodeRail;
     int64_t expertCountRecvSize = rail ? CalcMteExpertCountRecvSize(params.moeExpertPerRank, params.epWorldSize)
                                        : CalcExpertCountRecvSize(params.moeExpertPerRank, params.epWorldSize);
-    int64_t railBytes = rail ? CalcServerNum(params.epWorldSize, RailServerSize(params.ranksPerNode)) *
-                                   CalcRailTopkIdsSlotDataBytes(params.numMaxTokensPerRank, params.topK)
-                             : 0;
+    int64_t railBytes =
+        rail ? CalcServerNum(params.epWorldSize, RailServerSize(params.ranksPerNode)) *
+                   (CalcRailTopkIdsSlotDataBytes(params.numMaxTokensPerRank, params.topK) +
+                    (params.combineReduceQps != 0U ? CalcCombineWeightsBytes(params.numMaxTokensPerRank, params.topK)
+                                                   : 0))
+             : 0;
 
     int64_t tokenScaleBytes =
         CalcQuantTokenScaleBytes(params.h, params.elemsPerByte, params.topK, params.topkWeightsPrefetch);
@@ -345,6 +391,11 @@ HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams& params)
         bytes += params.numMaxTokensPerRank * params.topK * HIERARCHICAL_FLAG_BYTES;
         bytes += static_cast<int64_t>(HierarchicalSignal::Count) * HIERARCHICAL_FLAG_BYTES;
         bytes += HIERARCHICAL_RANKS_PER_HOST * HIERARCHICAL_FLAG_BYTES;
+        if (params.combineReduceQps != 0U) {
+            const int64_t partialBytes = Ops::Base::CeilAlign(
+                params.numMaxTokensPerRank * params.h * static_cast<int64_t>(sizeof(float)), ALIGN_512);
+            bytes += 2 * partialBytes + params.combineReduceQps * HIERARCHICAL_FLAG_BYTES;
+        }
     }
     return bytes;
 }
@@ -364,6 +415,9 @@ struct PeermemInfo {
     GM_ADDR gatewayCombineReadyPtr{nullptr};
     GM_ADDR hierarchicalControlPtr{nullptr};
     GM_ADDR gatewayPayloadReadyPtr{nullptr};
+    GM_ADDR combinePartialSendPtr{nullptr};
+    GM_ADDR combinePartialRecvPtr{nullptr};
+    GM_ADDR combineReduceCommitPtr{nullptr};
 
     HOST_DEVICE PeermemInfo() = default;
     HOST_DEVICE PeermemInfo(GM_ADDR base, const MegaMoeTilingData* tilingData, uint32_t elemsPerByte = 1,
@@ -385,7 +439,7 @@ struct PeermemInfo {
         expertCountRecvPtr = base + offset;
         if (UseDecodeRailRouting(tilingData)) {
             offset += CalcMteExpertCountRecvSize(tilingData->moeExpertPerRank, tilingData->epWorldSize);
-            railTopkIdsRecvPtr = base + offset;
+            railTopkIdsRecvPtr = base + offset + HierarchicalMetadataPrefixBytes(tilingData);
             offset += CalcRailTopkIdsRecvSize(tilingData);
         } else {
             offset += CalcExpertCountRecvSize(tilingData->moeExpertPerRank, tilingData->epWorldSize);
@@ -426,6 +480,16 @@ struct PeermemInfo {
             // One persistent, single-writer line per gateway on this host.
             // Never reset at launch: a peer can broadcast before our reset.
             gatewayPayloadReadyPtr = base + offset;
+            offset += HIERARCHICAL_RANKS_PER_HOST * HIERARCHICAL_FLAG_BYTES;
+            if (UseHierarchicalCombineReduction(tilingData)) {
+                const int64_t partialBytes = Ops::Base::CeilAlign(
+                    static_cast<int64_t>(tilingData->numMaxTokensPerRank) * tilingData->h * sizeof(float), ALIGN_512);
+                combinePartialSendPtr = base + offset;
+                offset += partialBytes;
+                combinePartialRecvPtr = base + offset;
+                offset += partialBytes;
+                combineReduceCommitPtr = base + offset;
+            }
         }
     }
 };

@@ -265,6 +265,42 @@ MegaMoE 的专属流通过已有事件依赖等待它；下一轮预处理也等
 也不代表经过跨设备时钟校准的全局起止跨度。`perf` 不传入设备 timer；安装了支持 timer 的 wheel 也不会打点，
 wheel 的编译配置可在每个 rank 的 `manifest.json` 中核对。需要恢复不支持 timer 的构建时执行普通 `build`。
 
+#### BS32：4QP 网关加权归并实验
+
+`--combine-reduce-qps 4` 开启网关加权归并；`0`（默认）保留原 BF16 专家行回传，
+`8` 使用8个归并发送核。三种配置使用同一份 wheel，切换参数无需重新编译。
+两台机器必须执行相同命令；首次使用本功能需两端完整 `build`，无需重建同版本 SHMEM。
+
+```bash
+# 两台各自构建一次，再同时执行每一条测试命令。
+bash experiments/megamoe/scripts/run_bs32.sh build --errors-only
+bash experiments/megamoe/scripts/run_bs32.sh run --combine-reduce-qps 4
+bash experiments/megamoe/scripts/run_bs32.sh perf --combine-reduce-qps 0
+bash experiments/megamoe/scripts/run_bs32.sh perf --combine-reduce-qps 4
+# 后续比较8QP：同一份构建，先精度后性能。
+bash experiments/megamoe/scripts/run_bs32.sh run --combine-reduce-qps 8
+bash experiments/megamoe/scripts/run_bs32.sh perf --combine-reduce-qps 8
+```
+
+直接调用时设置 `SymmBuffer(..., ranks_per_node=16, combine_reduce_qps=4)`；仅支持双机EP32、
+FP8xFP4、实际B=1～256。QP数量在 buffer 创建时确定，需要集体销毁并重建 buffer 才能改变。
+原生接口协议已升级，Python与扩展必须来自同一份完整构建。
+
+路由元数据和FP32权重在同一次Put中发送；BS32/K8时由1536 B增至2560 B。
+网关保留原BF16专家槽，在对应token的远端专家行全部就绪后，按top-k顺序做FP32乘权与求和，
+将每token的一个FP32部分和直接发送。物理AIV1、3、5、7各独占QP1～4；
+这些核先完成本核全部路由/共享激活与Dispatch，再参与归并，token归并后立即提交。
+BS32 balanced路由下，每个4QP owner归并4个远端token；8QP时每个owner归并2个。
+每条QP仍在原host barrier之后发布独立commit，最终输出等待所有QP；不扣留token来携带完成标记。
+各QP的quiet与其他AIV的Unpermute重叠，发送区和sequence保持不变直到quiet完成。
+
+源端仅对本机BF16专家行乘权，远端FP32部分和直接累加，共享专家及最终BF16转换沿用原路径。
+混合主机路由改变FP32加法结合顺序，**不保证与原路径逐bit一致**，精度阈值不放宽。
+`run.json`、`manifest.json`、`profiling.json`及性能汇总记录`combine_reduce_qps`。
+若需要流水诊断，先两端 `build --timer`，再执行 `trace --combine-reduce-qps 4`；
+新增`AIV_COMBINE_REDUCE`事件记录QP、token和专家掩码。性能比较使用不传timer的`perf`。
+CPU数值、内存范围与异步协议测试不能替代CANN编译和NPU实测；性能收益尚待上机确认。
+
 #### BS32：Dispatch 单次完成通知，双机 A/B（历史实验）
 
 此实验已完成，保留用于复现 `546182b`；后续优化使用 `build`、`run`、一次 `perf` 的流程，

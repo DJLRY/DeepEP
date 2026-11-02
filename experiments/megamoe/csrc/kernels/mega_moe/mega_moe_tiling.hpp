@@ -213,5 +213,7 @@ struct MegaMoeTilingData {
     // Nonzero invocation ID owned by SymmBuffer, independent of BS-specific Plans
     // and of the original 7-bit route/count epoch. Never wrap in a live buffer.
     uint32_t hierarchicalSequence;
+    // 0: original BF16 forwarding; 4/8: FP32 gateway reduction and owned QPs.
+    uint32_t combineReduceQps;
 };
 #endif

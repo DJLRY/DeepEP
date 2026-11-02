@@ -135,12 +135,17 @@ def backend(monkeypatch):
         current_device=lambda: 0, current_stream=lambda _: stream, stream=lambda _: contextlib.nullcontext()
     )
     monkeypatch.setattr(api, "npu_api", lambda: npu)
-    monkeypatch.setattr(api, "require_native", lambda _: SimpleNamespace(megamoe_workspace_address=lambda _: 4096))
+    monkeypatch.setattr(
+        api,
+        "require_native",
+        lambda _: SimpleNamespace(megamoe_workspace_address=lambda _: 4096, megamoe_combine_reduce_version=1),
+    )
 
     class Runtime:
-        def __init__(self, group, capacity, timeout, *, ranks_per_node=0):
+        def __init__(self, group, capacity, timeout, *, ranks_per_node=0, roce_app_qps=1):
             self.device, self.stream, self.native = 0, stream, SimpleNamespace(capacity=capacity)
             self.ranks_per_node = ranks_per_node
+            self.roce_app_qps = roce_app_qps
             self.closed = False
 
         def ensure_alive(self):
@@ -156,6 +161,7 @@ def backend(monkeypatch):
     class Plan:
         def __init__(self, example, *args):
             self.bs, self.workspace_bytes = example.shape[0], 4096
+            self.options = args
             events.append(("prepare", self.bs))
 
         def forward(self, *args):
@@ -475,15 +481,63 @@ def test_plan_allocation_failure_is_collective_and_retryable(backend):
     assert backend.buffer._plan_bs == 17
 
 
-def hierarchical_buffer(backend, *, size=32, mma_type="fp8xfp4"):
+def hierarchical_buffer(backend, *, size=32, mma_type="fp8xfp4", combine_reduce_qps=0):
     from deep_ep._store import StoreGroup
 
     group = StoreGroup(None, 0, size, prefix="hierarchical-api-test")
     group.all_gather = lambda value, stage: [value] * size
-    buffer = api.SymmBuffer(group, size * 2, 257, 2, 1024, 256, ranks_per_node=16, mma_type=mma_type)
+    buffer = api.SymmBuffer(
+        group, size * 2, 257, 2, 1024, 256, ranks_per_node=16, mma_type=mma_type, combine_reduce_qps=combine_reduce_qps
+    )
     buffer.topk_idx.data[:] = [0, size]
     buffer.topk_weights.data[:] = [0.4, 0.6]
     return buffer
+
+
+@pytest.mark.parametrize("qps", [0, 4, 8])
+def test_reduction_configuration_reaches_heap_runtime_and_plan(backend, qps):
+    sizes = []
+    backend.ext.buffer_size = lambda *args: sizes.append(args) or (2 << 20)
+    b = hierarchical_buffer(backend, combine_reduce_qps=qps)
+    try:
+        b.prepare(32)
+        assert b.combine_reduce_qps == qps
+        assert sizes[0][-1] == qps and b._plan.options[-1] == qps
+        assert b._runtime.roce_app_qps == (qps or 1)
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize("case", ["bad-qps", "ep16", "fp8", "old-core", "peer-mismatch"])
+def test_reduction_bad_configuration_fails_collectively_before_runtime(backend, monkeypatch, case):
+    from deep_ep._store import StoreGroup
+
+    monkeypatch.setattr(api, "_MegaRuntime", lambda *a, **kw: pytest.fail("Invalid configuration started SHMEM"))
+    if case == "old-core":
+        monkeypatch.setattr(api, "require_native", lambda _: SimpleNamespace())
+    size = 16 if case == "ep16" else 32
+    group = StoreGroup(None, 0, size, prefix="reduction-invalid")
+
+    def gather(value, stage):
+        peers = [value] * size
+        if case == "peer-mismatch" and stage == "check:configuration":
+            error, config = value
+            peers[-1] = (error, (*config[:-1], 8))
+        return peers
+
+    group.all_gather = gather
+    with pytest.raises(ValueError):
+        api.SymmBuffer(
+            group,
+            size * 2,
+            32,
+            2,
+            1024,
+            256,
+            ranks_per_node=16,
+            mma_type="fp8xfp8" if case == "fp8" else "fp8xfp4",
+            combine_reduce_qps=2 if case == "bad-qps" else 4,
+        )
 
 
 @pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8"])
@@ -587,7 +641,7 @@ def test_hierarchical_a8w8_bs32_uses_fp8_weights_without_layout_conversion(backe
         b.destroy()
 
 
-@pytest.mark.parametrize("protocol", [5, 6])
+@pytest.mark.parametrize("protocol", [5, 6, 7])
 def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypatch, protocol):
     api._extension.cache_clear()
     core = SimpleNamespace(create_megamoe_runtime=lambda: None)
@@ -595,7 +649,7 @@ def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypa
     monkeypatch.setattr(api, "require_native", lambda _: core)
     monkeypatch.setattr(api.importlib, "import_module", lambda _: extension)
     try:
-        if protocol == 5:
+        if protocol != 7:
             with pytest.raises(RuntimeError, match="versions differ"):
                 api._extension()
         else:

@@ -31,7 +31,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 6:
+    if getattr(extension, "api_protocol", None) != 7:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -81,6 +81,7 @@ class SymmBuffer:
         *,
         ranks_per_node: int = 0,
         timeout: int = 120,
+        combine_reduce_qps: int = 0,
     ):
         import torch
         import torch.distributed as dist
@@ -99,6 +100,11 @@ class SymmBuffer:
             integer("world_size", size, 2, 128)
             integer("ranks_per_node", ranks_per_node, 0, size)
             integer("timeout", timeout, 1, 300)
+            integer("combine_reduce_qps", combine_reduce_qps, 0, 8)
+            if combine_reduce_qps not in (0, 4, 8):
+                raise ValueError("combine_reduce_qps must be 0, 4 or 8")
+            if combine_reduce_qps and (size != 32 or ranks_per_node != 16 or mma_type != "fp8xfp4"):
+                raise ValueError("Gateway weighted reduction requires EP32, ranks_per_node=16 and FP8xFP4")
             if hidden % 64 or intermediate_hidden % 128:
                 raise ValueError("hidden must be divisible by 64; intermediate_hidden by 128")
             if activation != "swiglu" or mma_type not in {"fp8xfp4", "fp8xfp8"}:
@@ -126,11 +132,14 @@ class SymmBuffer:
             activation,
             ranks_per_node,
             timeout,
+            combine_reduce_qps,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
         capacity = int(
-            ext.buffer_size(size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, ranks_per_node)
+            ext.buffer_size(
+                size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, ranks_per_node, combine_reduce_qps
+            )
         )
         self._lock = threading.Lock()
         self._device = torch.device(f"npu:{npu_api().current_device()}")
@@ -140,17 +149,23 @@ class SymmBuffer:
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
         self.ranks_per_node = ranks_per_node
+        self.combine_reduce_qps = combine_reduce_qps
         self._hierarchical_roce = ranks_per_node == 16 and size > 16
         self._sequence = 0
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
         try:
+            if combine_reduce_qps and getattr(require_native("MegaMoE"), "megamoe_combine_reduce_version", 0) != 1:
+                raise RuntimeError("Rebuild the complete wheel for MegaMoE weighted reduction and owned QPs")
             self.allocate_inputs()
         except Exception as failure:
             error = str(failure)
         # 输入分配失败先通知所有 rank，再进入 SHMEM，避免其他 rank 已在建链等待。
         collective_check(group, "input allocation", error)
-        self._runtime = _MegaRuntime(group, capacity, timeout, ranks_per_node=ranks_per_node)
+        runtime_options = dict(ranks_per_node=ranks_per_node)
+        if combine_reduce_qps:
+            runtime_options["roce_app_qps"] = combine_reduce_qps
+        self._runtime = _MegaRuntime(group, capacity, timeout, **runtime_options)
 
     def allocate_inputs(self):
         """Legacy idempotent helper. Inputs are already allocated by the constructor."""
@@ -174,7 +189,7 @@ class SymmBuffer:
 
     def _prepare(self, bs):
         integer("BS", bs, 1, self.num_max_tokens_per_rank)
-        # Older protocol-6 wheels predate the extended sweep; retain their limit.
+        # Keep a conservative limit if a backend omits the capacity capability.
         limit = getattr(_extension(), "hierarchical_max_tokens", 32)
         if self._hierarchical_roce and bs > limit:
             raise ValueError(f"MTE+RoCE MegaMoE currently supports decode BS in [1,{limit}]; rebuild for larger BS")
@@ -198,6 +213,7 @@ class SymmBuffer:
             ext.ffts_config(),
             address,
             runtime.native.capacity,
+            self.combine_reduce_qps,
         )
         self._plan_bs = bs
 

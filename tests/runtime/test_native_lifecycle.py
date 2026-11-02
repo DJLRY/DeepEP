@@ -57,6 +57,8 @@ def lifecycle_binary(tmp_path_factory, request):
         "megamoe",
         "megamoe-roce",
         "megamoe-roce-close-fault",
+        "megamoe-roce-qp4",
+        "megamoe-roce-qp8",
         "low-latency",
         "ll-rank-bias-16",
         "ll-rank-bias-32",

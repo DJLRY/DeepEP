@@ -53,6 +53,7 @@ struct AivJobContext {
 struct Params {
     MegaMoeTilingData* tilingData;
     PeermemInfo peermemInfo;
+    GM_ADDR probsGmAddr;
 };
 struct SendMaskConfig {
     uint64_t railTopkIdsSlotBytes;
@@ -167,7 +168,7 @@ void SyncAll()
 using namespace MegaMoeImpl;
 
 void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidden, uint32_t topk,
-                   std::string_view pattern, uint32_t invocation = 257U)
+                   std::string_view pattern, uint32_t invocation = 257U, uint32_t reduceQps = 0U)
 {
     using namespace DispatchTest;
     MegaMoeTilingData t{};
@@ -183,9 +184,10 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     t.groupedMatmulMode = GROUPED_MATMUL_MODE_A8W4;
     t.roceScratchUbOffset = kScratchOffset;
     t.hierarchicalSequence = invocation;
+    t.combineReduceQps = reduceQps;
     Check(UseDecodeRailRouting(&t), "fixture requires the production decode rail layout");
-    const PeermemSizeParams sizes{capacity,           topk, hidden, 12U, 32U, 2U, 1U, false, false,
-                                  TOPO_TYPE_MTE_ROCE, true, 16U};
+    const PeermemSizeParams sizes{capacity,           topk, hidden, 12U,      32U, 2U, 1U, false, false,
+                                  TOPO_TYPE_MTE_ROCE, true, 16U,    reduceQps};
     const auto heapBytes = static_cast<size_t>(CalcPeermemLeastSize(sizes));
     // Append compact mapped ready regions for the other fifteen peers.
     // Only their ready slots are accessed by this fixture.
@@ -203,7 +205,9 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     broadcasts.fill(0U);
     RoceTest::operations.clear();
     RoceTest::signalObserved = RoceTest::scalarEventSet = RoceTest::mteCanRead = false;
-    Params params{&t, PeermemInfo(local.data(), &t)};
+    std::vector<float> weights(bs * topk);
+    for (uint32_t i = 0; i < weights.size(); ++i) weights[i] = (static_cast<int32_t>(i % 19) - 7) / 8.0F;
+    Params params{&t, PeermemInfo(local.data(), &t), reinterpret_cast<uint8_t*>(weights.data())};
     MoeStageCommonConfig common{rank, bs, topk, hidden, 12U};
     payloadReadyBase = Offset(params.peermemInfo.gatewayPayloadReadyPtr, 16U * 512U);
     ownerSlot = rank % 16U;
@@ -246,6 +250,9 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     const uint32_t incoming = Offset(
         params.peermemInfo.railTopkIdsRecvPtr + (1U - HierarchicalHost(rank)) * config.railTopkIdsSlotBytes, railBytes);
     metadataMarker = incoming + railBytes - 4U;
+    const uint32_t prefix = HierarchicalMetadataPrefixBytes(&t);
+    const uint32_t messageStart = rail - prefix;
+    const uint32_t messageBytes = railBytes + prefix;
     for (uint32_t token = 0U; token < bs; ++token) {
         for (uint32_t slot = 0U; slot < topk; ++slot) {
             const bool other = pattern == "remote" || (pattern == "mixed" && (token + slot) % 3U == 0U) ||
@@ -274,9 +281,16 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
         RoceTest::blockIndex = RoceTest::subBlockIndex = 1;
     };
     GatherAndPostHierarchicalDispatch(owner, common, params, nullptr, config, scratch);
-    Check(packCalls == 1U && posts.front().source == rail && posts.front().destination == rail &&
-              posts.front().bytes == railBytes,
+    Check(packCalls == 1U && posts.front().source == messageStart && posts.front().destination == messageStart &&
+              posts.front().bytes == messageBytes,
           "metadata was not the first Put");
+    if (reduceQps != 0U) {
+        Check(std::memcmp(local.data() + messageStart, weights.data(), weights.size() * sizeof(float)) == 0,
+              "packed weights do not match the source top-k probabilities");
+        Check(std::all_of(local.begin() + messageStart + weights.size() * sizeof(float), local.begin() + rail,
+                          [](uint8_t b) { return b == 0x7BU; }),
+              "packer overwrote weight padding");
+    }
     Check(posts.back().source == source && posts.back().destination == destination && posts.back().bytes == activeBytes,
           "payload range did not follow metadata on the same owned QP");
     for (uint32_t end = 512U; end <= railBytes; end += 512U) {
@@ -293,7 +307,7 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
           "XSCALE did not preserve separate metadata completion before payload");
     std::memcpy(expected.data() + metaCommit, &sequence, sizeof(sequence));
 #endif
-    std::copy_n(local.data() + rail, railBytes, expected.data() + rail);
+    std::copy_n(local.data() + messageStart, messageBytes, expected.data() + messageStart);
     Check(remote == expected, "metadata completion exposed or changed the payload");
     const auto pendingBeforeReceive = queued.size();
     const uint32_t quietsBeforeReceive = quiets;
@@ -302,8 +316,8 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     // The current-length tail contains an old full sequence with the same
     // legacy 7-bit epoch. A stale capacity-tail marker must not release Relay.
     writeWord(metadataMarker, sequence - 128U);
-    if (config.railTopkIdsSlotBytes > railBytes) {
-        writeWord(incoming + static_cast<uint32_t>(config.railTopkIdsSlotBytes) - 4U, sequence);
+    if (config.railTopkIdsSlotBytes > messageBytes) {
+        writeWord(incoming - prefix + static_cast<uint32_t>(config.railTopkIdsSlotBytes) - 4U, sequence);
     }
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
     writeWord(metaCommit, sequence);  // HNS must ignore this old independent flag.
@@ -322,7 +336,7 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     RoceTest::cycleStep = 1;
     Check(staleRejected && relayCalls == 0U && ReadWord(local, metaReady) != sequence,
           "stale actual-tail or capacity-tail marker released metadata");
-    std::copy_n(local.data() + rail, railBytes, local.data() + incoming);
+    std::copy_n(local.data() + messageStart, messageBytes, local.data() + incoming - prefix);
 #if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
     writeWord(metaCommit, sequence);
 #endif
@@ -383,6 +397,8 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     std::fill_n(local.data() + source, activeBytes, uint8_t{0xDDU});
     std::fill_n(local.data() + rail, railBytes, uint8_t{0xCCU});
     Check(remote == expected, "completed receive still referenced the reusable source");
+    Check(std::none_of(AscendC::packEvents.begin(), AscendC::packEvents.end(), [](bool v) { return v; }),
+          "packer left an event outstanding");
 }
 
 int main()
@@ -401,6 +417,12 @@ int main()
             CheckDispatch(rank, 1U, 64U, 3584U, 32U, "local");
             CheckDispatch(rank, 32U, 64U, 3584U, 8U, "mixed", 0x80000101U);
             CheckDispatch(rank, 7U, 64U, 3584U, 8U, "last", 0xffffffffU);
+            for (uint32_t qps : {4U, 8U}) {
+                CheckDispatch(rank, 32U, 64U, 3584U, 8U, "mixed", 257U, qps);
+                CheckDispatch(rank, 7U, 32U, 1024U, 1U, "remote", 0xffffffffU, qps);
+                CheckDispatch(rank, 1U, 64U, 3584U, 32U, "local", 257U, qps);
+                CheckDispatch(rank, 256U, 256U, 1024U, 32U, "last", 257U, qps);
+            }
         }
         // Negative control: the asynchronous double must detect early source
         // reuse instead of accidentally behaving as a synchronous memcpy.

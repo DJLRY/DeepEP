@@ -49,7 +49,12 @@ struct MoeStageCommonConfig {
 };
 struct TilingData {
     bool hierarchical = true;
+    bool reduction = false;
 };
+bool UseHierarchicalCombineReduction(const TilingData* tiling)
+{
+    return tiling->hierarchical && tiling->reduction;
+}
 bool UseHierarchicalRoce(const TilingData* tiling)
 {
     return tiling->hierarchical;
@@ -165,9 +170,10 @@ struct FixtureImpl : FixtureBase<Tag> {
     bool activationReady = false, activationDone = false;
     uint32_t currentSlice = 0U, retired = 0U, remoteCalls = 0U;
 
-    explicit FixtureImpl(uint32_t block = 0U, uint32_t blocks = 28U, bool hierarchical = true)
+    explicit FixtureImpl(uint32_t block = 0U, uint32_t blocks = 28U, bool hierarchical = true, bool reduction = false)
     {
         tiling.hierarchical = hierarchical;
+        tiling.reduction = reduction;
         waveCombineJob_ = {block, blocks};
         gmmExecutionConfig_.blockJob = waveCombineJob_;
         this->aivJob_ = {2U * block + 1U, 2U * blocks};
@@ -261,14 +267,16 @@ using Fixture = FixtureImpl<void>;
 
 void Coverage()
 {
-    for (bool hierarchical : {false, true}) {
+    for (uint32_t mode : {0U, 1U, 2U}) {
+        const bool hierarchical = mode != 0U;
+        const bool reduction = mode == 2U;
         for (uint32_t blocks : {1U, 2U, 4U, 28U}) {
             for (uint32_t rows : {1U, 7U, 21U, 22U, 27U, 28U, 29U, 32U, 255U, 256U, 257U, 1024U}) {
                 for (uint64_t prefix : {0ULL, 1ULL, 27ULL, 257ULL, (1ULL << 40U) + 17ULL}) {
                     for (uint64_t wave : {0ULL, 1ULL, 27ULL, 28ULL, (1ULL << 35U) + 3ULL}) {
                         std::vector<uint32_t> writes(rows, 0U), loads;
                         for (uint32_t block = 0U; block < blocks; ++block) {
-                            Fixture f(block, blocks, hierarchical);
+                            Fixture f(block, blocks, hierarchical, reduction);
                             // H8192 requires all 28 producers, exposing accidental use of 27 consumers.
                             f.commonConfig_.tokenHiddenDim = 8192U;
                             auto cursor = Fixture::Slice(rows, prefix + 256U, wave, 3U, 256U);
@@ -285,12 +293,13 @@ void Coverage()
                             for (auto count : writes) {
                                 after += count;
                             }
-                            if (hierarchical && blocks > 1U && block == 0U) {
+                            const bool offload = hierarchical && !reduction && blocks > 1U;
+                            if (offload && block == 0U) {
                                 assert(f.params_.sendCalls == 0U && after == before);
                             } else {
                                 loads.push_back(after - before);
-                                uint32_t consumers = blocks - static_cast<uint32_t>(hierarchical && blocks > 1U);
-                                uint32_t consumer = block - static_cast<uint32_t>(hierarchical && blocks > 1U);
+                                uint32_t consumers = blocks - static_cast<uint32_t>(offload);
+                                uint32_t consumer = block - static_cast<uint32_t>(offload);
                                 uint32_t first =
                                     (cursor.slice.begin.globalTokenIndex % consumers + wave % consumers) % consumers;
                                 uint32_t logical = (consumer + consumers - first) % consumers;

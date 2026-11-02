@@ -36,6 +36,7 @@
 #include "stage/mega_moe_gmm1_activation.hpp"
 #include "stage/mega_moe_gmm2_combine.hpp"
 #include "stage/mega_moe_hierarchical_combine.hpp"
+#include "stage/mega_moe_hierarchical_reduce.hpp"
 #include "stage/mega_moe_unpermute.hpp"
 #include "mc2_common/quantize_functions.hpp"
 
@@ -96,6 +97,17 @@ protected:
     __aicore__ inline bool TryProgressRemoteCombine(bool foregroundPending = true)
     {
         if constexpr (g_coreType == AIV) {
+            if (UseHierarchicalCombineReduction(params_.tilingData)) {
+                // A whole token is nonpreemptible. Never start it while this
+                // worker still owes any activation or Dispatch work.
+                if (foregroundPending || !IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)) {
+                    return false;
+                }
+                return TryProgressHierarchicalReducedCombine(
+                    commonConfig_, params_, hierarchicalCombine_,
+                    HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex), HierarchicalRoceScratch(params_),
+                    timer_.Enabled() ? &timer_ : nullptr);
+            }
             if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
                 // Bound both posting and flag scans before returning to the
                 // next activation/dispatch task on the fixed AIV1 owner.
@@ -1037,18 +1049,28 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                                               AscendTimer::AIV_HOST_COMBINE_BARRIER_WAIT);
                 CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
             }
-            if (aivJob_.jobIndex == HierarchicalSendJob()) {
+            if (IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)) {
                 auto* scratch = HierarchicalRoceScratch(params_);
                 auto* rdmaTimer = timer_.Enabled() ? &timer_ : nullptr;
-                DrainHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch, rdmaTimer);
-                RocePublishCommit(reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(
-                                      params_.peermemInfo, HierarchicalSignal::CombineCommit)),
+                const uint32_t lane = HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex);
+                auto* commit = HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::CombineCommit);
+                if (UseHierarchicalCombineReduction(params_.tilingData)) {
+                    DrainHierarchicalReducedCombine(commonConfig_, params_, hierarchicalCombine_, lane, scratch,
+                                                    rdmaTimer);
+                    commit = reinterpret_cast<__gm__ int32_t*>(params_.peermemInfo.combineReduceCommitPtr +
+                                                               lane * HIERARCHICAL_FLAG_BYTES);
+                } else {
+                    DrainHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch, rdmaTimer);
+                }
+                // No QP orders another QP's payload. Every owner posts its own
+                // commit before waiting; the existing SyncAll joins all lanes.
+                RocePublishCommit(reinterpret_cast<GM_ADDR>(commit),
                                   reinterpret_cast<GM_ADDR>(
                                       HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::Sequence)),
-                                  HierarchicalGateway(rankId_), scratch, rdmaTimer, AscendTimer::RdmaPhase::Combine);
-                RoceWaitCommit(HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::CombineCommit),
-                               params_.tilingData->hierarchicalSequence, rdmaTimer, AscendTimer::RdmaPhase::Combine,
-                               HierarchicalGateway(rankId_), scratch);
+                                  HierarchicalGateway(rankId_), scratch, rdmaTimer, AscendTimer::RdmaPhase::Combine,
+                                  lane + 1U);
+                RoceWaitCommit(commit, params_.tilingData->hierarchicalSequence, rdmaTimer,
+                               AscendTimer::RdmaPhase::Combine, HierarchicalGateway(rankId_), scratch, lane + 1U);
             }
             PipeBarrier<PIPE_ALL>();
             SyncAll<true>();
@@ -1057,13 +1079,16 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         }
         timer_.End(AscendTimer::AIV_FINAL_CROSS_RANK_WAIT);
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::UNPERMUTE);
-        if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
+        if (IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)) {
             // The existing output barrier has released every consumer. Retire
             // outgoing sources while the other AIVs unpermute disjoint output
             // rows; kernel completion still waits for both groups of work.
             RoceFinishOutstanding(HierarchicalGateway(rankId_), HierarchicalRoceScratch(params_),
-                                  timer_.Enabled() ? &timer_ : nullptr, AscendTimer::RdmaPhase::Combine);
-            PublishHierarchicalLocalSignal(params_, HierarchicalSignal::TxDone);
+                                  timer_.Enabled() ? &timer_ : nullptr, AscendTimer::RdmaPhase::Combine,
+                                  HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex) + 1U);
+            if (!UseHierarchicalCombineReduction(params_.tilingData)) {
+                PublishHierarchicalLocalSignal(params_, HierarchicalSignal::TxDone);
+            }
         } else {
             MegaMoeUnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();
             timer_.Start(AscendTimer::AIV_UNPERMUTE);

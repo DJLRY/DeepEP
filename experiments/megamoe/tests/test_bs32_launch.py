@@ -196,6 +196,28 @@ def test_second_host_rank_range_and_saved_python(saved):
     assert golden[0] == benchmark[0] == config["python"]
 
 
+@pytest.mark.parametrize("qps", [0, 4, 8])
+@pytest.mark.parametrize("action", ["run", "perf", "trace"])
+def test_reduction_qps_propagate_without_rebuild_or_saved_config_change(saved, monkeypatch, qps, action):
+    path, config = saved
+    before = path.read_bytes()
+    monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(launcher, "environment", lambda _: {})
+    monkeypatch.setattr(launcher, "preflight", lambda *a: None)
+    monkeypatch.setattr(launcher, "performance_summary", lambda *a: None)
+    calls = []
+    monkeypatch.setattr(launcher, "execute", lambda command, *a, **kw: calls.append(command))
+    launcher.main([action, "--config", str(path), "--combine-reduce-qps", str(qps)])
+    benchmark = next(c for c in calls if "torch.distributed.run" in c)
+    assert ("--combine-reduce-qps" in benchmark) == bool(qps)
+    if qps:
+        assert benchmark[benchmark.index("--combine-reduce-qps") + 1] == str(qps)
+    run_dir = Path(benchmark[benchmark.index("--output-dir") + 1])
+    assert json.loads((run_dir / "run.json").read_text())["combine_reduce_qps"] == qps
+    assert path.read_bytes() == before
+    assert not any("build.sh" in str(c) for c in calls)
+
+
 def test_environment_uses_positional_paths_and_removes_import_overrides(saved, monkeypatch):
     _, config = saved
     for name in ("SHMEM_ROOT", "CATLASS_ROOT", "PYTHONPATH", "PYTHONHOME", "PYTHON_EXEC"):
@@ -490,6 +512,7 @@ def test_preflight_checks_installed_timer_support(saved, tmp_path, monkeypatch, 
     modules["deep_ep._native"].require_native = lambda operation: None
     modules["deep_ep_experimental.megamoe._C"].timer_enabled = compiled
     modules["deep_ep_experimental.megamoe._C"].hierarchical_max_tokens = limit
+    modules["deep_ep_experimental.megamoe._C"].api_protocol = 7
 
     def execute(command, env):
         monkeypatch.setattr(sys, "argv", ["-c", *command[4:]])

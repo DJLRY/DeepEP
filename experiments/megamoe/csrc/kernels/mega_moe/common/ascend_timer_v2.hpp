@@ -62,6 +62,7 @@ enum DynamicTimingType {
     AIV_COMBINE_DRAIN,
     AIV_RELAY_STEP,
     AIV_COMBINE_RUN,
+    AIV_COMBINE_REDUCE,
     DYNAMIC_TYPE_COUNT_ENUM
 };
 

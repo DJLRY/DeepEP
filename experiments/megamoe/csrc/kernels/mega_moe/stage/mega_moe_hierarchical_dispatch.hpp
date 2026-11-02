@@ -34,6 +34,31 @@ __aicore__ inline void WaitHierarchicalLocalSignal(const Params& params, Hierarc
     SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
 }
 
+// The packer owns this core's reserved UB. Weight storage precedes the active
+// route packets, so one metadata Put and its original tail marker cover both.
+__aicore__ inline void PackHierarchicalCombineWeights(const MoeStageCommonConfig& common, const Params& params)
+{
+    if (!UseHierarchicalCombineReduction(params.tilingData)) {
+        return;
+    }
+    GlobalTensor<float> source, destination;
+    source.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.probsGmAddr));
+    const uint64_t slot = HierarchicalHost(common.rankId) * CalcRailTopkIdsSlotBytes(params.tilingData);
+    destination.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.peermemInfo.railTopkIdsRecvPtr + slot -
+                                                                HierarchicalMetadataPrefixBytes(params.tilingData)));
+    constexpr uint32_t batch = HIERARCHICAL_ROCE_UB_BYTES / sizeof(float);
+    LocalTensor<float> weights(TPosition::VECCALC, params.tilingData->roceScratchUbOffset, batch);
+    const uint32_t total = common.tokenNum * common.topK;
+    for (uint32_t offset = 0U; offset < total; offset += batch) {
+        const uint32_t count = total - offset < batch ? total - offset : batch;
+        DataCopyPad(weights, source[offset], {1U, count * 4U, 0U, 0U, 0U}, {false, 0U, 0U, 0U});
+        SyncFuncStatic<HardEvent::MTE2_MTE3, MEGAMOE_ROCE_EVENT_ID>();
+        DataCopyPad(destination[offset], weights, {1U, count * 4U, 0U, 0U, 0U});
+        SyncFuncStatic<HardEvent::MTE3_MTE2, MEGAMOE_ROCE_EVENT_ID>();
+    }
+    SyncFuncStatic<HardEvent::MTE3_S, MEGAMOE_ROCE_EVENT_ID>();
+}
+
 // Local packing preserves the existing rail format. RDMA reads its stable GM
 // copy, never the packer's reusable UB. Payload rows retain their original token
 // indices at the gateway; route metadata determines which rows consumers read.
@@ -47,8 +72,10 @@ __aicore__ inline void PostHierarchicalDispatch(const MoeStageCommonConfig& comm
     // full sequence: HNS can release Relay while the following payload is
     // still in flight, without a separate metadata commit WQE.
     WaitHierarchicalLocalSignal(params, HierarchicalSignal::LocalRailPacked, gateway, roceScratch);
-    GM_ADDR packedRail = params.peermemInfo.railTopkIdsRecvPtr + myHost * config.railTopkIdsSlotBytes;
-    const uint32_t railBytes = static_cast<uint32_t>(CalcRailTopkIdsSlotDataBytes(common.tokenNum, common.topK));
+    const auto prefixBytes = HierarchicalMetadataPrefixBytes(params.tilingData);
+    GM_ADDR packedRail = params.peermemInfo.railTopkIdsRecvPtr + myHost * config.railTopkIdsSlotBytes - prefixBytes;
+    const uint32_t railBytes =
+        static_cast<uint32_t>(prefixBytes + CalcRailTopkIdsSlotDataBytes(common.tokenNum, common.topK));
     RocePutBytes(packedRail, packedRail, railBytes, gateway, roceScratch, timer, AscendTimer::RdmaPhase::DispatchMeta);
 #if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
     // XSCALE has no established packet/SO contract. Preserve its explicit
@@ -79,6 +106,7 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
     const uint32_t otherHost = 1U - myHost;
     if (job.jobIndex == HierarchicalPackJob()) {
         PublishHierarchicalLocalSignal(params, HierarchicalSignal::Sequence);
+        PackHierarchicalCombineWeights(common, params);
         SendTopkIdsToRailServer(common, winRankAddr, config, params, scratch, myHost, job.jobIndex);
         PublishHierarchicalLocalSignal(params, HierarchicalSignal::LocalRailPacked);
         return;

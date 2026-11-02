@@ -279,7 +279,8 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     // RoCE owner 保留 SwiGLU 和远端 progress，把本地 Combine 搬运交给其余 AIV1。
     // 只修改局部 consumer job；成员 waveCombineJob_ 仍描述原来的 GMM2 生产核。
     auto combineJob = waveCombineJob_;
-    const bool offloadRoceCombine = UseHierarchicalRoce(params_.tilingData) && combineJob.totalJobs > 1U;
+    const bool offloadRoceCombine = UseHierarchicalRoce(params_.tilingData) &&
+                                    !UseHierarchicalCombineReduction(params_.tilingData) && combineJob.totalJobs > 1U;
     const bool roceOwner = offloadRoceCombine && this->aivJob_.jobIndex == HierarchicalSendJob();
     if (offloadRoceCombine) {
         constexpr uint32_t AIV_CORE_COUNT_PER_AIC = 2U;

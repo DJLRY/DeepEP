@@ -68,7 +68,8 @@ add_custom_target(megamoe_device DEPENDS "${kernel_library}")
 pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp)
 set_target_properties(megamoe_ext PROPERTIES OUTPUT_NAME _C
     INSTALL_RPATH "$ORIGIN" INSTALL_RPATH_USE_LINK_PATH FALSE)
-target_include_directories(megamoe_ext PRIVATE ${beta_include} ${TORCH_INCLUDE_DIRS} "${torch_npu_root}/include")
+target_include_directories(megamoe_ext PRIVATE ${beta_include} ${TORCH_INCLUDE_DIRS} "${torch_npu_root}/include"
+    "${PROJECT_SOURCE_DIR}/csrc")
 separate_arguments(torch_flags NATIVE_COMMAND "${TORCH_CXX_FLAGS}")
 target_compile_options(megamoe_ext PRIVATE ${torch_flags} -O2 -fstack-protector-strong)
 target_compile_definitions(megamoe_ext PRIVATE CATLASS_ARCH=3510)

@@ -67,6 +67,7 @@ DYNAMIC_NAMES = [
     "AIV_COMBINE_DRAIN",
     "AIV_RELAY_STEP",
     "AIV_COMBINE_RUN",
+    "AIV_COMBINE_REDUCE",
 ]
 
 RDMA_PHASES = ("dispatch_meta", "dispatch_payload", "combine")
@@ -209,6 +210,19 @@ def task_metadata(raw, core_id, logical_index):
     first, second = raw[offset : offset + 2]
     family = DYNAMIC_NAMES[dynamic_index // MAX_DYNAMIC_ITER]
     mask = (1 << 32) - 1
+    if family == "AIV_COMBINE_REDUCE":
+        qp, token = (first >> 32) & mask, first & mask
+        topk_mask, hidden = (second >> 32) & mask, second & mask
+        if not (1 <= qp <= 8 and token < 256 and topk_mask and 1024 <= hidden <= 8192 and hidden % 64 == 0):
+            raise ValueError(f"invalid combine reduction metadata: core={core_id}, slot={dynamic_index}")
+        return dict(
+            granularity="combine_reduce",
+            qp_index=qp,
+            token_index=token,
+            topk_mask=topk_mask,
+            expert_rows=topk_mask.bit_count(),
+            hidden=hidden,
+        )
     if family == "AIV_RELAY_STEP":
         step, source = ((first >> 32) & mask), (first & mask) - 1
         if step >= len(RELAY_STEPS) or source < 0:

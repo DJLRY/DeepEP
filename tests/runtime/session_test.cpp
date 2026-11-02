@@ -16,6 +16,7 @@ int qp_count = 0;
 int qp_engine = 0;
 size_t workspace_alignment = 0;
 int expected_world = 2;
+uint32_t expected_roce_qps = 2U;
 uint64_t expected_bytes = 2 << 20;
 int storage = 0, context_token = 0, another_context = 0;
 void* current_context = &context_token;
@@ -64,7 +65,8 @@ int aclshmemx_init_attr(int, aclshmemx_init_attr_t* attr)
 int aclshmemx_set_qp_num(data_op_engine_type_t engine, uint32_t count)
 {
     assert(initialized == 0);
-    assert((engine == ACLSHMEM_DATA_OP_UDMA && count == 32) || (engine == ACLSHMEM_DATA_OP_ROCE && count == 2));
+    assert((engine == ACLSHMEM_DATA_OP_UDMA && count == 32) ||
+           (engine == ACLSHMEM_DATA_OP_ROCE && count == expected_roce_qps));
     qp_count = count;
     qp_engine = engine;
     return 0;
@@ -129,15 +131,25 @@ int main(int argc, char** argv)
         assert(session.udma() && qp_count == 32);
         session.close();
         assert(!deepep::Session::busy());
-    } else if (mode == "megamoe-roce" || mode == "megamoe-roce-close-fault") {
+    } else if (mode == "megamoe-roce" || mode == "megamoe-roce-close-fault" || mode == "megamoe-roce-qp4" ||
+               mode == "megamoe-roce-qp8") {
+        const unsigned appQps = mode == "megamoe-roce-qp8" ? 8U : mode == "megamoe-roce-qp4" ? 4U : 1U;
+        expected_roce_qps = 1U + appQps;
         fails(
             []() { deepep::Session s(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, false, false, false, true); });
         fails(
             []() { deepep::Session s(0, 16, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true); });
+        for (unsigned invalid : {0U, 2U, 3U, 5U, 9U}) {
+            fails([invalid]() {
+                deepep::Session s(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true,
+                                  invalid);
+            });
+        }
 #ifdef DEEPEP_MEGAMOE_ROCE
         expected_world = 32;
-        deepep::Session session(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true);
-        assert(qp_engine == ACLSHMEM_DATA_OP_ROCE && qp_count == 2 && !session.udma());
+        deepep::Session session(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true, appQps);
+        assert(qp_engine == ACLSHMEM_DATA_OP_ROCE && qp_count == static_cast<int>(expected_roce_qps) &&
+               !session.udma());
         assert(workspace_alignment == 512);
         fails([&]() { session.barrier(); });
         fails([&]() { session.close(); });
@@ -157,8 +169,9 @@ int main(int argc, char** argv)
         assert(barriers == 0);
         assert(!deepep::Session::busy() && frees == 1 && finalized == 1);
 #else
-        fails(
-            []() { deepep::Session s(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true); });
+        fails([appQps]() {
+            deepep::Session s(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true, appQps);
+        });
         assert(!deepep::Session::busy() && allocations == 0);
 #endif
     } else if (mode == "megamoe") {
