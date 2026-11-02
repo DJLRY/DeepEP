@@ -11,8 +11,9 @@ constexpr auto CeilDiv(T value, U divisor)
     using Result = std::common_type_t<T, U>;
     return (static_cast<Result>(value) + divisor - 1) / divisor;
 }
-template <typename T, typename U>
-constexpr auto CeilAlign(T value, U alignment)
+// Match the device SDK's single-type signature; mixed signedness must fail.
+template <typename T>
+constexpr T CeilAlign(T value, T alignment)
 {
     return CeilDiv(value, alignment) * alignment;
 }

@@ -482,8 +482,10 @@ struct PeermemInfo {
             gatewayPayloadReadyPtr = base + offset;
             offset += HIERARCHICAL_RANKS_PER_HOST * HIERARCHICAL_FLAG_BYTES;
             if (UseHierarchicalCombineReduction(tilingData)) {
-                const int64_t partialBytes = Ops::Base::CeilAlign(
-                    static_cast<int64_t>(tilingData->numMaxTokensPerRank) * tilingData->h * sizeof(float), ALIGN_512);
+                const int64_t partialBytes =
+                    Ops::Base::CeilAlign(static_cast<int64_t>(tilingData->numMaxTokensPerRank) * tilingData->h *
+                                             static_cast<int64_t>(sizeof(float)),
+                                         ALIGN_512);
                 combinePartialSendPtr = base + offset;
                 offset += partialBytes;
                 combinePartialRecvPtr = base + offset;
