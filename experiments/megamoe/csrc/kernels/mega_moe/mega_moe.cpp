@@ -42,8 +42,8 @@ __global__ __mix__(1, 2) void benchmark_sleep_kernel(uint64_t cycles)
 #endif
 }
 
-extern "C" __attribute__((visibility("default"))) void benchmark_sleep_do(
-    uint32_t blocks, void* stream, uint64_t cycles)
+extern "C" __attribute__((visibility("default"))) void benchmark_sleep_do(uint32_t blocks, void* stream,
+                                                                          uint64_t cycles)
 {
     benchmark_sleep_kernel<<<blocks, 0, stream>>>(cycles);
 }
@@ -97,7 +97,7 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
     const uint8_t* tiling_host, uint64_t ffts_addr)
 {
     const auto& tiling = *reinterpret_cast<const MegaMoeTilingData*>(tiling_host);
-    static_assert(sizeof(MegaMoeTilingData) == 232, "MegaMoE tiling ABI changed");
+    static_assert(sizeof(MegaMoeTilingData) == 240, "MegaMoE tiling ABI changed");
     // 按本次实际 BS 编译期特化；不改变 wave 预算、Dispatch/Combine 或共享专家策略。
     if (is_a8w4 && tiling.bs <= MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS) {
         mega_moe_kernel<true, true><<<block_dim, ub_bytes, stream>>>(

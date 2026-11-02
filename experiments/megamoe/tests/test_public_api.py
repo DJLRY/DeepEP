@@ -481,13 +481,22 @@ def test_plan_allocation_failure_is_collective_and_retryable(backend):
     assert backend.buffer._plan_bs == 17
 
 
-def hierarchical_buffer(backend, *, size=32, mma_type="fp8xfp4", combine_reduce_qps=0):
+def hierarchical_buffer(backend, *, size=32, mma_type="fp8xfp4", combine_reduce_qps=0, **pipeline):
     from deep_ep._store import StoreGroup
 
     group = StoreGroup(None, 0, size, prefix="hierarchical-api-test")
     group.all_gather = lambda value, stage: [value] * size
     buffer = api.SymmBuffer(
-        group, size * 2, 257, 2, 1024, 256, ranks_per_node=16, mma_type=mma_type, combine_reduce_qps=combine_reduce_qps
+        group,
+        size * 2,
+        257,
+        2,
+        1024,
+        256,
+        ranks_per_node=16,
+        mma_type=mma_type,
+        combine_reduce_qps=combine_reduce_qps,
+        **pipeline,
     )
     buffer.topk_idx.data[:] = [0, size]
     buffer.topk_weights.data[:] = [0.4, 0.6]
@@ -502,7 +511,7 @@ def test_reduction_configuration_reaches_heap_runtime_and_plan(backend, qps):
     try:
         b.prepare(32)
         assert b.combine_reduce_qps == qps
-        assert sizes[0][-1] == qps and b._plan.options[-1] == qps
+        assert sizes[0][-1] == qps and b._plan.options[-3:] == (qps, 0, 0)
         assert b._runtime.roce_app_qps == (qps or 1)
     finally:
         b.destroy()
@@ -522,7 +531,9 @@ def test_reduction_bad_configuration_fails_collectively_before_runtime(backend, 
         peers = [value] * size
         if case == "peer-mismatch" and stage == "check:configuration":
             error, config = value
-            peers[-1] = (error, (*config[:-1], 8))
+            other = list(config)
+            other[10] = 8
+            peers[-1] = (error, tuple(other))
         return peers
 
     group.all_gather = gather
@@ -538,6 +549,69 @@ def test_reduction_bad_configuration_fails_collectively_before_runtime(backend, 
             mma_type="fp8xfp8" if case == "fp8" else "fp8xfp4",
             combine_reduce_qps=2 if case == "bad-qps" else 4,
         )
+
+
+@pytest.mark.parametrize(
+    "qps,gate,workers,lane_init",
+    [
+        (0, True, 0, False),
+        (0, False, 8, False),
+        (0, True, 14, False),
+        (0, False, 28, False),
+        (4, False, 0, True),
+        (8, True, 0, True),
+    ],
+)
+def test_pipeline_options_reach_every_bs_plan(backend, qps, gate, workers, lane_init):
+    b = hierarchical_buffer(
+        backend, combine_reduce_qps=qps, combine_gate=gate, dispatch_workers=workers, reduce_lane_init=lane_init
+    )
+    try:
+        for bs in (1, 32, 256):
+            b.prepare(bs)
+            assert b._plan.options[-3:] == (qps, int(gate) | (int(lane_init) << 1), workers)
+    finally:
+        b.destroy()
+
+
+@pytest.mark.parametrize(
+    "options",
+    [
+        dict(combine_gate=1),
+        dict(reduce_lane_init=True),
+        dict(dispatch_workers=-1),
+        dict(dispatch_workers=129),
+        dict(dispatch_workers=True),
+        dict(combine_reduce_qps=8, dispatch_workers=8),
+        dict(mma_type="fp8xfp8", combine_gate=True),
+        dict(size=16, combine_gate=True),
+    ],
+)
+def test_invalid_pipeline_configuration_does_not_start_runtime(backend, monkeypatch, options):
+    monkeypatch.setattr(api, "_MegaRuntime", lambda *a, **kw: pytest.fail("Invalid pipeline started SHMEM"))
+    with pytest.raises(ValueError):
+        hierarchical_buffer(backend, **options)
+
+
+@pytest.mark.parametrize("field", [11, 12, 13])
+def test_pipeline_options_must_match_on_all_ranks(backend, monkeypatch, field):
+    from deep_ep._store import StoreGroup
+
+    group = StoreGroup(None, 0, 32, prefix="pipeline-mismatch")
+
+    def gather(value, stage):
+        peers = [value] * 32
+        if stage == "check:configuration":
+            error, config = value
+            other = list(config)
+            other[field] = not other[field] if field != 12 else 8
+            peers[-1] = (error, tuple(other))
+        return peers
+
+    group.all_gather = gather
+    monkeypatch.setattr(api, "_MegaRuntime", lambda *a, **kw: pytest.fail("Mismatched pipeline started SHMEM"))
+    with pytest.raises(ValueError, match="configuration"):
+        api.SymmBuffer(group, 64, 32, 2, 1024, 256, ranks_per_node=16, combine_reduce_qps=8)
 
 
 @pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8"])
@@ -641,7 +715,7 @@ def test_hierarchical_a8w8_bs32_uses_fp8_weights_without_layout_conversion(backe
         b.destroy()
 
 
-@pytest.mark.parametrize("protocol", [5, 6, 7])
+@pytest.mark.parametrize("protocol", [5, 6, 7, 8])
 def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypatch, protocol):
     api._extension.cache_clear()
     core = SimpleNamespace(create_megamoe_runtime=lambda: None)
@@ -649,7 +723,7 @@ def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypa
     monkeypatch.setattr(api, "require_native", lambda _: core)
     monkeypatch.setattr(api.importlib, "import_module", lambda _: extension)
     try:
-        if protocol != 7:
+        if protocol != 8:
             with pytest.raises(RuntimeError, match="versions differ"):
                 api._extension()
         else:

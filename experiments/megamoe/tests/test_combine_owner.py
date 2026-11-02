@@ -34,6 +34,7 @@ def combine_owner_source():
         ("PRODUCER_COUNT", combine, "uint32_t GetTokenCombineProducerCount("),
         ("BALANCED_RANGE", utils, "WorkRange GetBalancedTokenRange("),
         ("ROTATED_RANGE", utils, "WorkRange GetRotatedBalancedTokenRange("),
+        ("DISPATCH_SUBSET", utils, "uint32_t GetDispatchSubsetJobIndex("),
         ("M_GROUP_COUNT", utils, "uint32_t GetMGroupCountForRows("),
     ]:
         fixture = fixture.replace(f"/* {marker} */", function_body(source, name)[1:-1])
@@ -66,7 +67,7 @@ def combine_owner_binary(tmp_path_factory):
     return binary
 
 
-@pytest.mark.parametrize("scenario", ["coverage", "readiness", "scheduler"])
+@pytest.mark.parametrize("scenario", ["coverage", "readiness", "scheduler", "dispatch"])
 def test_combine_owner_contract(combine_owner_binary, scenario):
     result = subprocess.run([str(combine_owner_binary), scenario], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr

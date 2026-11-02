@@ -11,10 +11,13 @@
 
 using namespace MegaMoeImpl;
 
-static_assert(sizeof(MegaMoeTilingData) == 232);
+static_assert(sizeof(MegaMoeTilingData) == 240);
 static_assert(offsetof(MegaMoeTilingData, dispatchRanksPerNode) == 216);
 static_assert(offsetof(MegaMoeTilingData, roceScratchUbOffset) == 220);
 static_assert(offsetof(MegaMoeTilingData, hierarchicalSequence) == 224);
+static_assert(offsetof(MegaMoeTilingData, combineReduceQps) == 228);
+static_assert(offsetof(MegaMoeTilingData, dispatchWorkers) == 232);
+static_assert(offsetof(MegaMoeTilingData, pipelineFlags) == 236);
 
 PeermemSizeParams parameters(const MegaMoeTilingData& t)
 {

@@ -50,6 +50,7 @@ struct MoeStageCommonConfig {
 struct TilingData {
     bool hierarchical = true;
     bool reduction = false;
+    uint32_t pipelineFlags = 0U;
 };
 bool UseHierarchicalCombineReduction(const TilingData* tiling)
 {
@@ -107,6 +108,10 @@ WorkRange GetBalancedTokenRange(uint32_t totalTokens, uint32_t workerIdx, uint32
 WorkRange GetRotatedBalancedTokenRange(uint32_t totalTokens, uint32_t workerIdx, uint32_t workerCount,
                                        uint64_t globalRowPrefix)
 { /* ROTATED_RANGE */
+}
+uint32_t GetDispatchSubsetJobIndex(uint32_t workerIdx, uint32_t workerCount, uint32_t selectedWorkers,
+                                   uint32_t expertIdx)
+{ /* DISPATCH_SUBSET */
 }
 template <bool IncludeAiv0 = false>
 WorkRange GetWaveCombineOwnedRange(const AivJobContext& job, uint32_t tokenCount, uint64_t expertRowPrefix)
@@ -370,6 +375,43 @@ void Scheduler()
     assert(f.waveCombineJob_.totalJobs == 28U && f.gmmExecutionConfig_.blockJob.totalJobs == 28U);
 }
 
+void DispatchSubsetCoverage()
+{
+    constexpr uint32_t physicalWorkers = 28U;
+    for (uint32_t selected : {1U, 8U, 14U, 28U}) {
+        std::array<uint32_t, physicalWorkers> participation{};
+        for (uint32_t expert = 0U; expert < 28U; ++expert) {
+            for (uint32_t worker = 0U; worker < physicalWorkers; ++worker) {
+                if (GetDispatchSubsetJobIndex(worker, physicalWorkers, selected, expert) < selected)
+                    ++participation[worker];
+            }
+            for (uint32_t wave : {0U, 1U, 27U, 28U}) {
+                for (uint32_t rows : {0U, 1U, 21U, 22U, 255U, 256U, 257U, 513U}) {
+                    const uint64_t prefix = (1ULL << 35U) + expert * 22U;
+                    std::vector<uint32_t> writes(rows, 0U);
+                    uint32_t active = 0U;
+                    for (uint32_t physical = 0U; physical < physicalWorkers; ++physical) {
+                        const uint32_t rotated =
+                            (physical + physicalWorkers - wave % physicalWorkers) % physicalWorkers;
+                        const uint32_t job = GetDispatchSubsetJobIndex(rotated, physicalWorkers, selected, expert);
+                        auto range = GetRotatedBalancedTokenRange(rows, job, selected, prefix);
+                        assert(range.start + range.count <= rows);
+                        active += range.count != 0U;
+                        for (uint32_t row = range.start; row < range.start + range.count; ++row) ++writes[row];
+                        if (selected == physicalWorkers) {
+                            auto baseline = GetRotatedBalancedTokenRange(rows, rotated, physicalWorkers, prefix);
+                            assert(range.start == baseline.start && range.count == baseline.count);
+                        }
+                    }
+                    assert(active == std::min(rows, selected));
+                    for (auto count : writes) assert(count == 1U);
+                }
+            }
+        }
+        for (auto count : participation) assert(count == selected);
+    }
+}
+
 int main(int argc, char** argv)
 {
     assert(argc == 2);
@@ -378,6 +420,8 @@ int main(int argc, char** argv)
         Coverage();
     } else if (std::strcmp(scenario, "readiness") == 0) {
         Readiness();
+    } else if (std::strcmp(scenario, "dispatch") == 0) {
+        DispatchSubsetCoverage();
     } else {
         assert(std::strcmp(scenario, "scheduler") == 0);
         Scheduler();

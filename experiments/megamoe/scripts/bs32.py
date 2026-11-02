@@ -244,7 +244,7 @@ import torch, torch_npu, deep_ep
 from deep_ep._native import require_native
 import deep_ep_experimental.megamoe._C as megamoe
 require_native('BS32 preflight')
-if getattr(megamoe, 'api_protocol', None) != 7:
+if getattr(megamoe, 'api_protocol', None) != 8:
     raise RuntimeError('Installed MegaMoE protocol is outdated; run run_bs32.sh build on both hosts first')
 info = json.loads(files('deep_ep').joinpath('_build_info.json').read_text())
 if Path(deep_ep.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()):
@@ -274,7 +274,18 @@ print('[CHECK] Python:', sys.executable, 'deep_ep:', deep_ep.__file__, flush=Tru
     )
 
 
-def test_commands(config, run_dir, *, mode="accuracy", timer_ranks=None, perf_method="legacy", combine_reduce_qps=0):
+def test_commands(
+    config,
+    run_dir,
+    *,
+    mode="accuracy",
+    timer_ranks=None,
+    perf_method="legacy",
+    combine_reduce_qps=0,
+    combine_gate=False,
+    dispatch_workers=0,
+    reduce_lane_init=False,
+):
     python = [config["python"], "-I", "-m"]
     golden_dir = str(Path(config["case_dir"]) / "golden")
     common = [
@@ -332,6 +343,12 @@ def test_commands(config, run_dir, *, mode="accuracy", timer_ranks=None, perf_me
         benchmark.extend(["--perf-method", perf_method])
     if combine_reduce_qps:
         benchmark.extend(["--combine-reduce-qps", str(combine_reduce_qps)])
+    if combine_gate:
+        benchmark.append("--combine-gate")
+    if dispatch_workers:
+        benchmark.extend(["--dispatch-workers", str(dispatch_workers)])
+    if reduce_lane_init:
+        benchmark.append("--reduce-lane-init")
     return golden, benchmark
 
 
@@ -368,6 +385,8 @@ def performance_summary(config, run_dir, bs_values=(32,)):
             f"[PERF SUMMARY] EP32 BS{bs}; FP8 input / FP4 weights; balanced routing",
             f"Performance method: {report.get('perf_method', 'legacy')}",
             f"Combine reduction QPs: {report.get('combine_reduce_qps', 0)} (0 = original BF16 forwarding)",
+            f"Pipeline: combine_gate={report.get('combine_gate', False)}, "
+            f"dispatch_workers={report.get('dispatch_workers', 0)}, reduce_lane_init={report.get('reduce_lane_init', False)}",
             f"All-rank kernel Duration; {report['rounds']}/{report['recorded_rounds']} rounds (tail half)",
             f"Mean of per-round minimum rank: {report['mean_us']:.3f} us",
             f"Mean of per-round maximum rank: {report['rank_max_mean_us']:.3f} us",
@@ -381,6 +400,9 @@ def performance_summary(config, run_dir, bs_values=(32,)):
                 bs=bs,
                 perf_method=report.get("perf_method", "legacy"),
                 combine_reduce_qps=report.get("combine_reduce_qps", 0),
+                combine_gate=report.get("combine_gate", False),
+                dispatch_workers=report.get("dispatch_workers", 0),
+                reduce_lane_init=report.get("reduce_lane_init", False),
                 rounds=report["rounds"],
                 recorded_rounds=report["recorded_rounds"],
                 mean_us=report["mean_us"],
@@ -428,11 +450,20 @@ def dispatch(
     perf_method="legacy",
     extra_bs=False,
     combine_reduce_qps=0,
+    combine_gate=False,
+    dispatch_workers=0,
+    reduce_lane_init=False,
 ):
     if extra_bs and action != "perf":
         raise ValueError("--extra-bs requires perf")
     if combine_reduce_qps not in (0, 4, 8) or (combine_reduce_qps and action not in ("run", "perf", "trace")):
         raise ValueError("--combine-reduce-qps requires run/perf/trace and a value of 0, 4 or 8")
+    if (combine_gate or dispatch_workers or reduce_lane_init) and action not in ("run", "perf", "trace"):
+        raise ValueError("Pipeline experiments require run/perf/trace")
+    if dispatch_workers not in (0, 8, 14, 28) or (dispatch_workers and combine_reduce_qps):
+        raise ValueError("--dispatch-workers requires q=0 and a value of 0, 8, 14 or 28")
+    if reduce_lane_init and not combine_reduce_qps:
+        raise ValueError("--reduce-lane-init requires --combine-reduce-qps 4 or 8")
     if platform.system() != "Linux":
         raise RuntimeError("Build/run require Linux; configure/show-config can run without devices")
     env = environment(config)
@@ -487,6 +518,9 @@ def dispatch(
                 perf_method=perf_method,
                 extra_bs=extra_bs,
                 combine_reduce_qps=combine_reduce_qps,
+                combine_gate=combine_gate,
+                dispatch_workers=dispatch_workers,
+                reduce_lane_init=reduce_lane_init,
                 bs_values=case["bs_values"],
             ),
             indent=2,
@@ -504,7 +538,14 @@ def dispatch(
             single_case = dict(case, bs_values=[bs])
             (case_dir / "case.json").write_text(json.dumps(single_case, indent=2) + "\n", encoding="utf-8")
             _, benchmark = test_commands(
-                config, case_dir, mode="perf", perf_method=perf_method, combine_reduce_qps=combine_reduce_qps
+                config,
+                case_dir,
+                mode="perf",
+                perf_method=perf_method,
+                combine_reduce_qps=combine_reduce_qps,
+                combine_gate=combine_gate,
+                dispatch_workers=dispatch_workers,
+                reduce_lane_init=reduce_lane_init,
             )
             print(f"[PERF] EP32 BS={bs} output={case_dir}", flush=True)
             execute(benchmark, env, case_dir / "console.log")
@@ -518,6 +559,9 @@ def dispatch(
         timer_ranks=selected,
         perf_method=perf_method,
         combine_reduce_qps=combine_reduce_qps,
+        combine_gate=combine_gate,
+        dispatch_workers=dispatch_workers,
+        reduce_lane_init=reduce_lane_init,
     )
     if not sampling:
         execute(golden, env, run_dir / "golden.log")
@@ -576,6 +620,19 @@ def main(argv=None):
         help="run/perf/trace: 4/8 enable FP32 gateway reduction; 0 keeps original forwarding",
     )
     waits = parser.add_mutually_exclusive_group()
+    parser.add_argument(
+        "--combine-gate", action="store_true", help="run/perf/trace: defer local Combine until all activation is done"
+    )
+    parser.add_argument(
+        "--dispatch-workers",
+        type=int,
+        choices=(0, 8, 14, 28),
+        default=None,
+        help="q=0 run/perf/trace: Dispatch participants per expert; 0 uses all workers",
+    )
+    parser.add_argument(
+        "--reduce-lane-init", action="store_true", help="q=4/8 run/perf/trace: parse only lane-owned routes"
+    )
     waits.add_argument(
         "--include-wait",
         dest="include_wait",
@@ -621,6 +678,16 @@ def main(argv=None):
         parser.error("--extra-bs requires perf")
     if args.combine_reduce_qps is not None and args.action not in ("run", "perf", "trace"):
         parser.error("--combine-reduce-qps requires run, perf or trace")
+    if (args.combine_gate or args.dispatch_workers is not None or args.reduce_lane_init) and args.action not in (
+        "run",
+        "perf",
+        "trace",
+    ):
+        parser.error("Pipeline experiments require run, perf or trace")
+    if args.dispatch_workers and args.combine_reduce_qps:
+        parser.error("--dispatch-workers requires --combine-reduce-qps 0")
+    if args.reduce_lane_init and not args.combine_reduce_qps:
+        parser.error("--reduce-lane-init requires --combine-reduce-qps 4 or 8")
     if args.timer and args.action != "build":
         parser.error("--timer requires build; use the trace action for collection")
     if args.timer_ranks is not None and args.action != "trace":
@@ -651,6 +718,12 @@ def main(argv=None):
     options = dict(rebuild_shmem=args.rebuild_shmem, errors_only=args.errors_only)
     if args.combine_reduce_qps is not None:
         options["combine_reduce_qps"] = args.combine_reduce_qps
+    if args.combine_gate:
+        options["combine_gate"] = True
+    if args.dispatch_workers is not None:
+        options["dispatch_workers"] = args.dispatch_workers
+    if args.reduce_lane_init:
+        options["reduce_lane_init"] = True
     if args.extra_bs:
         options["extra_bs"] = True
     if args.timer:

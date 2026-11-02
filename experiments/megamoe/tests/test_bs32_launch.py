@@ -187,6 +187,55 @@ def test_stage_separation_and_fixed_case(saved, monkeypatch, action, expected):
             assert command[command.index("--config") + 1] == str(case_path)
 
 
+@pytest.mark.parametrize("action", ["run", "perf", "trace"])
+@pytest.mark.parametrize(
+    "qps,flags,expected",
+    [
+        (0, ["--combine-gate"], dict(combine_gate=True, dispatch_workers=0, reduce_lane_init=False)),
+        (0, ["--dispatch-workers", "8"], dict(combine_gate=False, dispatch_workers=8, reduce_lane_init=False)),
+        (8, ["--reduce-lane-init"], dict(combine_gate=False, dispatch_workers=0, reduce_lane_init=True)),
+        (
+            4,
+            ["--combine-gate", "--reduce-lane-init"],
+            dict(combine_gate=True, dispatch_workers=0, reduce_lane_init=True),
+        ),
+    ],
+)
+def test_pipeline_experiments_propagate_and_are_recorded(saved, monkeypatch, action, qps, flags, expected):
+    path, config = saved
+    before = path.read_bytes()
+    monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(launcher, "environment", lambda _: {})
+    monkeypatch.setattr(launcher, "preflight", lambda *a: None)
+    monkeypatch.setattr(launcher, "performance_summary", lambda *a: None)
+    calls = []
+    monkeypatch.setattr(launcher, "execute", lambda command, *a, **kw: calls.append(command))
+    launcher.main([action, "--config", str(path), "--combine-reduce-qps", str(qps), *flags])
+    command = next(c for c in calls if "deep_ep_experimental.megamoe.benchmark" in c)
+    for flag in flags:
+        assert flag in command
+    run_dir = Path(command[command.index("--output-dir") + 1])
+    recorded = json.loads((run_dir / "run.json").read_text())
+    assert {key: recorded[key] for key in expected} == expected
+    assert path.read_bytes() == before
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["build", "--combine-gate"],
+        ["golden", "--dispatch-workers", "0"],
+        ["perf", "--reduce-lane-init"],
+        ["run", "--combine-reduce-qps", "8", "--dispatch-workers", "8"],
+    ],
+)
+def test_pipeline_cli_rejects_invalid_experiments_before_launch(saved, monkeypatch, args):
+    path, _ = saved
+    monkeypatch.setattr(launcher, "dispatch", lambda *a, **kw: pytest.fail("Invalid experiment launched"))
+    with pytest.raises(SystemExit):
+        launcher.main([*args, "--config", str(path)])
+
+
 def test_second_host_rank_range_and_saved_python(saved):
     _, config = saved
     config = dict(config, node_rank=1, python="/opt/env with spaces/bin/python")
@@ -512,7 +561,7 @@ def test_preflight_checks_installed_timer_support(saved, tmp_path, monkeypatch, 
     modules["deep_ep._native"].require_native = lambda operation: None
     modules["deep_ep_experimental.megamoe._C"].timer_enabled = compiled
     modules["deep_ep_experimental.megamoe._C"].hierarchical_max_tokens = limit
-    modules["deep_ep_experimental.megamoe._C"].api_protocol = 7
+    modules["deep_ep_experimental.megamoe._C"].api_protocol = 8
 
     def execute(command, env):
         monkeypatch.setattr(sys, "argv", ["-c", *command[4:]])

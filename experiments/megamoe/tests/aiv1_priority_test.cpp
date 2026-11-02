@@ -25,6 +25,7 @@ int64_t GetSystemCycle()
 
 struct TilingData {
     bool hierarchicalRoce = true;
+    uint32_t pipelineFlags = 0U;
 };
 bool UseHierarchicalRoce(const TilingData* tiling)
 {
@@ -369,6 +370,34 @@ void NonOwnersLeaveRemoteProgressToTheOwner()
     }
 }
 
+void GatedCombineWaitsForAllActivationWithoutStoppingOtherWork()
+{
+    for (uint32_t worker : {1U, 3U}) {
+        Fixture f;
+        f.tiling.pipelineFlags = 1U;
+        f.aivJob_.jobIndex = worker;
+        f.activationPlans = {{0, 1}};
+        f.sharedExpertNum_ = 1;
+        f.commonConfig_.moeExpertPerRank = 2;
+        f.combineSlices = 2;
+        f.ReadyAllCombines();
+        f.onClock = [](Fixture& fixture) {
+            // Producers become ready independently of deferred local Combine.
+            if (fixture.clock >= 2) fixture.ReadyAllActivationTiles();
+            if (fixture.clock >= 10) fixture.sharedReady = true;
+        };
+        f.afterCombine = [](Fixture& fixture, uint32_t) {
+            assert(fixture.consumedTiles.size() == 1);
+            assert(fixture.consumedShared == fixture.sharedTiles);
+        };
+        f.Run(1);
+        assert(f.events[0] == "D0:0" && f.events[1] == "D1:0");
+        assert(f.remoteCalls > f.combineSlices);
+        assert(f.remoteForeground.front());
+        assert(!f.remoteForeground.back());
+    }
+}
+
 int main()
 {
     CombineReleasesMultipleTilesAndSlices();
@@ -379,4 +408,5 @@ int main()
     FallbackRemoteProgressCanReleaseActivation();
     BackoffCanReleaseActivationAndCombine();
     NonOwnersLeaveRemoteProgressToTheOwner();
+    GatedCombineWaitsForAllActivationWithoutStoppingOtherWork();
 }

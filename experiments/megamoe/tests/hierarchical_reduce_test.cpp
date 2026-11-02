@@ -8,6 +8,7 @@
 #include <cstring>
 #include <iostream>
 #include <random>
+#include <set>
 #include <stdexcept>
 #include <type_traits>
 #include <vector>
@@ -60,6 +61,8 @@ inline uint32_t expectedPeer = 0;
 inline uint8_t* localBase = nullptr;
 inline uint8_t* remoteBase = nullptr;
 inline size_t heapBytes = 0;
+inline bool recordRouteReads = false;
+inline std::vector<std::pair<const int32_t*, uint32_t>> routeReads;
 struct Post {
     uint32_t qp;
     uint8_t* source;
@@ -133,6 +136,9 @@ struct DataCopyPadExtParams {
 template <typename T>
 void DataCopy(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count)
 {
+    if constexpr (std::is_same_v<T, int32_t>) {
+        if (ReduceTest::recordRouteReads) ReduceTest::routeReads.emplace_back(src.data, count);
+    }
     std::memcpy(dst.data, src.data, count * sizeof(T));
 }
 template <typename T>
@@ -305,7 +311,7 @@ namespace MegaMoeImpl {
 using namespace MegaMoeImpl;
 
 void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity, uint32_t topk, uint32_t hidden,
-               uint32_t pattern, uint32_t sequence, bool shared)
+               uint32_t pattern, uint32_t sequence, bool shared, bool laneInit = false)
 {
     using namespace ReduceTest;
     ub.fill(0);
@@ -324,6 +330,7 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     t.topoType = TOPO_TYPE_MTE_ROCE;
     t.groupedMatmulMode = GROUPED_MATMUL_MODE_A8W4;
     t.combineReduceQps = qps;
+    t.pipelineFlags = laneInit ? 2U : 0U;
     t.roceScratchUbOffset = 256U * 1024U - 512U;
     t.hierarchicalSequence = sequence;
     t.sharedExpertNum = shared ? 1U : 0U;
@@ -407,6 +414,29 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     AscendTimerDevice timer;
     auto* scratch = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(t.roceScratchUbOffset));
     for (activeLane = 0; activeLane < qps; ++activeLane) {
+        const uint32_t first = bs * activeLane / qps, end = bs * (activeLane + 1U) / qps;
+        routeReads.clear();
+        recordRouteReads = true;
+        InitializeHierarchicalReducedCombine(gwCommon, params, state[activeLane], activeLane, &timer);
+        recordRouteReads = false;
+        uint32_t expectedRows = 0;
+        for (uint32_t token = 0; token < bs; ++token) {
+            const uint32_t expected = token >= first && token < end ? masks[token] : 0U;
+            Check(state[activeLane].pendingTopkMasks[token] == expected, "wrong lane mask / parsed packet marker");
+            expectedRows += CombineMaskCount(expected);
+        }
+        Check(state[activeLane].expectedRows == expectedRows, "wrong lane row count");
+        std::set<uint32_t> expectedChunks, actualChunks;
+        for (uint32_t row = laneInit ? first * topk : 0U; row < (laneInit ? end * topk : bs * topk); ++row)
+            expectedChunks.insert(row / RAIL_PACKET_DATA_WORDS * RAIL_PACKET_WORDS +
+                                  (row % RAIL_PACKET_DATA_WORDS) / 64U * 64U);
+        const auto* routes = reinterpret_cast<int32_t*>(gateway.railTopkIdsRecvPtr + slot);
+        for (auto [address, words] : routeReads) {
+            Check(words == 64U, "route DMA changed reserved scratch size");
+            actualChunks.insert(static_cast<uint32_t>(address - routes));
+        }
+        Check(actualChunks == expectedChunks && routeReads.size() == expectedChunks.size(),
+              "lane initializer read unrelated or duplicate route chunks");
         Check(!TryProgressHierarchicalReducedCombine(gwCommon, params, state[activeLane], activeLane, scratch, &timer),
               "stale flags released data");
     }
@@ -484,14 +514,18 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
 int main()
 {
     try {
-        for (uint32_t qps : {4U, 8U})
-            for (uint32_t rank : {0U, 21U})
-                for (uint32_t pattern = 0; pattern < 5; ++pattern) {
-                    CheckCase(qps, rank, 32U, 64U, 8U, 3584U, pattern, 0x80000101U, false);
-                    CheckCase(qps, rank, 7U, 32U, 1U, 1024U, pattern, 0xffffffffU, true);
-                    CheckCase(qps, rank, 1U, 8U, 32U, 8192U, pattern, 129U, false);
-                }
-        CheckCase(4U, 0U, 256U, 256U, 32U, 1024U, 2U, 257U, true);
+        for (bool laneInit : {false, true}) {
+            for (uint32_t qps : {4U, 8U})
+                for (uint32_t rank : {0U, 21U})
+                    for (uint32_t pattern = 0; pattern < 5; ++pattern) {
+                        CheckCase(qps, rank, 32U, 64U, 8U, 3584U, pattern, 0x80000101U, false, laneInit);
+                        CheckCase(qps, rank, 7U, 32U, 1U, 1024U, pattern, 0xffffffffU, true, laneInit);
+                        CheckCase(qps, rank, 1U, 8U, 32U, 8192U, pattern, 129U, false, laneInit);
+                    }
+            CheckCase(4U, 0U, 256U, 256U, 32U, 1024U, 2U, 257U, true, laneInit);
+            CheckCase(8U, 0U, 3U, 8U, 7U, 1024U, 2U, 3U, false, laneInit);
+            CheckCase(8U, 16U, 37U, 64U, 7U, 1024U, 2U, 3U, false, laneInit);
+        }
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

@@ -274,6 +274,20 @@ __aicore__ inline uint32_t GetWaveEndRowOffsetInExpert(uint64_t expertRowCount, 
     return static_cast<uint32_t>(expertRowCount < maxWaveEndRowOffset ? expertRowCount : maxWaveEndRowOffset);
 }
 
+// Map a wave-rotated physical Dispatch worker into an expert's smaller group.
+// Returning selectedWorkers denotes an inactive worker; the balanced range
+// helper gives it no rows, but its scheduler still advances through the slice.
+__aicore__ inline uint32_t GetDispatchSubsetJobIndex(uint32_t workerIdx, uint32_t workerCount, uint32_t selectedWorkers,
+                                                     uint32_t expertIdx)
+{
+    if (workerCount == 0U || selectedWorkers == 0U || selectedWorkers > workerCount || workerIdx >= workerCount) {
+        return selectedWorkers;
+    }
+    const uint32_t first = (expertIdx * selectedWorkers) % workerCount;
+    const uint32_t logical = workerIdx >= first ? workerIdx - first : workerIdx + workerCount - first;
+    return logical < selectedWorkers ? logical : selectedWorkers;
+}
+
 // 连续均衡分配 token，前 totalTokens % workerCount 个任务各多处理一个 token。
 __aicore__ inline WorkRange GetBalancedTokenRange(uint32_t totalTokens, uint32_t workerIdx, uint32_t workerCount)
 {

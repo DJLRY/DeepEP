@@ -23,10 +23,15 @@ __aicore__ inline void InitializeHierarchicalReducedCombine(const MoeStageCommon
     if (progress.initialized) {
         return;
     }
-    InitializeHierarchicalCombineProgress(common, params, progress, timer);
     const uint32_t owners = params.tilingData->combineReduceQps;
     const uint32_t first = common.tokenNum * lane / owners;
     const uint32_t end = common.tokenNum * (lane + 1U) / owners;
+    if ((params.tilingData->pipelineFlags & 2U) != 0U) {
+        InitializeHierarchicalCombineProgressRange(common, params, progress, first, end, timer);
+        progress.nextRow = first * common.topK;
+        return;
+    }
+    InitializeHierarchicalCombineProgress(common, params, progress, timer);
     progress.expectedRows = 0U;
     for (uint32_t token = 0U; token < common.tokenNum; ++token) {
         if (token < first || token >= end) {

@@ -244,7 +244,8 @@ PlatformInfo GetPlatformInfo()
 
 MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t topk, int64_t local_experts,
                              int64_t world, int64_t max_tokens, int64_t max_recv, bool is_a8w4, int64_t shared_experts,
-                             int64_t ranks_per_node, int64_t combine_reduce_qps, const PlatformInfo& p)
+                             int64_t ranks_per_node, int64_t combine_reduce_qps, int64_t pipeline_flags,
+                             int64_t dispatch_workers, const PlatformInfo& p)
 {
     MegaMoeTilingData t{};
     t.moeExpertPerRank = static_cast<uint32_t>(local_experts);
@@ -274,6 +275,17 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
                                             p.aiv >= 2U * static_cast<uint32_t>(combine_reduce_qps)),
                 "Not enough AIV1 workers for combine_reduce_qps");
     t.combineReduceQps = static_cast<uint32_t>(combine_reduce_qps);
+    TORCH_CHECK(pipeline_flags >= 0 && pipeline_flags <= megamoe_config::PIPELINE_FLAGS,
+                "Invalid MegaMoE pipeline flags");
+    TORCH_CHECK(dispatch_workers >= 0 && dispatch_workers <= p.aic, "dispatch_workers exceeds AIV1 worker count");
+    TORCH_CHECK((pipeline_flags == 0 && dispatch_workers == 0) || (hierarchical && is_a8w4),
+                "Pipeline experiments require two-host EP32 A8W4");
+    TORCH_CHECK(!(pipeline_flags & megamoe_config::REDUCE_LANE_INIT) || combine_reduce_qps != 0,
+                "reduce_lane_init requires combine_reduce_qps=4 or 8");
+    TORCH_CHECK(dispatch_workers == 0 || combine_reduce_qps == 0,
+                "dispatch_workers currently requires combine_reduce_qps=0");
+    t.pipelineFlags = static_cast<uint32_t>(pipeline_flags);
+    t.dispatchWorkers = static_cast<uint32_t>(dispatch_workers);
     TORCH_CHECK(
         !hierarchical || (world == MegaMoeImpl::HIERARCHICAL_WORLD_SIZE && bs <= MegaMoeImpl::HIERARCHICAL_MAX_TOKENS),
         "MTE+RoCE MegaMoE requires two 16-rank hosts and BS in [1,", MegaMoeImpl::HIERARCHICAL_MAX_TOKENS, "]");
@@ -325,7 +337,8 @@ void CheckTensor(const torch::Tensor& t, int64_t dims, const char* name)
 
 Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t experts, int64_t world,
            int64_t max_tokens, bool is_a8w4, int64_t shared_experts, int64_t ranks_per_node, uint64_t ffts,
-           uint64_t symmetric_address, int64_t symmetric_bytes, int64_t combine_reduce_qps)
+           uint64_t symmetric_address, int64_t symmetric_bytes, int64_t combine_reduce_qps, int64_t pipeline_flags,
+           int64_t dispatch_workers)
     : ffts_(ffts)
 {
     CheckTensor(example, 2, "plan input");
@@ -342,9 +355,10 @@ Plan::Plan(torch::Tensor example, int64_t intermediate, int64_t topk, int64_t ex
     TORCH_CHECK(symmetric_address != 0 && symmetric_bytes >= required, "MegaMoE symmetric buffer needs ", required,
                 " bytes, got ", symmetric_bytes);
     platform_ = GetPlatformInfo();
-    tiling_ = MakeTiling(example.size(0), example.size(1), intermediate * 2, topk, experts, world, max_tokens, 0,
-                         is_a8w4, shared_experts, ranks_per_node, combine_reduce_qps, platform_);
-    static_assert(sizeof(MegaMoeTilingData) == 232, "MegaMoE tiling ABI changed");
+    tiling_ =
+        MakeTiling(example.size(0), example.size(1), intermediate * 2, topk, experts, world, max_tokens, 0, is_a8w4,
+                   shared_experts, ranks_per_node, combine_reduce_qps, pipeline_flags, dispatch_workers, platform_);
+    static_assert(sizeof(MegaMoeTilingData) == 240, "MegaMoE tiling ABI changed");
     const MegaMoeImpl::WorkspaceInfo info(nullptr, &tiling_);
     const int64_t bytes =
         info.workspaceSize + static_cast<int64_t>(platform_.system_workspace) + kReservedWorkspaceBytes;

@@ -166,6 +166,15 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
                                            : dispatchJob.jobIndex + dispatchJob.totalJobs - shift;
             }
         }
+        // Restrict only the Dispatch job. Rotate the selected physical group by
+        // expert, in addition to the wave rotation above; AIC/activation ownership
+        // and the complete-row readiness threshold must remain unchanged.
+        if (params_.tilingData->dispatchWorkers != 0U) {
+            const uint32_t workers = params_.tilingData->dispatchWorkers;
+            dispatchJob.jobIndex =
+                GetDispatchSubsetJobIndex(dispatchJob.jobIndex, dispatchJob.totalJobs, workers, range.begin.expertIdx);
+            dispatchJob.totalJobs = workers;
+        }
         // 小 batch 每核仅几行，直接二分源 rank，避免空 peer 的配额统计/扫描；索引预取仍保留。
         // 只改变行排列，token metadata 随行写出；GMM 和 Combine 的 slice/ready 边界不变。
         if (commonConfig_.tokenNum <= W4A8_SMALL_BATCH_MAX_TOKENS) {
@@ -367,7 +376,10 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         if (!shared.done && TryRunSharedExpertActivation(shared)) {
             continue;
         }
-        if (hasCombine && TryRunReadyCombine(combine)) {
+        // Experimental gating also covers shared activation. The independent
+        // remote-progress path below remains live while local Combine is gated.
+        const bool gateCombine = (params_.tilingData->pipelineFlags & 1U) != 0U;
+        if (hasCombine && (!gateCombine || (!hasActivation && shared.done)) && TryRunReadyCombine(combine)) {
             hasCombine = NextAivSlice(combine, false);
             this->TryProgressRemoteCombine(hasActivation || !shared.done);
             continue;

@@ -215,5 +215,8 @@ struct MegaMoeTilingData {
     uint32_t hierarchicalSequence;
     // 0: original BF16 forwarding; 4/8: FP32 gateway reduction and owned QPs.
     uint32_t combineReduceQps;
+    // Independent runtime experiments; zero preserves the existing scheduler.
+    uint32_t dispatchWorkers;  // 0: all AIV1 workers; otherwise a rotating subset per expert.
+    uint32_t pipelineFlags;    // bit 0: gate local Combine on activation; bit 1: lane-only reduce init.
 };
 #endif

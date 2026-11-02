@@ -56,6 +56,11 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
             "0,16",
         ],
     )
+    # Exercise the full CLI -> buffer/manifest/profiling option path as well as
+    # the default path, without requiring a device or changing the timing loop.
+    pipeline = dict(combine_gate=rank == 16, dispatch_workers=0, reduce_lane_init=rank == 16)
+    if rank == 16:
+        sys.argv.extend(["--combine-reduce-qps", "8", "--combine-gate", "--reduce-lane-init"])
     torch = MagicMock()
     torch.npu.get_device_properties.return_value.L2_cache_size = 128
     monkeypatch.setitem(sys.modules, "torch", torch)
@@ -81,7 +86,8 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
     raw = np.array([11, 22, 33, 44], dtype="<i8")
     timer = buffer.allocate_timer.return_value
     timer.cpu.return_value.numpy.return_value = raw
-    monkeypatch.setattr(api, "SymmBuffer", lambda *a, **kw: buffer)
+    buffer_options = []
+    monkeypatch.setattr(api, "SymmBuffer", lambda *a, **kw: buffer_options.append(kw) or buffer)
     monkeypatch.setattr(api, "transform_weights_for_mega_moe", lambda *a, **kw: (object(), object()))
     calls = []
     monkeypatch.setattr(api, "fp8_fp4_mega_moe", lambda *a, **kw: calls.append(kw["timer"]))
@@ -99,6 +105,9 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
 
     # --mode trace must enable timers itself; no --timer flag is passed.
     benchmark.main()
+    assert {key: buffer_options[0][key] for key in pipeline} == pipeline
+    manifest = json.loads((output / f"rank_{rank}" / "manifest.json").read_text())
+    assert {key: manifest[key] for key in pipeline} == pipeline
 
     selected = mode == "trace" and rank in (0, 16)
     assert len(calls) == warmup + iters
@@ -117,6 +126,7 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
         assert not list(output.rglob(name))
     if mode == "perf":
         report = json.loads((output / f"rank_{rank}" / "bs_2" / "profiling.json").read_text())
+        assert {key: report[key] for key in pipeline} == pipeline
         assert report["iteration_sync"] == ("none" if method == "legacy" else "shmem_world_on_stream")
         assert report["alignment_scope"] == ("once_before_batch" if method == "legacy" else "before_each_iteration")
         assert report["perf_method"] == method

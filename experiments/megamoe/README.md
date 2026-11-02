@@ -299,6 +299,50 @@ BS32 balanced路由下，每个4QP owner归并4个远端token；8QP时每个owne
 `run.json`、`manifest.json`、`profiling.json`及性能汇总记录`combine_reduce_qps`。
 若需要流水诊断，先两端 `build --timer`，再执行 `trace --combine-reduce-qps 4`；
 新增`AIV_COMBINE_REDUCE`事件记录QP、token和专家掩码。性能比较使用不传timer的`perf`。
+
+#### BS32：计算流水与归并初始化独立实验
+
+三个开关默认关闭，适用于双机EP32、FP8xFP4。它们在同一次构建中通过运行时tiling选择，
+不需要逐项重编译。新增字段将tiling协议扩展到240 B、Python/native协议升级到8，
+首次使用前两端都需完整构建并安装同一版本wheel：
+
+```bash
+bash experiments/megamoe/scripts/run_bs32.sh build --errors-only
+```
+
+| 开关 | 适用路线 | 行为 |
+|---|---|---|
+| `--combine-gate` | `q=0/4/8` | 本核路由及共享激活全部完成后才执行本地Combine；Dispatch和原有远端progress仍可推进。用于验证搬运阻塞激活的代价。 |
+| `--dispatch-workers 8/14/28` | `q=0` | 每专家选择较小的AIV1核组，专家间及wave间轮换，组内连续均分行；0为原全核路径，28为显式全核对照。实际设备核数不足时报错。 |
+| `--reduce-lane-init` | `q=4/8` | 每个归并owner只解析自己token区间对应的路由，按256 B对齐块读取，跳过512 B包尾标记；归并及通信完成协议不变。 |
+
+先单因素比较下表各行；两端必须按相同顺序使用相同参数。每组先将`perf`替换成`run`验证精度，
+通过后再执行`perf`。后续可以组合开关，但不能用组合结果代替单因素归因。
+
+```bash
+# 单QP：基线、门控、Dispatch参与核数（各自独立）
+bash experiments/megamoe/scripts/run_bs32.sh perf --combine-reduce-qps 0
+bash experiments/megamoe/scripts/run_bs32.sh perf --combine-reduce-qps 0 --combine-gate
+bash experiments/megamoe/scripts/run_bs32.sh perf --combine-reduce-qps 0 --dispatch-workers 8
+bash experiments/megamoe/scripts/run_bs32.sh perf --combine-reduce-qps 0 --dispatch-workers 14
+bash experiments/megamoe/scripts/run_bs32.sh perf --combine-reduce-qps 0 --dispatch-workers 28
+
+# 多QP：先按8QP数据验证，4QP可用同一构建补测
+bash experiments/megamoe/scripts/run_bs32.sh perf --combine-reduce-qps 8
+bash experiments/megamoe/scripts/run_bs32.sh perf --combine-reduce-qps 8 --combine-gate
+bash experiments/megamoe/scripts/run_bs32.sh perf --combine-reduce-qps 8 --reduce-lane-init
+```
+
+三个参数写入`run.json`、每rank的`manifest.json`、`profiling.json`和性能汇总。
+直接调用时使用`SymmBuffer(..., combine_gate=True, dispatch_workers=8, reduce_lane_init=False)`；
+配置在SHMEM初始化前进行全rank一致性检查。Dispatch ready仍按实际完成行数累加，
+GMM1仍等待完整M tile，权重和最终输出的数值合同不变。
+
+采集诊断trace时，两端先`build --timer --errors-only`，再将上述`perf`改为
+`trace`并追加`--include-wait --timer-ranks 0,14,16,30`。先观察GMM1完成到激活启动的延迟、
+GMM1/GMM2 WAIT、末次GMM2和末次数据POST；门控可能推迟回传，必须检查最终kernel完成时间。
+性能比较应重新构建timer OFF版本，并保持其余配置一致。这些开关仍需NPU精度和性能验证，
+CPU回归不代表设备加速结果。
 CPU数值、内存范围与异步协议测试不能替代CANN编译和NPU实测；性能收益尚待上机确认。
 
 #### BS32：Dispatch 单次完成通知，双机 A/B（历史实验）
