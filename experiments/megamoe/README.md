@@ -399,6 +399,24 @@ Python/native协议升至9，新增timer事件和多QP生产者标记区，旧wh
 每项先打印`[CASE]`和完整命令，再由原launcher打印结果目录，参数写入该目录的`run.json`及rank manifest。
 默认不运行组合项，避免把组合结果当成单项收益。
 
+全部完成后，终端集中打印`BEGIN MEGAMOE PIPELINE SUMMARY`到`END MEGAMOE PIPELINE SUMMARY`，
+可直接复制整块回传。每行带用例名、状态、节点、运行参数、QP数、Dispatch核数、开关和两项耗时，
+后附对应结果目录。`min_us`／`max_us`分别是每轮最短／最慢rank耗时的均值，单位µs，
+不是两台机器各自的耗时。`run`和`trace`只显示状态和目录，不填性能数字。
+汇总保存在`<case_dir>/pipeline_<action>_node_<节点>_<随机字符>/summary.txt`，
+同时保存CSV和JSON；终端会打印完整路径及`cat`命令。每完成一项即更新文件，
+中途失败也会输出汇总，失败项标为`FAILED`，后续未执行项标为`NOT_RUN`。
+
+已有的性能结果无需重跑：把本轮各项`[RUN]`输出的结果目录传给`summary`，
+脚本从各目录的`run.json`识别配置、从`summary.csv`读取BS32指标，不按传入顺序猜测用例：
+
+```bash
+bash experiments/megamoe/scripts/run_bs32_pipeline.sh summary \
+  /path/to/perf_node_0_first /path/to/perf_node_0_second
+```
+
+可一次传入本轮全部七个目录；每台机器分别汇总自己的结果目录。
+
 ```bash
 # 两端构建timer OFF；全部精度通过后再测性能
 bash experiments/megamoe/scripts/run_bs32.sh build --errors-only

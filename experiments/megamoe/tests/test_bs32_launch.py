@@ -632,13 +632,14 @@ def test_extra_batches_keep_independent_capacity_and_aggregate_reports(saved, mo
         )
 
     monkeypatch.setattr(launcher, "execute", execute)
-    launcher.main(
+    returned = launcher.main(
         ["perf", "--extra-bs", "--config", str(path), "--warmup", "3", "--iters", "8", "--perf-method", method]
     )
     assert probes == [{"max_bs": 256}]
     assert batches == [32, 1, 4, 8, 16, 256]
     assert len(set(outputs)) == 6 and len({p.parent for p in outputs}) == 1
     root = outputs[0].parent
+    assert returned == root
     assert json.loads((root / "case.json").read_text())["bs_values"] == batches
     run = json.loads((root / "run.json").read_text())
     assert run["extra_bs"] and run["bs_values"] == batches

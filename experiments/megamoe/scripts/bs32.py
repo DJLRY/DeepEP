@@ -602,7 +602,7 @@ def dispatch(
             execute(benchmark, env, case_dir / "console.log")
         performance_summary(config, run_dir, case["bs_values"])
         print(f"[DONE] {action}: {run_dir}", flush=True)
-        return
+        return run_dir
     golden, benchmark = test_commands(
         config,
         run_dir,
@@ -642,6 +642,7 @@ def dispatch(
     if action == "trace":
         trace_summary(run_dir, case, local_ranks)
     print(f"[DONE] {action}: {run_dir}", flush=True)
+    return run_dir
 
 
 def main(argv=None):
@@ -831,7 +832,7 @@ def main(argv=None):
             options["perf_method"] = args.perf_method
     if args.action == "trace":
         options["include_wait"] = bool(args.include_wait)
-    dispatch(args.action, config, **options)
+    return dispatch(args.action, config, **options)
 
 
 if __name__ == "__main__":
