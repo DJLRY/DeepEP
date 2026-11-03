@@ -169,6 +169,7 @@ struct State {
     uint32_t failAfterWaitChecks = 0U;
 };
 inline State* state = nullptr;
+inline uint32_t testPipelineFlags = 0U;
 constexpr uint32_t kUbOffset = 4096U;
 constexpr uint32_t kFlagWords = 512U / sizeof(int32_t);
 
@@ -338,6 +339,7 @@ struct MegaMoeTilingData {
     uint32_t topK = 0U;
     uint32_t hierarchicalSequence = 0U;
     uint32_t roceScratchUbOffset = ProgressTest::kUbOffset;
+    uint32_t pipelineFlags = 0U;
     bool hierarchical = true;
 };
 struct Params {
@@ -476,6 +478,7 @@ public:
     Fixture(uint32_t tokens, uint32_t topk, uint32_t rank = 0U, uint32_t sequence = 129U)
     {
         state = &s;
+        tiling.pipelineFlags = testPipelineFlags;
         common.tokenNum = tokens;
         tiling.numMaxTokensPerRank = std::max(32U, tokens);
         common.topK = tiling.topK = topk;
@@ -899,7 +902,7 @@ void OracleStep(Fixture& f, uint32_t maxPosts, uint32_t maxScans)
     uint32_t scanned = static_cast<uint32_t>(visits.size());
     // Stop at the last accepted run if the POST budget or all outstanding
     // route coordinates are covered. Otherwise every bounded visit is needed.
-    if (!runs.empty() && runs.size() == maxPosts) {
+    if (!runs.empty() && (runs.size() == maxPosts || ((f.tiling.pipelineFlags & 4U) != 0U && sent == pendingBefore))) {
         const auto& last = runs.back();
         scanned = last.visitEnd;
         // A false slot that terminates a run is consumed once. The physical
@@ -965,19 +968,22 @@ void CompleteInCall()
         uint32_t posts;
         uint32_t scanned;
         uint32_t next;
+        uint32_t sparseScanned;
+        uint32_t sparseNext;
     };
     const std::vector<Case> cases = {
-        {32U, 8U, 0U, {0U}, 1U, 64U, 64U},
-        {32U, 8U, 252U, {0U, 1U}, 1U, 64U, 60U},
-        {32U, 8U, 250U, {255U}, 1U, 64U, 58U},
-        {32U, 8U, 6U, {6U, 7U, 8U}, 1U, 64U, 70U},
-        {32U, 8U, 254U, {255U, 0U, 1U}, 2U, 5U, 3U},
-        {32U, 31U, 30U, {30U, 31U}, 1U, 64U, 94U},
-        {4U, 32U, 31U, {31U, 32U, 33U}, 1U, 64U, 95U},
-        {1U, 1U, 0U, {0U}, 1U, 1U, 0U},
+        {32U, 8U, 0U, {0U}, 1U, 64U, 64U, 2U, 2U},
+        {32U, 8U, 252U, {0U, 1U}, 1U, 64U, 60U, 7U, 3U},
+        {32U, 8U, 250U, {255U}, 1U, 64U, 58U, 6U, 0U},
+        {32U, 8U, 6U, {6U, 7U, 8U}, 1U, 64U, 70U, 4U, 10U},
+        {32U, 8U, 254U, {255U, 0U, 1U}, 2U, 5U, 3U, 5U, 3U},
+        {32U, 31U, 30U, {30U, 31U}, 1U, 64U, 94U, 3U, 33U},
+        {4U, 32U, 31U, {31U, 32U, 33U}, 1U, 64U, 95U, 4U, 35U},
+        {1U, 1U, 0U, {0U}, 1U, 1U, 0U, 1U, 0U},
     };
     for (const auto& c : cases) {
         Fixture f(c.tokens, c.topk, 16U);
+        const bool sparse = (f.tiling.pipelineFlags & 4U) != 0U;
         f.RouteRows(c.rows);
         ReleaseAll();
         AscendTimerDevice timer;
@@ -993,12 +999,13 @@ void CompleteInCall()
         Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {2U, 64U}),
               "sparse completion failed to submit ready routes");
         Check(f.progress.sentRows == c.rows.size() && f.progress.sentRows == f.progress.expectedRows &&
-                  f.progress.nextRow == c.next && f.s.posts.size() == c.posts,
+                  f.progress.nextRow == (sparse ? c.sparseNext : c.next) && f.s.posts.size() == c.posts,
               "sparse completion lost routes, cursor position, or probe order");
         Check(timer.records.size() == 1U && timer.records[0].before == c.rows.size() && timer.records[0].after == 0U &&
-                  timer.records[0].posts == c.posts && timer.records[0].scanned == c.scanned &&
+                  timer.records[0].posts == c.posts &&
+                  timer.records[0].scanned == (sparse ? c.sparseScanned : c.scanned) &&
                   timer.scanStarts == c.posts + 1U && timer.scanStops == timer.scanStarts && !timer.scanActive,
-              "completion did not preserve the baseline scan budget and cursor");
+              "completion did not report the selected scan policy and cursor");
         const auto reads = f.s.flagReads;
         Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {2U, 64U}) &&
                   timer.records.size() == 1U && f.s.flagReads == reads,
@@ -1028,8 +1035,10 @@ void CompleteInCall()
     Check(capped.progress.sentRows == 2U && capped.progress.nextRow == 4U && capped.s.posts.size() == 2U,
           "completion exceeded the two-Post budget");
     OracleStep(capped, 2U, 64U);
-    Check(capped.progress.sentRows == 3U && capped.progress.nextRow == 68U && capped.s.posts.size() == 3U,
-          "resumed final run did not preserve the baseline scan budget");
+    Check(capped.progress.sentRows == 3U &&
+              capped.progress.nextRow == ((capped.tiling.pipelineFlags & 4U) != 0U ? 6U : 68U) &&
+              capped.s.posts.size() == 3U,
+          "resumed final run did not obey the selected completion policy");
     capped.CheckPayload();
 }
 
@@ -1296,7 +1305,11 @@ void RetrySpacing()
 int main(int argc, char** argv)
 {
     using namespace ProgressTest;
-    Check(argc == 2, "expected one test scenario");
+    Check(argc == 2 || argc == 3, "expected one test scenario and optional sparse mode");
+    if (argc == 3) {
+        Check(std::strcmp(argv[2], "sparse") == 0, "unknown scan mode");
+        testPipelineFlags = 4U;
+    }
     const char* scenario = argv[1];
     if (std::strcmp(scenario, "routing") == 0)
         Routing();

@@ -552,24 +552,32 @@ def test_reduction_bad_configuration_fails_collectively_before_runtime(backend, 
 
 
 @pytest.mark.parametrize(
-    "qps,gate,workers,lane_init",
+    "qps,workers,lane_init,sparse_scan",
     [
-        (0, True, 0, False),
-        (0, False, 8, False),
-        (0, True, 14, False),
-        (0, False, 28, False),
-        (4, False, 0, True),
-        (8, True, 0, True),
+        (0, 0, False, False),
+        (0, 8, False, False),
+        (0, 14, False, False),
+        (0, 28, False, False),
+        (4, 0, True, False),
+        (8, 0, True, False),
+        (8, 14, True, False),
+        (4, 8, True, False),
+        (0, 0, False, True),
+        (0, 14, False, True),
     ],
 )
-def test_pipeline_options_reach_every_bs_plan(backend, qps, gate, workers, lane_init):
+def test_pipeline_options_reach_every_bs_plan(backend, qps, workers, lane_init, sparse_scan):
     b = hierarchical_buffer(
-        backend, combine_reduce_qps=qps, combine_gate=gate, dispatch_workers=workers, reduce_lane_init=lane_init
+        backend,
+        combine_reduce_qps=qps,
+        dispatch_workers=workers,
+        reduce_lane_init=lane_init,
+        combine_sparse_scan=sparse_scan,
     )
     try:
         for bs in (1, 32, 256):
             b.prepare(bs)
-            assert b._plan.options[-3:] == (qps, int(gate) | (int(lane_init) << 1), workers)
+            assert b._plan.options[-3:] == (qps, (int(lane_init) << 1) | (int(sparse_scan) << 2), workers)
     finally:
         b.destroy()
 
@@ -577,14 +585,22 @@ def test_pipeline_options_reach_every_bs_plan(backend, qps, gate, workers, lane_
 @pytest.mark.parametrize(
     "options",
     [
-        dict(combine_gate=1),
+        dict(reduce_lane_init=1),
         dict(reduce_lane_init=True),
         dict(dispatch_workers=-1),
         dict(dispatch_workers=129),
         dict(dispatch_workers=True),
-        dict(combine_reduce_qps=8, dispatch_workers=8),
-        dict(mma_type="fp8xfp8", combine_gate=True),
-        dict(size=16, combine_gate=True),
+        dict(combine_reduce_qps=8, combine_async=True),
+        dict(combine_owner_half=True),
+        dict(combine_sync_progress=True),
+        dict(combine_ready_trace=True),
+        dict(mma_type="fp8xfp8", dispatch_workers=14),
+        dict(size=16, dispatch_workers=14),
+        dict(combine_sparse_scan=1),
+        dict(combine_reduce_qps=8, combine_sparse_scan=True),
+        dict(combine_reduce_qps=4, combine_sparse_scan=True),
+        dict(mma_type="fp8xfp8", combine_sparse_scan=True),
+        dict(size=16, combine_sparse_scan=True),
     ],
 )
 def test_invalid_pipeline_configuration_does_not_start_runtime(backend, monkeypatch, options):
@@ -593,7 +609,7 @@ def test_invalid_pipeline_configuration_does_not_start_runtime(backend, monkeypa
         hierarchical_buffer(backend, **options)
 
 
-@pytest.mark.parametrize("field", [11, 12, 13])
+@pytest.mark.parametrize("field", [11, 12, 13, 14, 15, 16, 17])
 def test_pipeline_options_must_match_on_all_ranks(backend, monkeypatch, field):
     from deep_ep._store import StoreGroup
 
@@ -604,7 +620,7 @@ def test_pipeline_options_must_match_on_all_ranks(backend, monkeypatch, field):
         if stage == "check:configuration":
             error, config = value
             other = list(config)
-            other[field] = not other[field] if field != 12 else 8
+            other[field] = not other[field] if field != 11 else 8
             peers[-1] = (error, tuple(other))
         return peers
 
@@ -715,7 +731,7 @@ def test_hierarchical_a8w8_bs32_uses_fp8_weights_without_layout_conversion(backe
         b.destroy()
 
 
-@pytest.mark.parametrize("protocol", [5, 6, 7, 8])
+@pytest.mark.parametrize("protocol", [5, 6, 7, 8, 9])
 def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypatch, protocol):
     api._extension.cache_clear()
     core = SimpleNamespace(create_megamoe_runtime=lambda: None)
@@ -723,10 +739,30 @@ def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypa
     monkeypatch.setattr(api, "require_native", lambda _: core)
     monkeypatch.setattr(api.importlib, "import_module", lambda _: extension)
     try:
-        if protocol != 8:
+        if protocol != 9:
             with pytest.raises(RuntimeError, match="versions differ"):
                 api._extension()
         else:
             assert api._extension() is extension
     finally:
         api._extension.cache_clear()
+
+
+@pytest.mark.parametrize(
+    "qps,options,flags",
+    [
+        (0, dict(combine_async=True), 16),
+        (0, dict(combine_async=True, combine_sparse_scan=True), 20),
+        (8, dict(combine_owner_half=True, dispatch_workers=14, reduce_lane_init=True), 10),
+        (8, dict(combine_sync_progress=True), 32),
+        (4, dict(combine_ready_trace=True), 64),
+        (8, dict(combine_owner_half=True, combine_sync_progress=True, combine_ready_trace=True), 104),
+    ],
+)
+def test_tail_pipeline_options_reach_plan(backend, qps, options, flags):
+    b = hierarchical_buffer(backend, combine_reduce_qps=qps, **options)
+    try:
+        b.prepare(32)
+        assert b._plan.options[-3:] == (qps, flags, options.get("dispatch_workers", 0))
+    finally:
+        b.destroy()

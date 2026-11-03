@@ -155,9 +155,9 @@ struct HierarchicalCombineReadySnapshot {
     }
 };
 
-// Keep the current token's remaining bits in scalar state. Advancing still
-// visits every row for exact scan-budget accounting, including holes and sent
-// rows, but needs no per-row division or pending-mask reload.
+// Keep the current token's remaining bits in scalar state. Scan budgets count
+// logical row positions, including holes and sent rows. The sparse path skips
+// an empty token suffix in one step while charging the same logical budget.
 struct HierarchicalCombineScanCursor {
     uint32_t row;
     uint32_t token;
@@ -196,6 +196,24 @@ struct HierarchicalCombineScanCursor {
     {
         row = token = topk = 0U;
         pending = progress.pendingTopkMasks[0];
+    }
+
+    // Only call when pending == 0: earlier slots in this token may still be
+    // pending, but no slot at or after the cursor can become pending again.
+    // Respect partial budgets and avoid shifting by 32 for a full top-k token.
+    __aicore__ inline uint32_t SkipEmptySuffix(const MoeStageCommonConfig& common,
+                                               const HierarchicalCombineProgress& progress, uint32_t scansLeft)
+    {
+        const uint32_t remaining = common.topK - topk;
+        const uint32_t skipped = remaining < scansLeft ? remaining : scansLeft;
+        row += skipped;
+        topk += skipped;
+        if (topk == common.topK) {
+            topk = 0U;
+            ++token;
+            pending = token < common.tokenNum ? progress.pendingTopkMasks[token] : 0U;
+        }
+        return skipped;
     }
 };
 
@@ -252,11 +270,19 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
     const uint32_t scanLimit = budget.maxScannedRows < rowCount ? budget.maxScannedRows : rowCount;
     const uint32_t rowBytes = common.tokenHiddenDim * sizeof(bfloat16_t);
     const uint32_t destination = HierarchicalGateway(common.rankId);
+    const bool sparseScan = (params.tilingData->pipelineFlags & 4U) != 0U;
     HierarchicalCombineScanCursor cursor(progress, common.topK);
     HierarchicalCombineReadySnapshot snapshot;
     uint32_t scanned = 0U;
     uint32_t posts = 0U;
     while (scanned < scanLimit && posts < budget.maxPosts) {
+        if (sparseScan && cursor.pending == 0U) {
+            scanned += cursor.SkipEmptySuffix(common, progress, scanLimit - scanned);
+            if (cursor.row == rowCount) {
+                cursor.Wrap(progress);
+            }
+            continue;
+        }
         ++scanned;
         if (!cursor.Ready(params, snapshot, rowCount - cursor.row, scanLimit - scanned + 1U)) {
             cursor.Advance(common, progress);
@@ -320,6 +346,9 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
         }
         if (cursor.row == rowCount) {
             cursor.Wrap(progress);
+        }
+        if (sparseScan && progress.sentRows == progress.expectedRows) {
+            break;
         }
     }
     progress.nextRow = cursor.row;

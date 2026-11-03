@@ -68,6 +68,9 @@ DYNAMIC_NAMES = [
     "AIV_RELAY_STEP",
     "AIV_COMBINE_RUN",
     "AIV_COMBINE_REDUCE",
+    "AIV_COMBINE_ASYNC",
+    "AIV_COMBINE_READY",
+    "AIV_COMBINE_SYNC",
 ]
 
 RDMA_PHASES = ("dispatch_meta", "dispatch_payload", "combine")
@@ -210,6 +213,31 @@ def task_metadata(raw, core_id, logical_index):
     first, second = raw[offset : offset + 2]
     family = DYNAMIC_NAMES[dynamic_index // MAX_DYNAMIC_ITER]
     mask = (1 << 32) - 1
+    if family == "AIV_COMBINE_ASYNC":
+        expert, row = ((first >> 32) & mask) - 1, first & mask
+        if expert < 0 or second != 1:
+            raise ValueError(f"invalid async Combine metadata: core={core_id}, slot={dynamic_index}")
+        return dict(granularity="combine_async", expert_id=expert, row_start=row, row_count=1, scope="row_lifetime")
+    if family == "AIV_COMBINE_READY":
+        qp, token = (first >> 32) & mask, first & mask
+        pending, observed = (second >> 32) & mask, second & mask
+        if not (1 <= qp <= 8 and token < 256) or observed & ~pending:
+            raise ValueError(f"invalid Combine ready snapshot: core={core_id}, slot={dynamic_index}")
+        return dict(
+            granularity="combine_ready",
+            qp_index=qp,
+            token_index=token,
+            pending_topk_mask=pending,
+            observed_ready_mask=observed,
+            token_ready=bool(pending) and pending == observed,
+            observation="poll_snapshot",
+        )
+    if family == "AIV_COMBINE_SYNC":
+        qp, phase = (first >> 32) & mask, first & mask
+        phases = ("before_export_sync", "after_export_sync", "before_host_barrier", "after_host_barrier")
+        if not (1 <= qp <= 8 and 1 <= phase <= len(phases) and 0 <= second <= 8192):
+            raise ValueError(f"invalid Combine sync marker: core={core_id}, slot={dynamic_index}")
+        return dict(granularity="combine_sync", qp_index=qp, sync_phase=phases[phase - 1], pending_rows=second)
     if family == "AIV_COMBINE_REDUCE":
         qp, token = (first >> 32) & mask, first & mask
         topk_mask, hidden = (second >> 32) & mask, second & mask

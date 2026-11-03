@@ -31,7 +31,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 8:
+    if getattr(extension, "api_protocol", None) != 9:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -82,9 +82,13 @@ class SymmBuffer:
         ranks_per_node: int = 0,
         timeout: int = 120,
         combine_reduce_qps: int = 0,
-        combine_gate: bool = False,
         dispatch_workers: int = 0,
         reduce_lane_init: bool = False,
+        combine_sparse_scan: bool = False,
+        combine_owner_half: bool = False,
+        combine_async: bool = False,
+        combine_sync_progress: bool = False,
+        combine_ready_trace: bool = False,
     ):
         import torch
         import torch.distributed as dist
@@ -105,20 +109,40 @@ class SymmBuffer:
             integer("timeout", timeout, 1, 300)
             integer("combine_reduce_qps", combine_reduce_qps, 0, 8)
             integer("dispatch_workers", dispatch_workers, 0, 128)
-            if type(combine_gate) is not bool or type(reduce_lane_init) is not bool:
-                raise TypeError("combine_gate and reduce_lane_init must be bool")
+            if any(
+                type(value) is not bool
+                for value in (
+                    reduce_lane_init,
+                    combine_sparse_scan,
+                    combine_owner_half,
+                    combine_async,
+                    combine_sync_progress,
+                    combine_ready_trace,
+                )
+            ):
+                raise TypeError("Pipeline switches must be bool")
             if combine_reduce_qps not in (0, 4, 8):
                 raise ValueError("combine_reduce_qps must be 0, 4 or 8")
             if combine_reduce_qps and (size != 32 or ranks_per_node != 16 or mma_type != "fp8xfp4"):
                 raise ValueError("Gateway weighted reduction requires EP32, ranks_per_node=16 and FP8xFP4")
-            if (combine_gate or dispatch_workers or reduce_lane_init) and (
-                size != 32 or ranks_per_node != 16 or mma_type != "fp8xfp4"
-            ):
+            if (
+                dispatch_workers
+                or reduce_lane_init
+                or combine_sparse_scan
+                or combine_owner_half
+                or combine_async
+                or combine_sync_progress
+                or combine_ready_trace
+            ) and (size != 32 or ranks_per_node != 16 or mma_type != "fp8xfp4"):
                 raise ValueError("Pipeline experiments require EP32, ranks_per_node=16 and FP8xFP4")
             if reduce_lane_init and not combine_reduce_qps:
                 raise ValueError("reduce_lane_init requires combine_reduce_qps=4 or 8")
-            if dispatch_workers and combine_reduce_qps:
-                raise ValueError("dispatch_workers currently requires combine_reduce_qps=0")
+            if combine_sparse_scan and combine_reduce_qps:
+                raise ValueError("combine_sparse_scan requires combine_reduce_qps=0")
+            if (combine_owner_half or combine_sync_progress or combine_ready_trace) and not combine_reduce_qps:
+                raise ValueError("owner_half, sync_progress and ready_trace require combine_reduce_qps=4 or 8")
+            if combine_async and combine_reduce_qps:
+                raise ValueError("combine_async requires combine_reduce_qps=0")
             if hidden % 64 or intermediate_hidden % 128:
                 raise ValueError("hidden must be divisible by 64; intermediate_hidden by 128")
             if activation != "swiglu" or mma_type not in {"fp8xfp4", "fp8xfp8"}:
@@ -147,9 +171,13 @@ class SymmBuffer:
             ranks_per_node,
             timeout,
             combine_reduce_qps,
-            combine_gate,
             dispatch_workers,
             reduce_lane_init,
+            combine_sparse_scan,
+            combine_owner_half,
+            combine_async,
+            combine_sync_progress,
+            combine_ready_trace,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
@@ -167,11 +195,13 @@ class SymmBuffer:
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
         self.ranks_per_node = ranks_per_node
         self.combine_reduce_qps = combine_reduce_qps
-        self.combine_gate, self.dispatch_workers, self.reduce_lane_init = (
-            combine_gate,
-            dispatch_workers,
-            reduce_lane_init,
-        )
+        self.dispatch_workers = dispatch_workers
+        self.reduce_lane_init = reduce_lane_init
+        self.combine_sparse_scan = combine_sparse_scan
+        self.combine_owner_half = combine_owner_half
+        self.combine_async = combine_async
+        self.combine_sync_progress = combine_sync_progress
+        self.combine_ready_trace = combine_ready_trace
         self._hierarchical_roce = ranks_per_node == 16 and size > 16
         self._sequence = 0
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
@@ -236,7 +266,12 @@ class SymmBuffer:
             address,
             runtime.native.capacity,
             self.combine_reduce_qps,
-            int(self.combine_gate) | (int(self.reduce_lane_init) << 1),
+            (int(self.reduce_lane_init) << 1)
+            | (int(self.combine_sparse_scan) << 2)
+            | (int(self.combine_owner_half) << 3)
+            | (int(self.combine_async) << 4)
+            | (int(self.combine_sync_progress) << 5)
+            | (int(self.combine_ready_trace) << 6),
             self.dispatch_workers,
         )
         self._plan_bs = bs

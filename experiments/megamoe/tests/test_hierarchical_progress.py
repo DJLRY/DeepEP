@@ -58,9 +58,10 @@ def hierarchical_progress_binary(tmp_path_factory):
         "retry-spacing",
     ],
 )
-def test_hierarchical_progress_contract(hierarchical_progress_binary, scenario):
+@pytest.mark.parametrize("sparse_scan", [False, True], ids=["baseline", "sparse"])
+def test_hierarchical_progress_contract(hierarchical_progress_binary, scenario, sparse_scan):
     result = subprocess.run(
-        [str(hierarchical_progress_binary), scenario],
+        [str(hierarchical_progress_binary), scenario, *(["sparse"] if sparse_scan else [])],
         capture_output=True,
         text=True,
         timeout=10,

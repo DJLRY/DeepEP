@@ -132,17 +132,35 @@ def main():
         help="legacy: one Exp prefix; shmem: per-round L2 flush, device sleep and SHMEM barrier",
     )
     parser.add_argument(
-        "--combine-gate", action="store_true", help="Defer local Combine until this worker finishes all activation"
-    )
-    parser.add_argument(
         "--dispatch-workers",
         type=int,
         choices=(0, 8, 14, 28),
         default=0,
-        help="q=0 only: Dispatch participants per expert; 0 keeps all workers",
+        help="Dispatch participants per expert; 0 keeps all workers",
     )
     parser.add_argument(
         "--reduce-lane-init", action="store_true", help="q=4/8 only: initialize only this lane's routes"
+    )
+    parser.add_argument(
+        "--combine-owner-half", action="store_true", help="q=4/8: give reduction owners half the local Combine share"
+    )
+    parser.add_argument(
+        "--combine-async",
+        action="store_true",
+        help="q=0: issue one local Combine row and retire it on a later scheduler visit",
+    )
+    parser.add_argument(
+        "--combine-sync-progress",
+        action="store_true",
+        help="q=4/8: bounded ready-token progress while waiting for producer barriers",
+    )
+    parser.add_argument(
+        "--combine-ready-trace",
+        action="store_true",
+        help="q=4/8: record readiness snapshots and synchronization boundaries (timer builds)",
+    )
+    parser.add_argument(
+        "--combine-sparse-scan", action="store_true", help="q=0 only: skip empty pending tokens and stop on completion"
     )
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
     parser.add_argument(
@@ -204,9 +222,13 @@ def run(args, config, group):
             args.check_tokens,
             args.relative_rmse,
             args.combine_reduce_qps,
-            args.combine_gate,
             args.dispatch_workers,
             args.reduce_lane_init,
+            args.combine_sparse_scan,
+            args.combine_owner_half,
+            args.combine_async,
+            args.combine_sync_progress,
+            args.combine_ready_trace,
         ),
     )
     timer_ranks = args.timer_ranks if args.timer_ranks is not None else list(range(min(world, 8)))
@@ -257,9 +279,13 @@ def run(args, config, group):
             "ascend_post_gmm2_host_reduce_fp32_v1" if args.combine_reduce_qps else "ascend_post_gmm2_route_weight_v1"
         ),
         combine_reduce_qps=args.combine_reduce_qps,
-        combine_gate=args.combine_gate,
         dispatch_workers=args.dispatch_workers,
         reduce_lane_init=args.reduce_lane_init,
+        combine_sparse_scan=args.combine_sparse_scan,
+        combine_owner_half=args.combine_owner_half,
+        combine_async=args.combine_async,
+        combine_sync_progress=args.combine_sync_progress,
+        combine_ready_trace=args.combine_ready_trace,
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
     )
@@ -270,9 +296,13 @@ def run(args, config, group):
         num_max_tokens_per_rank=max(config["bs_values"]),
         ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
         combine_reduce_qps=args.combine_reduce_qps,
-        combine_gate=args.combine_gate,
         dispatch_workers=args.dispatch_workers,
         reduce_lane_init=args.reduce_lane_init,
+        combine_sparse_scan=args.combine_sparse_scan,
+        combine_owner_half=args.combine_owner_half,
+        combine_async=args.combine_async,
+        combine_sync_progress=args.combine_sync_progress,
+        combine_ready_trace=args.combine_ready_trace,
         **model,
     )
 
@@ -429,9 +459,13 @@ def run(args, config, group):
             report.update(measurement)
             report["combine_reduce_qps"] = args.combine_reduce_qps
             report.update(
-                combine_gate=args.combine_gate,
                 dispatch_workers=args.dispatch_workers,
                 reduce_lane_init=args.reduce_lane_init,
+                combine_sparse_scan=args.combine_sparse_scan,
+                combine_owner_half=args.combine_owner_half,
+                combine_async=args.combine_async,
+                combine_sync_progress=args.combine_sync_progress,
+                combine_ready_trace=args.combine_ready_trace,
             )
             (case / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             if rank == 0:

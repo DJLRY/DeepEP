@@ -270,7 +270,88 @@ struct WaveCombineScratch {
     LocalTensor<int32_t> metaInfoTensor;
     LocalTensor<bfloat16_t> rowBufferTensor;
     LocalTensor<float> quantTempTensor;
+    bool asyncInFlight = false;
+    uint32_t asyncRowsDone = 0U;
+    __gm__ int32_t* asyncReady = nullptr;
+    int64_t asyncStart = 0;
+    uint32_t asyncExpert = 0U;
+    uint32_t asyncRow = 0U;
+    int64_t asyncWave = AscendTimer::NO_WAVE;
 };
+
+// One BF16 row and one metadata record, independent of activation scratch.
+// Dispatch is finished before the priority scheduler can issue the first row.
+// Large activation tiles explicitly retire the row before reusing high UB.
+constexpr uint32_t ASYNC_COMBINE_META_UB = 224U * 1024U;
+constexpr uint32_t ASYNC_COMBINE_ROW_UB = ASYNC_COMBINE_META_UB + 32U;
+constexpr uint32_t ASYNC_COMBINE_EVENT = 6U;  // stage events 0..5, RoCE event 7
+
+__aicore__ inline void RetireAsyncCombineRow(const Params& params, WaveCombineScratch& scratch,
+                                             AscendTimerDevice& timer)
+{
+    if (!scratch.asyncInFlight) {
+        return;
+    }
+    WaitFlag<HardEvent::MTE3_S>(static_cast<TEventID>(ASYNC_COMBINE_EVENT));
+    if (scratch.asyncReady != nullptr) {
+        WriteGmByPassDCache(scratch.asyncReady, static_cast<int32_t>(params.tilingData->hierarchicalSequence));
+    }
+    if (timer.Enabled()) {
+        timer.SetWave(scratch.asyncWave);
+        // This is row lifetime, including scheduler/activation overlap, not
+        // exclusive AIV execution time. Parser labels it separately.
+        timer.RecordDetail(AscendTimer::AIV_COMBINE_ASYNC, scratch.asyncStart, GetSystemCycle(),
+                           (static_cast<uint64_t>(scratch.asyncExpert + 1U) << 32) | scratch.asyncRow, 1U);
+    }
+    scratch.asyncInFlight = false;
+    ++scratch.asyncRowsDone;
+}
+
+__aicore__ inline bool ProgressAsyncCombineSlice(const MoeStageCommonConfig& common, const Params& params,
+                                                 const ExpertLoopState& state, uint32_t rowStart, WorkRange owned,
+                                                 AscendTimerDevice& timer, WaveCombineScratch& scratch)
+{
+    RetireAsyncCombineRow(params, scratch, timer);
+    if (scratch.asyncRowsDone == owned.count) {
+        scratch.asyncRowsDone = 0U;
+        return true;
+    }
+    const uint32_t localRow = rowStart + owned.start + scratch.asyncRowsDone;
+    const uint64_t globalRow = state.globalTokenStartIndex + localRow;
+    scratch.asyncStart = timer.Enabled() ? GetSystemCycle() : 0;
+    scratch.asyncExpert = state.expertIdx;
+    scratch.asyncRow = localRow;
+    LocalTensor<int32_t> meta(TPosition::VECCALC, ASYNC_COMBINE_META_UB, META_INFO_SIZE);
+    LocalTensor<bfloat16_t> row(TPosition::VECIN, ASYNC_COMBINE_ROW_UB, common.tokenHiddenDim);
+    GlobalTensor<int32_t> metaGm;
+    metaGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr));
+    SyncFuncStatic<HardEvent::S_MTE2, ASYNC_COMBINE_EVENT>();
+    DataCopy(meta, metaGm[globalRow * META_INFO_SIZE], META_INFO_SIZE);
+    SyncFuncStatic<HardEvent::MTE2_S, ASYNC_COMBINE_EVENT>();
+    const auto route = CombineImpl::LoadCombineTokenRoute(meta, 0U);
+    const bool gateway = HierarchicalHost(route.dstRankId) != HierarchicalHost(common.rankId);
+    const uint32_t destination = gateway ? HierarchicalGateway(route.dstRankId) : route.dstRankId;
+    const uint64_t destinationRow = CombineImpl::GetCombineDstRowIndex(route, params);
+    const uint64_t offset = (gateway ? params.peermemInfo.gatewayCombinePtr : params.peermemInfo.combineSendPtr) -
+                            params.peermemInfo.rankSyncInWorldPtr;
+    GlobalTensor<bfloat16_t> source, target;
+    source.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(params.workspaceInfo.gmm2MmadResPtr));
+    target.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(GetRankWinAddrWithOffset(destination, offset)));
+    DataCopyExtParams copy{1U, static_cast<uint32_t>(common.tokenHiddenDim * sizeof(bfloat16_t)), 0U, 0U, 0U};
+    DataCopyPad(row, source[globalRow * common.tokenHiddenDim], copy, {false, 0U, 0U, 0U});
+    SetFlag<HardEvent::MTE2_MTE3>(static_cast<TEventID>(ASYNC_COMBINE_EVENT));
+    WaitFlag<HardEvent::MTE2_MTE3>(static_cast<TEventID>(ASYNC_COMBINE_EVENT));
+    DataCopyPad(target[destinationRow * common.tokenHiddenDim], row, copy);
+    SetFlag<HardEvent::MTE3_S>(static_cast<TEventID>(ASYNC_COMBINE_EVENT));
+    scratch.asyncReady = nullptr;
+    if (gateway) {
+        const uint64_t readyOffset = params.peermemInfo.gatewayCombineReadyPtr - params.peermemInfo.rankSyncInWorldPtr +
+                                     destinationRow * HIERARCHICAL_FLAG_BYTES;
+        scratch.asyncReady = reinterpret_cast<__gm__ int32_t*>(GetRankWinAddrWithOffset(destination, readyOffset));
+    }
+    scratch.asyncInFlight = true;
+    return false;
+}
 
 constexpr uint32_t WAVE_COMBINE_MIN_ROW_BUFFER_COUNT = 2U;
 constexpr uint32_t WAVE_COMBINE_STEADY_ROW_BUFFER_COUNT = 1U;
@@ -1209,7 +1290,8 @@ __aicore__ inline void NotifyTokenCombineSliceReady(const Params& params, uint32
 template <bool InputReadyChecked = false>
 __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, const AivJobContext& job,
                                             const Params& params, const ExpertLoopState& state, uint32_t rowStart,
-                                            uint32_t rowCount, AscendTimerDevice& timer, WaveCombineScratch& scratch)
+                                            uint32_t rowCount, AscendTimerDevice& timer, WaveCombineScratch& scratch,
+                                            const WorkRange* assigned = nullptr)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -1218,7 +1300,7 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
         return;
     }
     uint64_t globalRowStart = static_cast<uint64_t>(state.globalTokenStartIndex) + rowStart;
-    WorkRange owned = GetWaveCombineOwnedRange(job, rowCount, globalRowStart);
+    WorkRange owned = assigned != nullptr ? *assigned : GetWaveCombineOwnedRange(job, rowCount, globalRowStart);
     if (owned.count == 0U) {
         return;
     }

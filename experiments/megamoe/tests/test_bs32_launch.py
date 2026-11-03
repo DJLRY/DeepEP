@@ -191,14 +191,19 @@ def test_stage_separation_and_fixed_case(saved, monkeypatch, action, expected):
 @pytest.mark.parametrize(
     "qps,flags,expected",
     [
-        (0, ["--combine-gate"], dict(combine_gate=True, dispatch_workers=0, reduce_lane_init=False)),
-        (0, ["--dispatch-workers", "8"], dict(combine_gate=False, dispatch_workers=8, reduce_lane_init=False)),
-        (8, ["--reduce-lane-init"], dict(combine_gate=False, dispatch_workers=0, reduce_lane_init=True)),
+        (0, ["--combine-async"], dict(combine_async=True)),
+        (8, ["--dispatch-workers", "14", "--reduce-lane-init"], dict(dispatch_workers=14, reduce_lane_init=True)),
+        (8, ["--combine-owner-half"], dict(combine_owner_half=True)),
         (
-            4,
-            ["--combine-gate", "--reduce-lane-init"],
-            dict(combine_gate=True, dispatch_workers=0, reduce_lane_init=True),
+            8,
+            ["--combine-sync-progress", "--combine-ready-trace"],
+            dict(combine_sync_progress=True, combine_ready_trace=True),
         ),
+        (0, ["--dispatch-workers", "8"], dict(dispatch_workers=8, reduce_lane_init=False)),
+        (0, ["--dispatch-workers", "14", "--combine-sparse-scan"], dict(dispatch_workers=14, combine_sparse_scan=True)),
+        (0, ["--combine-sparse-scan"], dict(dispatch_workers=0, combine_sparse_scan=True)),
+        (8, ["--reduce-lane-init"], dict(dispatch_workers=0, reduce_lane_init=True)),
+        (4, ["--reduce-lane-init"], dict(dispatch_workers=0, reduce_lane_init=True)),
     ],
 )
 def test_pipeline_experiments_propagate_and_are_recorded(saved, monkeypatch, action, qps, flags, expected):
@@ -223,10 +228,16 @@ def test_pipeline_experiments_propagate_and_are_recorded(saved, monkeypatch, act
 @pytest.mark.parametrize(
     "args",
     [
-        ["build", "--combine-gate"],
+        ["build", "--dispatch-workers", "14"],
         ["golden", "--dispatch-workers", "0"],
         ["perf", "--reduce-lane-init"],
-        ["run", "--combine-reduce-qps", "8", "--dispatch-workers", "8"],
+        ["run", "--combine-reduce-qps", "8", "--combine-async"],
+        ["run", "--combine-owner-half"],
+        ["run", "--combine-sync-progress"],
+        ["run", "--combine-ready-trace"],
+        ["build", "--combine-sparse-scan"],
+        ["golden", "--combine-sparse-scan"],
+        ["perf", "--combine-reduce-qps", "8", "--combine-sparse-scan"],
     ],
 )
 def test_pipeline_cli_rejects_invalid_experiments_before_launch(saved, monkeypatch, args):
@@ -561,7 +572,7 @@ def test_preflight_checks_installed_timer_support(saved, tmp_path, monkeypatch, 
     modules["deep_ep._native"].require_native = lambda operation: None
     modules["deep_ep_experimental.megamoe._C"].timer_enabled = compiled
     modules["deep_ep_experimental.megamoe._C"].hierarchical_max_tokens = limit
-    modules["deep_ep_experimental.megamoe._C"].api_protocol = 8
+    modules["deep_ep_experimental.megamoe._C"].api_protocol = 9
 
     def execute(command, env):
         monkeypatch.setattr(sys, "argv", ["-c", *command[4:]])

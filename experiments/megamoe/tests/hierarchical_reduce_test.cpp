@@ -217,6 +217,7 @@ public:
         return true;
     }
     uint32_t reduced = 0;
+    uint32_t readyRecords = 0, syncRecords = 0;
     void RecordDetail(AscendTimer::DynamicTimingType type, int64_t start, int64_t end, uint64_t first, uint64_t second)
     {
         ReduceTest::Check(end > start, "empty trace interval");
@@ -224,6 +225,16 @@ public:
             ReduceTest::Check((first >> 32) == ReduceTest::activeLane + 1U && (second >> 32) != 0U,
                               "wrong reduction trace");
             ++reduced;
+        } else if (type == AscendTimer::AIV_COMBINE_READY) {
+            ReduceTest::Check((first >> 32) == ReduceTest::activeLane + 1U &&
+                                  (static_cast<uint32_t>(second) & ~static_cast<uint32_t>(second >> 32)) == 0U,
+                              "wrong ready snapshot / bits outside pending mask");
+            ++readyRecords;
+        } else if (type == AscendTimer::AIV_COMBINE_SYNC) {
+            ReduceTest::Check((first >> 32) == ReduceTest::activeLane + 1U && static_cast<uint32_t>(first) >= 1U &&
+                                  static_cast<uint32_t>(first) <= 4U,
+                              "wrong synchronization marker");
+            ++syncRecords;
         }
     }
 };
@@ -311,7 +322,7 @@ namespace MegaMoeImpl {
 using namespace MegaMoeImpl;
 
 void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity, uint32_t topk, uint32_t hidden,
-               uint32_t pattern, uint32_t sequence, bool shared, bool laneInit = false)
+               uint32_t pattern, uint32_t sequence, bool shared, bool laneInit = false, bool diagnostic = false)
 {
     using namespace ReduceTest;
     ub.fill(0);
@@ -330,7 +341,7 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     t.topoType = TOPO_TYPE_MTE_ROCE;
     t.groupedMatmulMode = GROUPED_MATMUL_MODE_A8W4;
     t.combineReduceQps = qps;
-    t.pipelineFlags = laneInit ? 2U : 0U;
+    t.pipelineFlags = (laneInit ? 2U : 0U) | (diagnostic ? 64U : 0U);
     t.roceScratchUbOffset = 256U * 1024U - 512U;
     t.hierarchicalSequence = sequence;
     t.sharedExpertNum = shared ? 1U : 0U;
@@ -339,7 +350,11 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     heapBytes = CalcPeermemLeastSize(sizes);
     std::vector<uint8_t> sourceHeap(heapBytes, 0xA5), gatewayHeap(heapBytes, 0xA5);
     PeermemInfo source(sourceHeap.data(), &t), gateway(gatewayHeap.data(), &t);
-    Check(gateway.combineReduceCommitPtr + qps * 512U == gatewayHeap.data() + heapBytes, "layout budget mismatch");
+    Check(gateway.combineReduceCommitPtr + qps * 512U == gateway.combineProducerDonePtr,
+          "producer flags overlap QP commits");
+    Check(gateway.combineProducerDonePtr + HIERARCHICAL_PRODUCER_PHASES * HIERARCHICAL_MAX_AIV_WORKERS * 512U ==
+              gatewayHeap.data() + heapBytes,
+          "layout budget mismatch");
     localBase = gatewayHeap.data();
     remoteBase = sourceHeap.data();
     expectedPeer = sourceRank;
@@ -439,6 +454,8 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
               "lane initializer read unrelated or duplicate route chunks");
         Check(!TryProgressHierarchicalReducedCombine(gwCommon, params, state[activeLane], activeLane, scratch, &timer),
               "stale flags released data");
+        TraceHierarchicalCombineBoundary(gwCommon, params, state[activeLane], activeLane, &timer, 1U);
+        TraceHierarchicalCombineBoundary(gwCommon, params, state[activeLane], activeLane, &timer, 2U);
     }
     // Publish expert rows in reverse order. A partial token must never be posted.
     std::vector<uint32_t> published(bs, 0U);
@@ -456,8 +473,14 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
             Check(published[sent] == masks[sent], "incomplete token was sent");
         }
     }
-    for (activeLane = 0; activeLane < qps; ++activeLane)
+    for (activeLane = 0; activeLane < qps; ++activeLane) {
         DrainHierarchicalReducedCombine(gwCommon, params, state[activeLane], activeLane, scratch, &timer);
+        TraceHierarchicalCombineBoundary(gwCommon, params, state[activeLane], activeLane, &timer, 3U);
+        TraceHierarchicalCombineBoundary(gwCommon, params, state[activeLane], activeLane, &timer, 4U);
+    }
+    Check(timer.syncRecords == (diagnostic ? qps * 4U : 0U), "missing synchronization diagnostics");
+    Check(diagnostic ? timer.readyRecords >= bs * 4U : timer.readyRecords == 0U,
+          "missing/unsolicited ready diagnostics");
     std::vector<uint32_t> sent(bs, 0U);
     for (const auto& post : posts) {
         const uint32_t token = static_cast<uint32_t>((post.source - gateway.combinePartialSendPtr) / (hidden * 4U));
@@ -526,6 +549,8 @@ int main()
             CheckCase(8U, 0U, 3U, 8U, 7U, 1024U, 2U, 3U, false, laneInit);
             CheckCase(8U, 16U, 37U, 64U, 7U, 1024U, 2U, 3U, false, laneInit);
         }
+        CheckCase(8U, 0U, 32U, 64U, 8U, 3584U, 2U, 0x80000101U, false, true, true);
+        CheckCase(4U, 16U, 7U, 32U, 32U, 1024U, 2U, 0xffffffffU, true, false, true);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

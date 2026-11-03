@@ -275,15 +275,24 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
                                             p.aiv >= 2U * static_cast<uint32_t>(combine_reduce_qps)),
                 "Not enough AIV1 workers for combine_reduce_qps");
     t.combineReduceQps = static_cast<uint32_t>(combine_reduce_qps);
-    TORCH_CHECK(pipeline_flags >= 0 && pipeline_flags <= megamoe_config::PIPELINE_FLAGS,
+    TORCH_CHECK(pipeline_flags >= 0 && (pipeline_flags & megamoe_config::PIPELINE_FLAGS) == pipeline_flags,
                 "Invalid MegaMoE pipeline flags");
     TORCH_CHECK(dispatch_workers >= 0 && dispatch_workers <= p.aic, "dispatch_workers exceeds AIV1 worker count");
     TORCH_CHECK((pipeline_flags == 0 && dispatch_workers == 0) || (hierarchical && is_a8w4),
                 "Pipeline experiments require two-host EP32 A8W4");
     TORCH_CHECK(!(pipeline_flags & megamoe_config::REDUCE_LANE_INIT) || combine_reduce_qps != 0,
                 "reduce_lane_init requires combine_reduce_qps=4 or 8");
-    TORCH_CHECK(dispatch_workers == 0 || combine_reduce_qps == 0,
-                "dispatch_workers currently requires combine_reduce_qps=0");
+    TORCH_CHECK(!(pipeline_flags & megamoe_config::COMBINE_SPARSE_SCAN) || combine_reduce_qps == 0,
+                "combine_sparse_scan requires combine_reduce_qps=0");
+    TORCH_CHECK(!(pipeline_flags & (megamoe_config::COMBINE_OWNER_HALF | megamoe_config::COMBINE_SYNC_PROGRESS |
+                                    megamoe_config::COMBINE_READY_TRACE)) ||
+                    combine_reduce_qps != 0,
+                "owner_half, sync_progress and ready_trace require combine_reduce_qps=4 or 8");
+    TORCH_CHECK(!(pipeline_flags & megamoe_config::COMBINE_ASYNC) || combine_reduce_qps == 0,
+                "combine_async requires combine_reduce_qps=0");
+    TORCH_CHECK(
+        !(pipeline_flags & megamoe_config::COMBINE_SYNC_PROGRESS) || p.aiv <= MegaMoeImpl::HIERARCHICAL_MAX_AIV_WORKERS,
+        "Too many AIV workers for Combine producer rendezvous");
     t.pipelineFlags = static_cast<uint32_t>(pipeline_flags);
     t.dispatchWorkers = static_cast<uint32_t>(dispatch_workers);
     TORCH_CHECK(
@@ -295,6 +304,8 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     TORCH_CHECK(!hierarchical || p.ub > MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES,
                 "Not enough UB for MegaMoE RoCE scratch");
     const uint32_t stage_ub = hierarchical ? p.ub - MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES : p.ub;
+    TORCH_CHECK(!(pipeline_flags & megamoe_config::COMBINE_ASYNC) || stage_ub >= 240U * 1024U + 32U,
+                "combine_async requires at least 240 KiB + 32 B of stage UB");
     TORCH_CHECK(combine_reduce_qps == 0 || stage_ub >= t.h * 10U + AlignUp(t.topK * 4U, 32U),
                 "Not enough UB for FP32 gateway reduction");
     t.roceScratchUbOffset = hierarchical ? stage_ub : 0U;

@@ -25,7 +25,6 @@ int64_t GetSystemCycle()
 
 struct TilingData {
     bool hierarchicalRoce = true;
-    uint32_t pipelineFlags = 0U;
 };
 bool UseHierarchicalRoce(const TilingData* tiling)
 {
@@ -59,6 +58,7 @@ struct Fixture {
     } gmmExecutionConfig_;
     struct {
         uint32_t moeExpertPerRank = 0;
+        uint32_t tokenNum = 32U;
     } commonConfig_;
     TilingData tiling;
     struct {
@@ -76,6 +76,13 @@ struct Fixture {
             finalWave = wave;
         }
     } timer_;
+    struct {
+        bool asyncInFlight = false;
+    } waveCombineScratch_;
+    template <typename Params, typename Scratch, typename Timer>
+    void RetireAsyncCombineRow(Params&, Scratch&, Timer&)
+    {
+    }
     uint32_t sharedExpertNum_ = 0;
     uint32_t mGroupsPerWave_ = 2;
 
@@ -84,6 +91,7 @@ struct Fixture {
     std::set<std::pair<uint32_t, uint32_t>> readyTiles;
     std::set<std::pair<uint32_t, uint32_t>> consumedTiles;
     uint32_t combineSlices = 0;
+    bool asyncCombine = false;
     std::set<uint32_t> readyCombines;
     std::set<uint32_t> consumedCombines;
     bool sharedReady = false;
@@ -168,6 +176,13 @@ struct Fixture {
         if (readyCombines.count(cursor.sliceIndex) == 0) {
             return false;
         }
+        if (asyncCombine && !waveCombineScratch_.asyncInFlight) {
+            waveCombineScratch_.asyncInFlight = true;
+            events.push_back("I" + std::to_string(cursor.sliceIndex));
+            ReadyAllActivationTiles();
+            return false;
+        }
+        waveCombineScratch_.asyncInFlight = false;
         assert(consumedCombines.insert(cursor.sliceIndex).second);
         events.push_back("C" + std::to_string(cursor.sliceIndex));
         if (afterCombine) {
@@ -255,6 +270,19 @@ void CombineReleasesMultipleTilesAndSlices()
     f.Expect({"C0", "R:init", "A0:1", "A0:3", "A0:5", "A1:0", "A1:2", "C1", "R:scan"});
     assert(f.remoteForeground == std::vector<bool>({true, false}));
     assert(f.clock == 0);
+}
+
+void AsyncSubmitYieldsToActivationBeforeRetire()
+{
+    Fixture f;
+    f.aivJob_.jobIndex = 3U;  // q=0 nonowner performs local Combine.
+    f.asyncCombine = true;
+    f.activationPlans = {{0, 1}};
+    f.combineSlices = 1;
+    f.ReadyAllCombines();
+    f.Run(1);
+    f.Expect({"I0", "R:noop", "A0:0", "C0", "R:noop"});
+    assert(f.clock == 0 && !f.waveCombineScratch_.asyncInFlight);
 }
 
 void RemoteProgressRunsAfterEveryCombine()
@@ -370,36 +398,9 @@ void NonOwnersLeaveRemoteProgressToTheOwner()
     }
 }
 
-void GatedCombineWaitsForAllActivationWithoutStoppingOtherWork()
-{
-    for (uint32_t worker : {1U, 3U}) {
-        Fixture f;
-        f.tiling.pipelineFlags = 1U;
-        f.aivJob_.jobIndex = worker;
-        f.activationPlans = {{0, 1}};
-        f.sharedExpertNum_ = 1;
-        f.commonConfig_.moeExpertPerRank = 2;
-        f.combineSlices = 2;
-        f.ReadyAllCombines();
-        f.onClock = [](Fixture& fixture) {
-            // Producers become ready independently of deferred local Combine.
-            if (fixture.clock >= 2) fixture.ReadyAllActivationTiles();
-            if (fixture.clock >= 10) fixture.sharedReady = true;
-        };
-        f.afterCombine = [](Fixture& fixture, uint32_t) {
-            assert(fixture.consumedTiles.size() == 1);
-            assert(fixture.consumedShared == fixture.sharedTiles);
-        };
-        f.Run(1);
-        assert(f.events[0] == "D0:0" && f.events[1] == "D1:0");
-        assert(f.remoteCalls > f.combineSlices);
-        assert(f.remoteForeground.front());
-        assert(!f.remoteForeground.back());
-    }
-}
-
 int main()
 {
+    AsyncSubmitYieldsToActivationBeforeRetire();
     CombineReleasesMultipleTilesAndSlices();
     RemoteProgressRunsAfterEveryCombine();
     SharedActivationReleasedByCombineFollowsRemoteProgress();
@@ -408,5 +409,4 @@ int main()
     FallbackRemoteProgressCanReleaseActivation();
     BackoffCanReleaseActivationAndCombine();
     NonOwnersLeaveRemoteProgressToTheOwner();
-    GatedCombineWaitsForAllActivationWithoutStoppingOtherWork();
 }

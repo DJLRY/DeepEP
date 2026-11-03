@@ -225,6 +225,20 @@ def trace_events(
                 f"COMBINE_{task['decision']}_rows{task['run_start']}+{task['run_rows']}_{task['stop_reason']}"
             )
             wave_metadata["display_index_semantics"] = "per_core_combine_run"
+        if granularity == "combine_async":
+            # A DMA row can remain in flight while this AIV executes activation.
+            # Keep row lifetime on its own track, not nested as AIV compute work.
+            lane += "/COMBINE_ASYNC"
+            category = "combine_row_lifetime"
+            display_name = f"COMBINE_ASYNC_expert{task['expert_id']}_row{task['row_start']}"
+        if granularity == "combine_ready":
+            lane += "/COMBINE_READY"
+            category = "combine_ready_snapshot"
+            display_name = f"COMBINE_READY_qp{task['qp_index']}_token{task['token_index']}"
+        if granularity == "combine_sync":
+            lane += "/COMBINE_SYNC"
+            category = "combine_sync_marker"
+            display_name = f"COMBINE_SYNC_qp{task['qp_index']}_{task['sync_phase']}"
         if family in COMBINE_PROGRESS_FIXED_NAMES or granularity in ("combine_progress", "combine_drain"):
             lane += "/COMBINE_PROGRESS"
             category = "combine_wait" if "WAIT" in family else "combine_progress"
@@ -349,6 +363,10 @@ def write_combine_progress_breakdown(raw_by_rank, path: Path):
         "AIV_COMBINE_PROGRESS": "progress",
         "AIV_COMBINE_DRAIN": "drain",
         "AIV_COMBINE_RUN": "run",
+        "AIV_COMBINE_REDUCE": "reduce",
+        "AIV_COMBINE_ASYNC": "async_row_lifetime",
+        "AIV_COMBINE_READY": "ready_snapshot",
+        "AIV_COMBINE_SYNC": "sync_marker",
     }
     fields = [
         "rank",
@@ -373,6 +391,13 @@ def write_combine_progress_breakdown(raw_by_rank, path: Path):
         "stop_reason",
         "next_pending",
         "already_deferred",
+        "qp_index",
+        "token_index",
+        "pending_topk_mask",
+        "observed_ready_mask",
+        "token_ready",
+        "sync_phase",
+        "pending_rows",
     ]
     with path.open("w", newline="", encoding="utf-8") as stream:
         writer = csv.DictWriter(stream, fieldnames=fields)
@@ -385,6 +410,17 @@ def write_combine_progress_breakdown(raw_by_rank, path: Path):
                     continue
                 task = event.get("task", {})
                 metrics = {}
+                for key in (
+                    "qp_index",
+                    "token_index",
+                    "pending_topk_mask",
+                    "observed_ready_mask",
+                    "token_ready",
+                    "sync_phase",
+                    "pending_rows",
+                ):
+                    if key in task:
+                        metrics[key] = task[key]
                 if family in ("AIV_COMBINE_PROGRESS", "AIV_COMBINE_DRAIN"):
                     metrics.update({key: task.get(key, "") for key in ("pending_before", "pending_after")})
                 if family == "AIV_COMBINE_PROGRESS":
@@ -417,7 +453,9 @@ def write_combine_progress_breakdown(raw_by_rank, path: Path):
                         wave_id=event.get("wave_id", ""),
                         event_family=family,
                         phase=phases[family],
-                        scope="envelope" if family in ("AIV_COMBINE_PROGRESS", "AIV_COMBINE_DRAIN") else "phase",
+                        scope=task.get(
+                            "scope", "envelope" if family in ("AIV_COMBINE_PROGRESS", "AIV_COMBINE_DRAIN") else "phase"
+                        ),
                         start_us=f"{(event['start_cycle'] - base) / CYCLE_TO_US:.6f}",
                         elapsed_us=f"{(event['end_cycle'] - event['start_cycle']) / CYCLE_TO_US:.6f}",
                         **metrics,

@@ -58,7 +58,17 @@ def combine_owner_binary(tmp_path_factory):
     source.write_text(combine_owner_source(), encoding="utf-8")
     binary = directory / "combine_owner"
     result = subprocess.run(
-        [compiler, "-std=c++17", "-Wall", "-Wextra", "-Werror", str(source), "-o", str(binary)],
+        [
+            compiler,
+            "-std=c++17",
+            "-Wall",
+            "-Wextra",
+            "-Werror",
+            f"-I{DIRECTORY.parents[2] / 'csrc'}",
+            str(source),
+            "-o",
+            str(binary),
+        ],
         capture_output=True,
         text=True,
         timeout=60,
@@ -67,7 +77,7 @@ def combine_owner_binary(tmp_path_factory):
     return binary
 
 
-@pytest.mark.parametrize("scenario", ["coverage", "readiness", "scheduler", "dispatch"])
+@pytest.mark.parametrize("scenario", ["coverage", "weighted", "readiness", "scheduler", "dispatch"])
 def test_combine_owner_contract(combine_owner_binary, scenario):
     result = subprocess.run([str(combine_owner_binary), scenario], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr

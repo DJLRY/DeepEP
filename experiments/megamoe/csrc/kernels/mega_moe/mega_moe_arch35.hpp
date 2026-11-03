@@ -37,6 +37,7 @@
 #include "stage/mega_moe_gmm2_combine.hpp"
 #include "stage/mega_moe_hierarchical_combine.hpp"
 #include "stage/mega_moe_hierarchical_reduce.hpp"
+#include "stage/mega_moe_hierarchical_combine_sync.hpp"
 #include "stage/mega_moe_unpermute.hpp"
 #include "mc2_common/quantize_functions.hpp"
 
@@ -1026,8 +1027,25 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         timer_.Start(AscendTimer::AIV_EXPORT_SYNC);
         ExportCompactExpertTokenCounts(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
         TryProgressRemoteCombine(false);
+        const bool reduceOwner = UseHierarchicalCombineReduction(params_.tilingData) &&
+                                 IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex);
+        if (reduceOwner) {
+            TraceHierarchicalCombineBoundary(commonConfig_, params_, hierarchicalCombine_,
+                                             HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex),
+                                             timer_.Enabled() ? &timer_ : nullptr, 1U);
+        }
         PipeBarrier<PIPE_ALL>();
-        SyncAll<true>();
+        if (UseHierarchicalCombineReduction(params_.tilingData) && (params_.tilingData->pipelineFlags & 32U) != 0U) {
+            JoinHierarchicalCombineProducers(aivJob_, commonConfig_, params_, hierarchicalCombine_,
+                                             timer_.Enabled() ? &timer_ : nullptr, 0U);
+        } else {
+            SyncAll<true>();
+        }
+        if (reduceOwner) {
+            TraceHierarchicalCombineBoundary(commonConfig_, params_, hierarchicalCombine_,
+                                             HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex),
+                                             timer_.Enabled() ? &timer_ : nullptr, 2U);
+        }
         timer_.End(AscendTimer::AIV_EXPORT_SYNC);
     }
     if (sharedExpertNum_ > 0U && !ENABLE_A8W4) {
@@ -1047,7 +1065,23 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
             {
                 AscendTimerFixedScope barrier(timer_.Enabled() ? &timer_ : nullptr,
                                               AscendTimer::AIV_HOST_COMBINE_BARRIER_WAIT);
-                CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
+                const bool reduction = UseHierarchicalCombineReduction(params_.tilingData);
+                const bool owner = reduction && IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex);
+                const uint32_t lane = HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex);
+                if (owner) {
+                    TraceHierarchicalCombineBoundary(commonConfig_, params_, hierarchicalCombine_, lane,
+                                                     timer_.Enabled() ? &timer_ : nullptr, 3U);
+                }
+                if (reduction && (params_.tilingData->pipelineFlags & 32U) != 0U) {
+                    CrossRankSyncInHierarchicalHostWithProgress(aivJob_, commonConfig_, params_, hierarchicalCombine_,
+                                                                timer_.Enabled() ? &timer_ : nullptr);
+                } else {
+                    CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
+                }
+                if (owner) {
+                    TraceHierarchicalCombineBoundary(commonConfig_, params_, hierarchicalCombine_, lane,
+                                                     timer_.Enabled() ? &timer_ : nullptr, 4U);
+                }
             }
             if (IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)) {
                 auto* scratch = HierarchicalRoceScratch(params_);

@@ -17,6 +17,7 @@ find_library(TORCH_NPU_LIBRARY torch_npu PATHS "${torch_npu_root}/lib" NO_DEFAUL
 find_library(TORCH_PYTHON_LIBRARY torch_python PATHS "${TORCH_INSTALL_PREFIX}/lib" NO_DEFAULT_PATH REQUIRED)
 
 set(beta_include
+    "${PROJECT_SOURCE_DIR}/csrc"
     "${CMAKE_CURRENT_SOURCE_DIR}/csrc"
     "${CMAKE_CURRENT_SOURCE_DIR}/csrc/kernels/mega_moe"
     "${CATLASS_ROOT}/include" "${CATLASS_ROOT}/examples/common"
@@ -63,6 +64,7 @@ add_custom_command(OUTPUT "${kernel_library}"
         -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -ldl -lstdc++ -lm
         -o "${kernel_library}"
     DEPENDS csrc/kernels/mega_moe/mega_moe.cpp csrc/kernel_launch.hpp ${kernel_headers}
+        "${PROJECT_SOURCE_DIR}/csrc/common/megamoe_pipeline_schedule.hpp"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
 add_custom_target(megamoe_device DEPENDS "${kernel_library}")
 pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp)

@@ -217,6 +217,8 @@ struct MegaMoeTilingData {
     uint32_t combineReduceQps;
     // Independent runtime experiments; zero preserves the existing scheduler.
     uint32_t dispatchWorkers;  // 0: all AIV1 workers; otherwise a rotating subset per expert.
-    uint32_t pipelineFlags;    // bit 0: gate local Combine on activation; bit 1: lane-only reduce init.
+    // Bits: 1 lane init, 2 sparse scan, 3 owner half share, 4 async rows,
+    // 5 progress during producer synchronization, 6 ready/boundary diagnostics.
+    uint32_t pipelineFlags;
 };
 #endif

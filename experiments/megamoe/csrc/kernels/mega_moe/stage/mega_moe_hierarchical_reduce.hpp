@@ -125,6 +125,11 @@ __aicore__ inline bool TryProgressHierarchicalReducedCombine(const MoeStageCommo
     if (progress.sentRows == progress.expectedRows) {
         return false;
     }
+    const bool diagnostic = timer != nullptr && timer->Enabled() && (params.tilingData->pipelineFlags & 64U) != 0U;
+    AscendTimerCombineProgressScope timing(diagnostic ? timer : nullptr, AscendTimer::AIV_COMBINE_PROGRESS);
+    const uint32_t pendingBefore = progress.expectedRows - progress.sentRows;
+    uint32_t scannedRows = 0U;
+    timing.StartScan();
     const uint32_t owners = params.tilingData->combineReduceQps;
     const uint32_t first = common.tokenNum * lane / owners;
     const uint32_t end = common.tokenNum * (lane + 1U) / owners;
@@ -134,14 +139,27 @@ __aicore__ inline bool TryProgressHierarchicalReducedCombine(const MoeStageCommo
     for (uint32_t checked = 0U; checked < end - first && posts < maxPosts; ++checked) {
         const uint32_t mask = progress.pendingTopkMasks[token];
         bool ready = mask != 0U;
-        for (uint32_t topk = 0U; ready && topk < common.topK; ++topk) {
+        uint32_t observed = 0U;
+        const int64_t scanStart = diagnostic ? GetSystemCycle() : 0;
+        for (uint32_t topk = 0U; (ready || diagnostic) && topk < common.topK; ++topk) {
             if ((mask & (uint32_t{1} << topk)) != 0U) {
                 const uint32_t row = token * common.topK + topk;
-                ready = snapshot.Ready(params, row, common.tokenNum * common.topK - row, common.topK);
+                const bool rowReady = snapshot.Ready(params, row, common.tokenNum * common.topK - row, common.topK);
+                ready = ready && rowReady;
+                observed |= rowReady ? uint32_t{1} << topk : 0U;
+                ++scannedRows;
             }
         }
+        if (diagnostic && mask != 0U && observed != progress.deferredTopkMasks[token]) {
+            timer->RecordDetail(AscendTimer::AIV_COMBINE_READY, scanStart, GetSystemCycle(),
+                                (static_cast<uint64_t>(lane + 1U) << 32) | token,
+                                (static_cast<uint64_t>(mask) << 32) | observed);
+            progress.deferredTopkMasks[token] = observed;
+        }
         if (ready) {
+            timing.StopScan();
             ReduceAndPostHierarchicalToken(common, params, token, mask, lane, roceScratch, timer);
+            timing.StartScan();
             progress.pendingTopkMasks[token] = 0U;
             progress.sentRows += CombineMaskCount(mask);
             ++posts;
@@ -154,7 +172,45 @@ __aicore__ inline bool TryProgressHierarchicalReducedCombine(const MoeStageCommo
         }
     }
     progress.nextRow = token * common.topK;
+    timing.Finish(pendingBefore, progress.expectedRows - progress.sentRows, posts, scannedRows);
     return posts != 0U;
+}
+
+// Explicit snapshots at synchronization edges include zero-ready tokens. A
+// snapshot is an observation at poll time, not the exact producer-ready time.
+// Phase: 1=before export sync, 2=after export sync, 3=before host barrier,
+// 4=after host barrier. Progress envelopes show the last poll before each edge.
+__aicore__ inline void TraceHierarchicalCombineBoundary(const MoeStageCommonConfig& common, const Params& params,
+                                                        HierarchicalCombineProgress& progress, uint32_t lane,
+                                                        AscendTimerDevice* timer, uint32_t phase)
+{
+    if (timer == nullptr || !timer->Enabled() || (params.tilingData->pipelineFlags & 64U) == 0U) {
+        return;
+    }
+    InitializeHierarchicalReducedCombine(common, params, progress, lane, timer);
+    const uint32_t owners = params.tilingData->combineReduceQps;
+    const uint32_t first = common.tokenNum * lane / owners;
+    const uint32_t end = common.tokenNum * (lane + 1U) / owners;
+    HierarchicalCombineReadySnapshot snapshot;
+    for (uint32_t token = first; token < end; ++token) {
+        const int64_t start = GetSystemCycle();
+        const uint32_t mask = progress.pendingTopkMasks[token];
+        uint32_t observed = 0U;
+        for (uint32_t topk = 0U; topk < common.topK; ++topk) {
+            const uint32_t row = token * common.topK + topk;
+            if ((mask & (uint32_t{1} << topk)) != 0U &&
+                snapshot.Ready(params, row, common.tokenNum * common.topK - row, common.topK)) {
+                observed |= uint32_t{1} << topk;
+            }
+        }
+        timer->RecordDetail(AscendTimer::AIV_COMBINE_READY, start, GetSystemCycle(),
+                            (static_cast<uint64_t>(lane + 1U) << 32) | token,
+                            (static_cast<uint64_t>(mask) << 32) | observed);
+        progress.deferredTopkMasks[token] = observed;
+    }
+    const int64_t start = GetSystemCycle();
+    timer->RecordDetail(AscendTimer::AIV_COMBINE_SYNC, start, GetSystemCycle(),
+                        (static_cast<uint64_t>(lane + 1U) << 32) | phase, progress.expectedRows - progress.sentRows);
 }
 
 // Only the post-producer host barrier permits blocking drain. Each owner posts

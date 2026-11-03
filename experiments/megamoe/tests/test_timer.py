@@ -140,6 +140,9 @@ def test_startup_details_and_combine_decisions_round_trip(raw_file, tmp_path):
             ("AIV_RELAY_STEP", [((0 << 32) | 31, (168 << 32) | 12), ((5 << 32) | 31, (168 << 32) | 12)]),
             ("AIV_COMBINE_RUN", [((7 << 32) | 1, 0x302), ((7 << 32) | 16, 0x401)]),
             ("AIV_COMBINE_REDUCE", [((4 << 32) | 31, (0x85 << 32) | 3584)]),
+            ("AIV_COMBINE_ASYNC", [((4 << 32) | 17, 1)]),
+            ("AIV_COMBINE_READY", [((4 << 32) | 31, (0x85 << 32) | 0x81), ((4 << 32) | 31, (0x85 << 32) | 0x85)]),
+            ("AIV_COMBINE_SYNC", [((4 << 32) | 1, 3), ((4 << 32) | 4, 0)]),
         ):
             type_id = p.DYNAMIC_NAMES.index(family)
             put(p.N_TIMING_COUNTER + core * p.DYNAMIC_ITER_PER_CORE + type_id, len(records))
@@ -166,6 +169,16 @@ def test_startup_details_and_combine_decisions_round_trip(raw_file, tmp_path):
     assert runs[1]["run_rows"] == 16 and runs[1]["already_deferred"]
     reduced = next(e["args"] for e in visible if e["args"].get("granularity") == "combine_reduce")
     assert (reduced["qp_index"], reduced["token_index"], reduced["expert_rows"], reduced["hidden"]) == (4, 31, 3, 3584)
+    async_row = next(e["args"] for e in visible if e["args"].get("granularity") == "combine_async")
+    assert (async_row["expert_id"], async_row["row_start"], async_row["scope"]) == (3, 17, "row_lifetime")
+    assert next(e["tid"] for e in visible if e["args"].get("granularity") == "combine_async").endswith("/COMBINE_ASYNC")
+    readiness = [e["args"] for e in visible if e["args"].get("granularity") == "combine_ready"]
+    assert [e["token_ready"] for e in readiness] == [False, True]
+    sync = [e["args"] for e in visible if e["args"].get("granularity") == "combine_sync"]
+    assert [(e["sync_phase"], e["pending_rows"]) for e in sync] == [
+        ("before_export_sync", 3),
+        ("after_host_barrier", 0),
+    ]
     hidden = trace_events(raw, "keep", first_start_cycle(raw), include_wait=False)
     assert not any(e["args"].get("relay_step") == "packet_wait" for e in hidden)
     assert any(e["args"].get("relay_step") == "count_publish" for e in hidden)

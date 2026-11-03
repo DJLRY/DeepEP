@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstring>
 #include <vector>
+#include "common/megamoe_pipeline_schedule.hpp"
 
 constexpr int AIC = 0, AIV = 1, g_coreType = AIV;
 uint32_t GetSubBlockIdx()
@@ -46,11 +47,13 @@ struct WorkRange {
 };
 struct MoeStageCommonConfig {
     uint32_t tokenHiddenDim = 3584U, moeExpertPerRank = 0U;
+    uint32_t tokenNum = 32U;
 };
 struct TilingData {
     bool hierarchical = true;
     bool reduction = false;
     uint32_t pipelineFlags = 0U;
+    uint32_t combineReduceQps = 8U;
 };
 bool UseHierarchicalCombineReduction(const TilingData* tiling)
 {
@@ -122,13 +125,16 @@ uint32_t GetTokenCombineProducerCount(const MoeStageCommonConfig& common, const 
 }
 template <bool InputReadyChecked>
 void RunTokenCombineSlice(const MoeStageCommonConfig&, const AivJobContext& job, Params& params,
-                          const ExpertLoopState& state, uint32_t rowStart, uint32_t rowCount, Timer&, int&)
+                          const ExpertLoopState& state, uint32_t rowStart, uint32_t rowCount, Timer&, int&,
+                          const WorkRange* assigned = nullptr)
 {
     static_assert(InputReadyChecked);
     assert(*GetTokenCombineReadyCounter(params, state.expertIdx, rowStart) >=
            static_cast<int32_t>(params.expectedProducers));
     assert(state.globalTokenStartIndex + rowStart == params.expectedPrefix);
-    WorkRange range = GetWaveCombineOwnedRange(job, rowCount, state.globalTokenStartIndex + rowStart);
+    WorkRange range = assigned != nullptr
+                          ? *assigned
+                          : GetWaveCombineOwnedRange(job, rowCount, state.globalTokenStartIndex + rowStart);
     assert(range.count != 0U && range.start + range.count <= rowCount);
     assert(params.writes && params.writes->size() == rowCount);
     for (uint32_t row = range.start; row < range.start + range.count; ++row) {
@@ -136,6 +142,23 @@ void RunTokenCombineSlice(const MoeStageCommonConfig&, const AivJobContext& job,
     }
     ++params.sendCalls;
     params.lastConsumer = job;
+}
+
+struct Scratch {
+    bool asyncInFlight = false;
+    int64_t asyncWave = -1;
+    int dummy = 0;
+    operator int&()
+    {
+        return dummy;
+    }
+};
+void RetireAsyncCombineRow(Params&, Scratch&, Timer&) {}
+bool ProgressAsyncCombineSlice(const MoeStageCommonConfig&, Params&, const ExpertLoopState&, uint32_t, WorkRange,
+                               Timer&, Scratch&)
+{
+    assert(false);  // Dedicated async fixture exercises the real DMA/event code.
+    return false;
 }
 
 // Keep this member in a dependent base, as in the production kernel. Declaring
@@ -169,7 +192,7 @@ struct FixtureImpl : FixtureBase<Tag> {
     } gmmExecutionConfig_;
     MoeStageCommonConfig commonConfig_{};
     Timer timer_{};
-    int waveCombineScratch_ = 0;
+    Scratch waveCombineScratch_;
     uint32_t sharedExpertNum_ = 0U, mGroupsPerWave_ = 1U;
     std::vector<AivTaskCursor> slices;
     bool activationReady = false, activationDone = false;
@@ -357,6 +380,42 @@ void Readiness()
     assert(AscendC::reads == 0U && empty.params_.sendCalls == 0U);
 }
 
+void WeightedCoverage()
+{
+    constexpr uint32_t workers = 28U;
+    for (uint32_t owners : {4U, 8U}) {
+        const uint32_t units = workers * 2U - owners;
+        for (uint32_t rows : {0U, 1U, 7U, 21U, 22U, 28U, 32U, 255U, 256U, 1024U}) {
+            std::array<uint64_t, workers> total{};
+            for (uint32_t shift = 0U; shift < units; ++shift) {
+                std::vector<uint32_t> writes(rows, 0U);
+                for (uint32_t worker = 0U; worker < workers; ++worker) {
+                    Fixture f(worker, workers, true, true);
+                    f.tiling.pipelineFlags = 8U;
+                    f.tiling.combineReduceQps = owners;
+                    const auto cursor = Fixture::Slice(rows, 256U, shift, 3U, 256U);
+                    f.params_.writes = &writes;
+                    f.params_.expectedPrefix = 256U;
+                    f.params_.expectedProducers = f.Producers(cursor);
+                    // A weighted consumer with rows must not bypass GMM2 readiness.
+                    const auto assigned =
+                        deepep::megamoe_config::HalfOwnerCombineRange(rows, worker, workers, owners, 256U, shift);
+                    if (assigned.count != 0U) assert(!f.TryRunReadyCombine(cursor));
+                    f.Ready(cursor) = f.Producers(cursor);
+                    assert(f.TryRunReadyCombine(cursor));
+                    total[worker] += assigned.count;
+                    assert(f.waveCombineJob_.jobIndex == worker && f.waveCombineJob_.totalJobs == workers);
+                    assert(f.aivJob_.jobIndex == worker * 2U + 1U);
+                }
+                for (uint32_t count : writes) assert(count == 1U);
+            }
+            for (uint32_t worker = 0U; worker < workers; ++worker) {
+                assert(total[worker] == static_cast<uint64_t>(rows) * (worker < owners ? 1U : 2U));
+            }
+        }
+    }
+}
+
 void Scheduler()
 {
     Fixture f;
@@ -418,6 +477,8 @@ int main(int argc, char** argv)
     const char* scenario = argv[1];
     if (std::strcmp(scenario, "coverage") == 0) {
         Coverage();
+    } else if (std::strcmp(scenario, "weighted") == 0) {
+        WeightedCoverage();
     } else if (std::strcmp(scenario, "readiness") == 0) {
         Readiness();
     } else if (std::strcmp(scenario, "dispatch") == 0) {
