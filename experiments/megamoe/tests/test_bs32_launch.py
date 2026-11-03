@@ -406,6 +406,9 @@ def test_sampling_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, 
                 (report_dir / "profiling.json").write_text(
                     json.dumps(dict(rounds=50, recorded_rounds=100, mean_us=12.5, rank_max_mean_us=25.0))
                 )
+        elif str(launcher.ROOT / "experiments/megamoe/scripts/trace_text.py") in command:
+            assert command[-3:] == ["--max-bytes", "65535", "--print-parts"]
+            assert command[command.index("export") + 1] == str(outputs[-1])
         else:
             assert "deep_ep_experimental.megamoe.timer" in command
             assert command[command.index("--ranks") + 1] == str(node * 16)
@@ -415,7 +418,7 @@ def test_sampling_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, 
     for _ in range(2):
         launcher.main([action, "--config", str(path), "--perf-method", method])
     assert json.loads((outputs[-1] / "run.json").read_text())["perf_method"] == method
-    assert len(calls) == (4 if action == "trace" else 2)
+    assert len(calls) == (6 if action == "trace" else 2)
     assert outputs[0] != outputs[1]
     summary = (outputs[-1] / "summary.txt").read_text()
     if action == "perf":
@@ -442,7 +445,8 @@ def test_trace_wait_option_reaches_parser_and_run_manifest(saved, monkeypatch, f
     calls = []
     monkeypatch.setattr(launcher, "execute", lambda command, *args, **kwargs: calls.append(command))
     launcher.main(["trace", "--config", str(path), *([flag] if flag else [])])
-    assert len(calls) == 2
+    assert len(calls) == 3
+    assert calls[2][-3:] == ["--max-bytes", "65535", "--print-parts"]
     assert ("--include-wait" in calls[1]) is include
     run_dir = Path(calls[0][calls[0].index("--output-dir") + 1])
     assert json.loads((run_dir / "run.json").read_text())["include_wait"] is include

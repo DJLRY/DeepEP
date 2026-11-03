@@ -452,6 +452,23 @@ def trace_summary(run_dir, case, local_timer_ranks):
     print(summary, end="", flush=True)
 
 
+def print_trace_parts(source, config, *, pipeline=False, env=None):
+    execute(
+        [
+            config["python"],
+            "-I",
+            str(ROOT / "experiments/megamoe/scripts/trace_text.py"),
+            "export-pipeline" if pipeline else "export",
+            str(source),
+            "--max-bytes",
+            "65535",
+            "--print-parts",
+        ],
+        environment(config) if env is None else env,
+        Path(source) / "trace_text.log",
+    )
+
+
 def dispatch(
     action,
     config,
@@ -472,6 +489,7 @@ def dispatch(
     reduce_double_buffer=False,
     combine_single_row=False,
     combine_ready_trace=False,
+    print_text=True,
 ):
     if extra_bs and action != "perf":
         raise ValueError("--extra-bs requires perf")
@@ -631,11 +649,13 @@ def dispatch(
         )
     if action == "trace":
         trace_summary(run_dir, case, local_ranks)
+        if print_text and local_ranks:
+            print_trace_parts(run_dir, config, env=env)
     print(f"[DONE] {action}: {run_dir}", flush=True)
     return run_dir
 
 
-def main(argv=None):
+def main(argv=None, *, print_text=True):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "action",
@@ -812,6 +832,7 @@ def main(argv=None):
             options["perf_method"] = args.perf_method
     if args.action == "trace":
         options["include_wait"] = bool(args.include_wait)
+        options["print_text"] = print_text
     return dispatch(args.action, config, **options)
 
 

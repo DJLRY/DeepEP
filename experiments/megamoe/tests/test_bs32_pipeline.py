@@ -42,7 +42,12 @@ def fake_launcher(monkeypatch, tmp_path, launch):
     monkeypatch.setattr(
         MODULE["main"].__globals__["runpy"],
         "run_path",
-        lambda _: {"main": launch, "DEFAULT_CONFIG": config, "validate": lambda _: None},
+        lambda _: {
+            "main": lambda args, **kwargs: launch(args),
+            "DEFAULT_CONFIG": config,
+            "validate": lambda _: None,
+            "print_trace_parts": lambda *args, **kwargs: None,
+        },
     )
 
 
@@ -161,3 +166,28 @@ def test_retired_flags_cannot_be_relabelled_as_current_baseline(tmp_path, retire
     assert MODULE["read_result"](path)["case"] == "custom"
     with pytest.raises(ValueError, match="does not match"):
         MODULE["read_result"](path, "q0_scan")
+
+
+def test_trace_prints_one_collection_after_all_cases(monkeypatch, tmp_path):
+    calls = []
+    config = tmp_path / "host.json"
+    config.write_text(json.dumps(dict(case_dir=str(tmp_path / "results"), node_rank=0)))
+
+    def launch(args, *, print_text=True):
+        assert print_text is False
+        name = MODULE["INDEPENDENT_CASES"][len(calls)]
+        calls.append(name)
+        return write_result(tmp_path / name, MODULE["expected_settings"](name, "trace"), action="trace")
+
+    def show(directory, config, *, pipeline):
+        assert pipeline and calls == list(MODULE["INDEPENDENT_CASES"])
+        assert all(row["status"] == "OK" for row in json.loads((directory / "summary.json").read_text()))
+        calls.append("printed")
+
+    monkeypatch.setattr(
+        MODULE["main"].__globals__["runpy"],
+        "run_path",
+        lambda _: dict(main=launch, DEFAULT_CONFIG=config, validate=lambda _: None, print_trace_parts=show),
+    )
+    MODULE["main"](["trace"])
+    assert calls[-1] == "printed"

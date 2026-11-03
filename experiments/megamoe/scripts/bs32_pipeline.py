@@ -229,7 +229,7 @@ def main(argv=None):
             print(shlex.join(["bash", "experiments/megamoe/scripts/run_bs32.sh", *command]), flush=True)
             try:
                 # Use the exact returned directory, never glob for the latest run.
-                result_dir = launcher["main"](command)
+                result_dir = launcher["main"](command, **({"print_text": False} if args.action == "trace" else {}))
                 rows[index]["run_dir"] = str(result_dir)
                 rows[index] = read_result(result_dir, name)
             except BaseException as error:
@@ -238,6 +238,8 @@ def main(argv=None):
             save_summary(directory, rows)
     finally:
         save_summary(directory, rows, display=True)
+    if args.action == "trace":
+        launcher["print_trace_parts"](directory, config, pipeline=True)
     return directory
 
 

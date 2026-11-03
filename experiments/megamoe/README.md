@@ -424,6 +424,16 @@ bash experiments/megamoe/scripts/run_bs32_pipeline.sh trace
 执行前可加`--dry-run`查看命令；支持`--config`、性能/trace的`--warmup`与`--iters`。
 同一构建支持全部开关，不需要逐项重编译；仅在timer OFF性能和timer ON trace之间重建。
 
+`trace`默认自动打印可复制的TXT分段。矩阵脚本等待本机四组完成后，按用例名将全部本地rank的CSV与配置
+一起无损压缩，再统一分段；不会逐组重复打印。两台分别输出自己的集合，每段以`[TEXT PART i/N]`标识，
+复制其后完整的`BEGIN MEGAMOE TRACE TEXT V1`至`END MEGAMOE TRACE TEXT V1`即可，一次复制一段。
+每段正文连同头尾与CRLF换行最多65535字节；采用LZMA加强压缩并按完整块大小填充分段，减少part数。
+实际数量取决于trace大小，不过滤WAIT、空闲核、原始周期或任务metadata。
+分段文件保存在打印出的`[TEXT] output=...`目录，完整终端导出内容也保存为矩阵目录的`trace_text.log`。
+直接运行`run_bs32.sh trace`时，只导出并打印该次采集。恢复集合后，四组分别位于`captures/<用例名>/`。
+这是脚本改动；已有timer ON构建可直接采集，无需为文本导出重编wheel。
+
+
 每轮结束集中打印`BEGIN MEGAMOE PIPELINE SUMMARY`到`END MEGAMOE PIPELINE SUMMARY`，可直接复制回传。
 每行带用例名、状态、节点、参数、QP数、Dispatch核数、开关和两项耗时，后附结果目录。
 `min_us`／`max_us`分别是每轮最短／最慢rank耗时的均值，单位µs，不是两台机器各自的耗时。

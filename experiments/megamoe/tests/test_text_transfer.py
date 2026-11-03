@@ -274,3 +274,91 @@ def test_source_entrypoint_show_and_restore_via_stdin_without_device(capture, tm
 def test_invalid_clipboard_limits_are_rejected(limit):
     with pytest.raises(ValueError, match="1024 and 65535"):
         transfer.make_parts({}, limit)
+
+
+def test_pipeline_auto_print_roundtrip_all_four_cases(capture, tmp_path):
+    import shutil
+
+    pipeline = tmp_path / "pipeline"
+    pipeline.mkdir()
+    rows = []
+    cases = ("q0_scan", "q0_single_row", "q8_dispatch14", "q8_double_buffer")
+    for case in cases:
+        run = tmp_path / case
+        shutil.copytree(capture[0], run)
+        (run / "run.json").write_text(json.dumps(dict(action="trace", case=case)))
+        rows.append(dict(case=case, status="OK", action="trace", node=0, run_dir=str(run)))
+    (pipeline / "summary.json").write_text(json.dumps(rows))
+    exported = tmp_path / "collection"
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-X",
+            "utf8",
+            str(SCRIPT),
+            "export-pipeline",
+            str(pipeline),
+            "--output-dir",
+            str(exported),
+            "--print-parts",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    manifest = json.loads((exported / "manifest.json").read_text())
+    assert manifest["max_bytes"] == 65535
+    assert result.stdout.count(transfer.BEGIN) == len(manifest["parts"])
+    assert all(part["crlf_bytes"] <= 65535 for part in manifest["parts"])
+    restored = tmp_path / "restored-collection"
+    bundle = transfer.restore_text([result.stdout], restored)
+    assert [item["name"] for item in bundle["captures"]] == list(cases)
+    for case in cases:
+        output = restored / "captures" / case
+        assert json.loads((output / "context/run.json").read_text())["case"] == case
+        for rank in (0, 16):
+            filename = f"rank_{rank}_npu_time_parsed.csv"
+            assert (output / "timer" / filename).read_bytes() == (capture[1] / filename).read_bytes()
+        assert (output / "timer/all_rank_trace.json").is_file()
+    separate = sum(len(transfer.make_parts(transfer.collect_bundle(row["run_dir"]), 65535)[2]) for row in rows)
+    assert len(manifest["parts"]) < separate
+
+
+@pytest.mark.parametrize("name", ["../escape", "q0_scan", "bad/name"])
+def test_collection_rejects_bad_or_duplicate_names_before_writing(capture, tmp_path, name):
+    child = transfer.collect_bundle(capture[0])
+    bundle = dict(
+        format=transfer.COLLECTION_FORMAT,
+        cycles_per_us=p.CYCLE_TO_US,
+        ranks=child["ranks"],
+        captures=[dict(name="q0_scan", bundle=child), dict(name=name, bundle=child)],
+    )
+    _, _, parts = transfer.make_parts(bundle)
+    with pytest.raises(ValueError, match="path"):
+        transfer.restore_text(parts, tmp_path / "invalid-collection")
+    assert not (tmp_path / "invalid-collection").exists()
+
+
+def test_export_prints_single_capture_parts(capture, tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-X",
+            "utf8",
+            str(SCRIPT),
+            "export",
+            str(capture[0]),
+            "--output-dir",
+            str(tmp_path / "printed"),
+            "--print-parts",
+            "--max-bytes",
+            "1024",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    status, payload = transfer.parse_parts([result.stdout])
+    assert status["missing"] == [] and payload is not None

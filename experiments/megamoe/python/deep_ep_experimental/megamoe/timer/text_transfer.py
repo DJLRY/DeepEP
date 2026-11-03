@@ -20,6 +20,7 @@ from .parse_timer_csv import core_info
 
 
 FORMAT = "megamoe_trace_text_v1"
+COLLECTION_FORMAT = "megamoe_trace_collection_v1"
 BEGIN = "-----BEGIN MEGAMOE TRACE TEXT V1-----"
 END = "-----END MEGAMOE TRACE TEXT V1-----"
 DEFAULT_MAX_BYTES = 60000
@@ -194,13 +195,21 @@ def make_parts(bundle, max_bytes=DEFAULT_MAX_BYTES):
     raw = json_bytes(bundle)
     if len(raw) > MAX_BUNDLE_BYTES:
         raise ValueError("Unpacked transfer exceeds 512 MiB; export fewer ranks per bundle")
-    compressed = lzma.compress(raw)
+    compressed = lzma.compress(raw, preset=6 | lzma.PRESET_EXTREME)
     if len(compressed) > MAX_BUNDLE_BYTES:
         raise ValueError("Compressed transfer exceeds 512 MiB; export fewer ranks per bundle")
     bundle_hash = digest(compressed)
-    # Reserve more than the complete fixed envelope, including six-digit part
-    # numbers. Count the 2-byte CRLF, not just Base64 characters.
-    chunk_bytes = ((max_bytes - 512) // (LINE_WIDTH + 2)) * (LINE_WIDTH // 4 * 3)
+    # Find the largest raw chunk whose complete envelope fits, even with CRLF.
+    # Fixed-width part numbers make this bound independent of the part count.
+    low, high = 1, max_bytes
+    while low < high:
+        middle = (low + high + 1) // 2
+        trial = render_part(bundle_hash, len(compressed), 999999, 999999, bytes(middle))
+        if text_sizes(trial)[1] <= max_bytes:
+            low = middle
+        else:
+            high = middle - 1
+    chunk_bytes = low
     total = (len(compressed) + chunk_bytes - 1) // chunk_bytes
     if total > 999999:
         raise ValueError("Too many transfer parts")
@@ -215,8 +224,43 @@ def make_parts(bundle, max_bytes=DEFAULT_MAX_BYTES):
 
 def export_text(source, output=None, *, ranks=None, attachments=(), label=None, max_bytes=DEFAULT_MAX_BYTES):
     bundle = collect_bundle(source, ranks, attachments, label)
+    return export_bundle(bundle, output, find_timer_directory(source), max_bytes)
+
+
+def collect_pipeline(source):
+    rows = json.loads((Path(source) / "summary.json").read_text(encoding="utf-8"))
+    if not rows or any(row["status"] != "OK" or row["action"] != "trace" for row in rows):
+        raise ValueError("Pipeline export requires completed trace cases")
+    if len({row["node"] for row in rows}) != 1:
+        raise ValueError("Pipeline export must contain one host")
+    captures = []
+    for row in rows:
+        captures.append(dict(name=row["case"], bundle=collect_bundle(row["run_dir"], label=row["case"])))
+    bundle = dict(
+        format=COLLECTION_FORMAT,
+        label=f"pipeline-node{rows[0]['node']}",
+        ranks=sorted({rank for capture in captures for rank in capture["bundle"]["ranks"]}),
+        cycles_per_us=protocol.CYCLE_TO_US,
+        notes=NOTES,
+        captures=captures,
+    )
+    validate_bundle(bundle)
+    return bundle
+
+
+def bundle_files(bundle):
+    if bundle["format"] == FORMAT:
+        return bundle["files"]
+    return [
+        dict(record, name=f"captures/{capture['name']}/{record['name']}")
+        for capture in bundle["captures"]
+        for record in capture["bundle"]["files"]
+    ]
+
+
+def export_bundle(bundle, output, parent, max_bytes):
     bundle_hash, compressed_bytes, parts = make_parts(bundle, max_bytes)
-    output = Path(output) if output is not None else find_timer_directory(source) / "text-transfer" / bundle_hash[:16]
+    output = Path(output) if output is not None else Path(parent) / "text-transfer" / bundle_hash[:16]
     index = dict(
         format=FORMAT,
         label=bundle["label"],
@@ -224,7 +268,7 @@ def export_text(source, output=None, *, ranks=None, attachments=(), label=None, 
         bundle_sha256=bundle_hash,
         bundle_bytes=compressed_bytes,
         max_bytes=max_bytes,
-        files=[{key: value for key, value in record.items() if key != "text"} for record in bundle["files"]],
+        files=[{key: value for key, value in record.items() if key != "text"} for record in bundle_files(bundle)],
         parts=[],
     )
     output.mkdir(parents=True, exist_ok=False)
@@ -321,7 +365,28 @@ def unpack_bundle(compressed):
     raw = decoder.decompress(compressed, max_length=MAX_BUNDLE_BYTES + 1)
     if len(raw) > MAX_BUNDLE_BYTES or not decoder.eof or decoder.unused_data:
         raise ValueError("Invalid or oversized compressed bundle")
-    bundle = json.loads(raw)
+    return validate_bundle(json.loads(raw))
+
+
+def validate_bundle(bundle):
+    if bundle.get("format") == COLLECTION_FORMAT:
+        captures = bundle.get("captures", [])
+        if not 1 <= len(captures) <= 32 or bundle.get("cycles_per_us") != protocol.CYCLE_TO_US:
+            raise ValueError("Invalid trace collection")
+        names, ranks, files = set(), set(), {}
+        for capture in captures:
+            name = capture["name"]
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,63}", name) or name in names:
+                raise ValueError("Invalid or duplicate capture path")
+            names.add(name)
+            if capture["bundle"].get("format") != FORMAT:
+                raise ValueError("Nested collections are not supported")
+            child, child_files = validate_bundle(capture["bundle"])
+            ranks.update(child["ranks"])
+            files.update({f"captures/{name}/{path}": data for path, data in child_files.items()})
+        if bundle.get("ranks") != sorted(ranks):
+            raise ValueError("Invalid collection rank coverage")
+        return bundle, files
     if bundle.get("format") != FORMAT or bundle.get("cycles_per_us") != protocol.CYCLE_TO_US:
         raise ValueError("Unsupported transfer format or timer clock conversion")
     files = {}
@@ -370,20 +435,28 @@ def restore_text(texts, output, *, render=True):
         json_bytes(
             dict(
                 **status,
-                format=FORMAT,
+                format=bundle["format"],
                 label=bundle["label"],
                 ranks=bundle["ranks"],
                 notes=bundle["notes"],
-                files=[{key: value for key, value in record.items() if key != "text"} for record in bundle["files"]],
+                files=[
+                    {key: value for key, value in record.items() if key != "text"} for record in bundle_files(bundle)
+                ],
             )
         )
     )
     if render:
         from .__main__ import main as render_timer
 
-        render_timer(
-            [str(output / "timer"), "--ranks", ",".join(map(str, bundle["ranks"])), "--include-wait", "--merge"]
+        captures = (
+            [(output / "captures" / capture["name"], capture["bundle"]) for capture in bundle["captures"]]
+            if bundle["format"] == COLLECTION_FORMAT
+            else [(output, bundle)]
         )
+        for directory, capture in captures:
+            render_timer(
+                [str(directory / "timer"), "--ranks", ",".join(map(str, capture["ranks"])), "--include-wait", "--merge"]
+            )
     return bundle
 
 
@@ -409,6 +482,12 @@ def main(argv=None):
     export.add_argument(
         "--max-bytes", type=int, default=DEFAULT_MAX_BYTES, help="Whole block limit including CRLF; 1024..65535"
     )
+    export.add_argument("--print-parts", action="store_true", help="Print every complete block after export")
+    pipeline = commands.add_parser("export-pipeline", help="Compress all completed cases from one pipeline together")
+    pipeline.add_argument("source", type=Path)
+    pipeline.add_argument("--output-dir", type=Path)
+    pipeline.add_argument("--max-bytes", type=int, default=CLIPBOARD_LIMIT)
+    pipeline.add_argument("--print-parts", action="store_true")
     show = commands.add_parser("show", help="Print exactly one block, with no other stdout")
     show.add_argument("directory", type=Path, help="Directory returned by export")
     show.add_argument("--part", type=int, required=True, help="One-based part number")
@@ -420,19 +499,35 @@ def main(argv=None):
     restore.add_argument("--no-render", action="store_true", help="Restore and verify files without rendering JSON")
     args = parser.parse_args(argv)
     try:
-        if args.command == "export":
-            output, index = export_text(
-                args.source,
-                args.output_dir,
-                ranks=args.ranks,
-                attachments=args.attach,
-                label=args.label,
-                max_bytes=args.max_bytes,
+        if args.command in ("export", "export-pipeline"):
+            if args.command == "export-pipeline":
+                output, index = export_bundle(
+                    collect_pipeline(args.source), args.output_dir, args.source, args.max_bytes
+                )
+            else:
+                output, index = export_text(
+                    args.source,
+                    args.output_dir,
+                    ranks=args.ranks,
+                    attachments=args.attach,
+                    label=args.label,
+                    max_bytes=args.max_bytes,
+                )
+            print(
+                f"[TEXT] label={index['label']} ranks={index['ranks']} compressed_bytes={index['bundle_bytes']} parts={len(index['parts'])}",
+                flush=True,
             )
-            print(f"[TEXT] ranks={index['ranks']} compressed_bytes={index['bundle_bytes']} parts={len(index['parts'])}")
-            print(f"[TEXT] output={output}")
-            print(f"[TEXT] Every complete block is <= {args.max_bytes} bytes, including CRLF. Copy BEGIN through END.")
-            print("[TEXT] Use 'show <output> --part 1', then 2, 3, ...; do not copy all parts in one operation.")
+            print(f"[TEXT] output={output}", flush=True)
+            print(
+                f"[TEXT] Copy one complete BEGIN-through-END block at a time; each <= {args.max_bytes} bytes including CRLF.",
+                flush=True,
+            )
+            if args.print_parts:
+                for number in range(1, len(index["parts"]) + 1):
+                    print(f"[TEXT PART {number}/{len(index['parts'])}] {index['label']}", flush=True)
+                    print(show_part(output, number), end="", flush=True)
+            else:
+                print("[TEXT] Use 'show <output> --part 1', then 2, 3, ...")
         elif args.command == "show":
             sys.stdout.write(show_part(args.directory, args.part))
         elif args.command == "inspect":
