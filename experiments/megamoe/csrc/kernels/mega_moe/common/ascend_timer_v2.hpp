@@ -37,6 +37,7 @@ enum FixedTiming {
     FIXED_TIMING_COUNT
 };
 
+// AIV_COMBINE_ASYNC keeps its ID for archived traces; it has no current producer.
 enum DynamicTimingType {
     AIV_DISPATCH = 0,
     AIV_SWIGLU_WAIT,

@@ -303,7 +303,7 @@ BS32 balanced路由下，每个4QP owner归并4个远端token；8QP时每个owne
 #### BS32：计算流水与归并初始化独立实验
 
 以下选项适用于双机EP32、FP8xFP4，默认沿用原始路径。它们在同一次构建中通过运行时tiling选择，
-不需要逐项重编译。当前tiling协议为240 B、Python/native协议为9，
+不需要逐项重编译。当前tiling协议为240 B、Python/native协议为10，
 首次使用前两端都需完整构建并安装同一版本wheel：
 
 ```bash
@@ -315,9 +315,8 @@ bash experiments/megamoe/scripts/run_bs32.sh build --errors-only
 | `--dispatch-workers 8/14/28` | `q=0/4/8` | 每专家选择较小的AIV1核组，专家间及wave间轮换，组内连续均分行；0为原全核路径，28为显式全核对照。实际设备核数不足时报错。 |
 | `--reduce-lane-init` | `q=4/8` | 每个归并owner只解析自己token区间对应的路由，按256 B对齐块读取，跳过512 B包尾标记；归并及通信完成协议不变。 |
 | `--combine-sparse-scan` | `q=0` | 批量跳过当前token中已无pending行的后缀；全部待发payload提交后立即退出本次扫描。默认关闭，可与14核Dispatch组合。 |
-| `--combine-owner-half` | `q=4/8` | 归并owner按1份、其他AIV1按2份分配连续搬行区间；余数按全局行前缀及wave轮换。保持物理QP owner和GMM2生产核不变。 |
-| `--combine-async` | `q=0` | 单行搬运提交后返回优先级调度器，重新检查激活；后续访问等待该行完成后发布ready。使用独立高位UB和事件6。 |
-| `--combine-sync-progress` | `q=4/8` | 在Export生产者汇合、host peer等待及host本地汇合期间，每次最多归并并POST一个已ready token。保留原SyncAll、host握手、各QP commit及quiet。 |
+| `--combine-single-row` | `q=0` | 当前worker恰好负责一行时，走同步轻量MTE路径；省去行环管理，完成数据写入后发布ready，返回前排空。 |
+| `--reduce-double-buffer` | `q=4/8` | 单个已ready token内部交替使用两个BF16输入缓冲，重叠下一专家行的加载与当前行计算；FP32乘加顺序不变。 |
 | `--combine-ready-trace` | `q=4/8` | timer开启时记录ready快照、归并progress和进入/离开同步边界；timer OFF时不采样。用于诊断，不作为性能优化开关。 |
 
 先单因素比较下表各行；两端必须按相同顺序使用相同参数。每组先将`perf`替换成`run`验证精度，
@@ -379,82 +378,81 @@ bash experiments/megamoe/scripts/run_bs32.sh trace --combine-reduce-qps 0 --disp
 不等于flag DMA数或标量循环次数；末次发送完成后早退出会减少该次调用跨越的行数。
 因此不能只凭`scanned_rows`判断跳过空token的收益。端到端收益需要上机验证。
 
-#### 本轮：单QP与8QP完整实验矩阵
+#### 本轮：同步Combine单行路径与归并双缓冲
 
-本轮默认仍不启用实验开关。两端同步工作区代码并完整重建wheel；原有机器配置、Golden和SHMEM SDK可继续使用。
-Python/native协议升至9，新增timer事件和多QP生产者标记区，旧wheel会被拒绝。
-每个单因素配置与同路线基线比较：
+保留14核Dispatch、QP=0扫描优化与QP=8 lane初始化；移除上一轮未见净收益的异步Combine、
+owner搬行减半和同步等待期间progress实现及开关。本轮新增开关默认关闭，分别对照：
 
-| 用例 | 配置相对该路线基线的变化 |
-|---|---|
-| `q0_base` | 单QP，14核Dispatch |
-| `q0_scan` | 增加sparse scan |
-| `q0_async` | 增加异步Combine |
-| `q8_base` | 8QP，按lane初始化，28核Dispatch |
-| `q8_dispatch14` | Dispatch改为14核 |
-| `q8_owner_half` | owner搬行权重减半 |
-| `q8_sync` | 同步等待期间有界progress |
+| 用例 | 配置 | 新增开关 |
+|---|---|---|
+| `q0_scan` | QP=0，14核Dispatch，扫描优化 | 基线 |
+| `q0_single_row` | 同上 | `--combine-single-row` |
+| `q8_dispatch14` | QP=8，14核Dispatch，lane初始化 | 基线 |
+| `q8_double_buffer` | 同上 | `--reduce-double-buffer` |
 
-两端在仓库根目录执行下列同一组命令。脚本逐项串行执行，出现错误立即停止；
-每项先打印`[CASE]`和完整命令，再由原launcher打印结果目录，参数写入该目录的`run.json`及rank manifest。
-默认不运行组合项，避免把组合结果当成单项收益。
+上一轮基线的min／max分别为173.963／185.986µs和200.267／225.727µs；
+清理后的基线需重新实测，确认没有明显变化，再评估新开关收益。
+两端同步代码并完整重建wheel：Python/native协议升至10，已删除多QP生产者标记区，旧wheel会被拒绝。
+现有机器配置、Golden和SHMEM SDK可继续使用；本轮不要求重建SHMEM SDK。
 
-全部完成后，终端集中打印`BEGIN MEGAMOE PIPELINE SUMMARY`到`END MEGAMOE PIPELINE SUMMARY`，
-可直接复制整块回传。每行带用例名、状态、节点、运行参数、QP数、Dispatch核数、开关和两项耗时，
-后附对应结果目录。`min_us`／`max_us`分别是每轮最短／最慢rank耗时的均值，单位µs，
-不是两台机器各自的耗时。`run`和`trace`只显示状态和目录，不填性能数字。
-汇总保存在`<case_dir>/pipeline_<action>_node_<节点>_<随机字符>/summary.txt`，
-同时保存CSV和JSON；终端会打印完整路径及`cat`命令。每完成一项即更新文件，
-中途失败也会输出汇总，失败项标为`FAILED`，后续未执行项标为`NOT_RUN`。
+QP=0的单行路径仅在当前worker负责恰好一行时使用，其他任务沿用原行环。
+它缓存本次调用中不变的行字节数和对称窗口偏移，按需读取metadata，直接完成一次机内MTE搬运；
+数据写入完成后才发布网关ready，返回调度器前已排空。不改变RoCE发送字节数、POST次数和owner分工。
 
-已有的性能结果无需重跑：把本轮各项`[RUN]`输出的结果目录传给`summary`，
-脚本从各目录的`run.json`识别配置、从`summary.csv`读取BS32指标，不按传入顺序猜测用例：
+QP=8的双缓冲仅作用于单个已ready token的归并内部：两个BF16输入缓冲交替使用，
+预取下一条被选中的专家行，与当前行的转换、加权、累加重叠；保持原top-k顺序和FP32乘加顺序。
+归并结果完整写入GM后才POST，QP归属、commit和quiet协议不变。
+输入缓冲区从一份增至两份，归并UB预算由10H增至12H字节，另加对齐后的top-k权重；host侧检查容量。
+
+两端在仓库根目录执行同一组命令。脚本逐项串行执行，出错立即停止；每项打印`[CASE]`和完整命令，
+配置写入结果目录的`run.json`及rank manifest。先通过全部精度检查，再测性能：
+
+```bash
+# 两端构建timer OFF；四组各验证一次精度，然后各测一次性能
+bash experiments/megamoe/scripts/run_bs32.sh build --errors-only
+bash experiments/megamoe/scripts/run_bs32_pipeline.sh run
+bash experiments/megamoe/scripts/run_bs32_pipeline.sh perf
+
+# 两端重建timer ON，采集同样四组
+bash experiments/megamoe/scripts/run_bs32.sh build --timer --errors-only
+bash experiments/megamoe/scripts/run_bs32_pipeline.sh trace
+```
+
+`perf`默认warmup 20、iters 100；`trace`默认warmup 20、iters 30，保留WAIT并采rank 0/14/16/30。
+两组8QP trace均加`--combine-ready-trace`，以相同诊断开销对照。
+只跑一条路线可加`--suite q0`或`--suite q8`；单项用`--case q0_scan`、`--case q8_double_buffer`等。
+执行前可加`--dry-run`查看命令；支持`--config`、性能/trace的`--warmup`与`--iters`。
+同一构建支持全部开关，不需要逐项重编译；仅在timer OFF性能和timer ON trace之间重建。
+
+每轮结束集中打印`BEGIN MEGAMOE PIPELINE SUMMARY`到`END MEGAMOE PIPELINE SUMMARY`，可直接复制回传。
+每行带用例名、状态、节点、参数、QP数、Dispatch核数、开关和两项耗时，后附结果目录。
+`min_us`／`max_us`分别是每轮最短／最慢rank耗时的均值，单位µs，不是两台机器各自的耗时。
+`run`和`trace`只显示状态与目录，不填性能数字。
+汇总保存在`<case_dir>/pipeline_<action>_node_<节点>_<随机字符>/summary.txt`，同时保存CSV和JSON。
+每完成一项即更新文件，中途失败也会输出汇总；失败项标为`FAILED`，后续项标为`NOT_RUN`。
+
+已有性能结果无需重跑：把四个`[RUN]`结果目录交给`summary`，脚本读取各自的`run.json`和`summary.csv`，
+不按输入顺序猜测配置。每台机器分别汇总自己的目录：
 
 ```bash
 bash experiments/megamoe/scripts/run_bs32_pipeline.sh summary \
   /path/to/perf_node_0_first /path/to/perf_node_0_second
 ```
 
-可一次传入本轮全部七个目录；每台机器分别汇总自己的结果目录。
+历史目录仍可汇总；带已移除策略的配置标为`custom`并显示原开关，不归入当前四组。
 
-```bash
-# 两端构建timer OFF；全部精度通过后再测性能
-bash experiments/megamoe/scripts/run_bs32.sh build --errors-only
-bash experiments/megamoe/scripts/run_bs32_pipeline.sh run
-bash experiments/megamoe/scripts/run_bs32_pipeline.sh perf
+验收重点：
 
-# 两端重建timer ON，采集同样七组，warmup 20 / iters 30
-bash experiments/megamoe/scripts/run_bs32.sh build --timer --errors-only
-bash experiments/megamoe/scripts/run_bs32_pipeline.sh trace
-```
+- QP=0：单次`AIV_COMBINE`耗时、末次机内Combine、激活等待、末次payload POST及timer OFF的`max_us`。
+- QP=8：每token的`AIV_COMBINE_REDUCE`耗时、owner末次归并、末次POST、commit等待及timer OFF的`max_us`。
+- 两条路线均检查精度和缓冲区复用；基线有明显变化时先排查清理影响，不能直接归因于新开关。
 
-`perf`默认warmup 20、iters 100；`trace`保留WAIT并采rank 0/14/16/30，
-所有8QP trace（包括基线）都增加`--combine-ready-trace`，便于在相同诊断开销下对照。
-只跑一条路线可加`--suite q0`或`--suite q8`；单项重跑用`--case q8_owner_half`等。
-执行前可加`--dry-run`查看命令；也支持`--config`、性能/trace的`--warmup`与`--iters`。
-
-单项确认后，组合候选为`--case q0_all`（扫描＋异步）和`--case q8_all`（14核＋owner减负＋同步progress，保留lane初始化）。
-分别按`run → perf → trace`流程验证；性能前恢复timer OFF，trace前恢复timer ON。同一构建支持所有开关，不需要逐项重编译。
-
-异步Combine只在本AIV的Dispatch结束后提交。每行的metadata和BF16数据位于224 KiB以上的独立UB；
-事件6负责搬运依赖，事件7仍归RoCE使用。常规小激活可与在途搬运重叠；超过128行的激活先retire在途行，
-再复用高位UB，保护集中路由、大slice及共享专家场景。每个slice的最后一行完成后才推进Combine游标。
-这是单行拆分实验，后续短批搬行、Wave和Dispatch提前量仍需独立验证。
-
-多QP同步progress先等待各AIV发布本次sequence的生产完成标记，再进入原硬件屏障。
-host阶段保留原peer握手和每AIV epoch；只处理已经收齐专家行的token，未ready token不阻止同步推进，
-原阻塞drain仍在host barrier之后。标记区按phase/AIV独占512 B行，跨调用不清零；
-多QP对称窗口增加96 KiB，BF16和FP32数据区的语义不变。
-
-验收仍看timer OFF端到端与慢rank分布。trace重点检查末次GMM2、末次机内搬行、末次payload POST及kernel结束，
-并检查owner与普通搬运核的结束差。新增事件语义：
-
-- `AIV_COMBINE_ASYNC`是单行提交至retire的生命周期，可与激活重叠，不能当成独占AIV执行时长。
-- `AIV_COMBINE_READY`是轮询时观察到的pending/ready mask，不是硬件精确到达时刻；全零pending表示本lane已无需处理该token。
-- `AIV_COMBINE_SYNC`标记Export与host barrier前后，配合`AIV_COMBINE_PROGRESS`定位最后一次progress与barrier后剩余归并。
-
-诊断快照会增加timer ON开销；不要将扫描累计时间、同步等待与计算重叠时长直接相加为预期收益。
-本地CPU验证不代替CANN编译、NPU精度和性能实测。
+`AIV_COMBINE_READY`是轮询观察到的pending/ready mask，不是硬件精确到达时刻；
+`AIV_COMBINE_SYNC`标记Export与host barrier前后，配合`AIV_COMBINE_PROGRESS`定位同步尾部。
+旧`AIV_COMBINE_ASYNC`事件编号仅保留用于历史trace解码，当前内核不再生成该事件。
+诊断会增加timer ON开销，不能将扫描、同步和重叠时间相加作为收益。
+小批完成通知和连续结果POST合并留待本轮实测后单独验证；Wave大小和增加QP暂不调整。
+本地CPU回归不代替CANN编译、NPU精度和性能实测。
 
 #### BS32：Dispatch 单次完成通知，双机 A/B（历史实验）
 

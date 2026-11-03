@@ -12,45 +12,31 @@ import tempfile
 
 
 CASES = {
-    "q0_base": ("--combine-reduce-qps", "0", "--dispatch-workers", "14"),
     "q0_scan": ("--combine-reduce-qps", "0", "--dispatch-workers", "14", "--combine-sparse-scan"),
-    "q0_async": ("--combine-reduce-qps", "0", "--dispatch-workers", "14", "--combine-async"),
-    "q8_base": ("--combine-reduce-qps", "8", "--dispatch-workers", "28", "--reduce-lane-init"),
+    "q0_single_row": (
+        "--combine-reduce-qps",
+        "0",
+        "--dispatch-workers",
+        "14",
+        "--combine-sparse-scan",
+        "--combine-single-row",
+    ),
     "q8_dispatch14": ("--combine-reduce-qps", "8", "--dispatch-workers", "14", "--reduce-lane-init"),
-    "q8_owner_half": (
-        "--combine-reduce-qps",
-        "8",
-        "--dispatch-workers",
-        "28",
-        "--reduce-lane-init",
-        "--combine-owner-half",
-    ),
-    "q8_sync": (
-        "--combine-reduce-qps",
-        "8",
-        "--dispatch-workers",
-        "28",
-        "--reduce-lane-init",
-        "--combine-sync-progress",
-    ),
-    "q0_all": ("--combine-reduce-qps", "0", "--dispatch-workers", "14", "--combine-sparse-scan", "--combine-async"),
-    "q8_all": (
+    "q8_double_buffer": (
         "--combine-reduce-qps",
         "8",
         "--dispatch-workers",
         "14",
         "--reduce-lane-init",
-        "--combine-owner-half",
-        "--combine-sync-progress",
+        "--reduce-double-buffer",
     ),
 }
-INDEPENDENT_CASES = tuple(name for name in CASES if not name.endswith("_all"))
+INDEPENDENT_CASES = tuple(CASES)
 SWITCHES = {
     "reduce_lane_init": "lane",
     "combine_sparse_scan": "scan",
-    "combine_owner_half": "owner_half",
-    "combine_async": "async",
-    "combine_sync_progress": "sync",
+    "combine_single_row": "single_row",
+    "reduce_double_buffer": "double_buffer",
     "combine_ready_trace": "ready_trace",
 }
 
@@ -60,6 +46,13 @@ def settings(options):
         "combine_reduce_qps": options.get("combine_reduce_qps", 0),
         "dispatch_workers": options.get("dispatch_workers", 0),
         **{key: options.get(key, False) for key in SWITCHES},
+        # Preserve retired/unknown enabled switches when summarizing old results.
+        # Otherwise an old strategy could be mistaken for a current baseline.
+        **{
+            key: value
+            for key, value in options.items()
+            if key not in SWITCHES and key.startswith(("combine_", "reduce_")) and value is True
+        },
     }
 
 
@@ -112,7 +105,13 @@ def save_summary(directory, rows, *, display=False):
         "# case             status   node action warmup iters method qps dw flags                    min_us    max_us",
     ]
     for index, row in enumerate(rows, 1):
-        flags = "+".join(label for key, label in SWITCHES.items() if row.get(key)) or "-"
+        labels = [label for key, label in SWITCHES.items() if row.get(key)]
+        labels.extend(
+            key
+            for key, value in row.items()
+            if key not in SWITCHES and key.startswith(("combine_", "reduce_")) and value is True
+        )
+        flags = "+".join(labels) or "-"
         low = f"{row['mean_us']:.3f}" if "mean_us" in row else "-"
         high = f"{row['rank_max_mean_us']:.3f}" if "rank_max_mean_us" in row else "-"
         lines.append(

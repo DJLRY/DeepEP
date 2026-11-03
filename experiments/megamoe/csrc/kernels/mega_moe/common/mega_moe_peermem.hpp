@@ -65,8 +65,6 @@ constexpr uint32_t HIERARCHICAL_WORLD_SIZE = 32U;
 // Per-token Combine state has one uint32 top-k mask, not one bit per token.
 constexpr uint32_t HIERARCHICAL_MAX_TOKENS = 256U;
 constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
-constexpr uint32_t HIERARCHICAL_MAX_AIV_WORKERS = 96U;
-constexpr uint32_t HIERARCHICAL_PRODUCER_PHASES = 2U;
 // The QP backend uses the first 256B; startup consumers reuse this reservation
 // for a single strided snapshot of sixteen 32B flag heads (512B total).
 constexpr uint32_t HIERARCHICAL_ROCE_UB_BYTES = HIERARCHICAL_RANKS_PER_HOST * 32U;
@@ -397,7 +395,6 @@ HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams& params)
             const int64_t partialBytes = Ops::Base::CeilAlign(
                 params.numMaxTokensPerRank * params.h * static_cast<int64_t>(sizeof(float)), ALIGN_512);
             bytes += 2 * partialBytes + params.combineReduceQps * HIERARCHICAL_FLAG_BYTES;
-            bytes += HIERARCHICAL_PRODUCER_PHASES * HIERARCHICAL_MAX_AIV_WORKERS * HIERARCHICAL_FLAG_BYTES;
         }
     }
     return bytes;
@@ -421,7 +418,6 @@ struct PeermemInfo {
     GM_ADDR combinePartialSendPtr{nullptr};
     GM_ADDR combinePartialRecvPtr{nullptr};
     GM_ADDR combineReduceCommitPtr{nullptr};
-    GM_ADDR combineProducerDonePtr{nullptr};
 
     HOST_DEVICE PeermemInfo() = default;
     HOST_DEVICE PeermemInfo(GM_ADDR base, const MegaMoeTilingData* tilingData, uint32_t elemsPerByte = 1,
@@ -495,10 +491,6 @@ struct PeermemInfo {
                 combinePartialRecvPtr = base + offset;
                 offset += partialBytes;
                 combineReduceCommitPtr = base + offset;
-                offset += tilingData->combineReduceQps * HIERARCHICAL_FLAG_BYTES;
-                // Single-writer lines, persistent across launches. Separate
-                // local-export and host-arrival phases use the full sequence.
-                combineProducerDonePtr = base + offset;
             }
         }
     }

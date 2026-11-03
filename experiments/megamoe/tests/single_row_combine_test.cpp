@@ -1,5 +1,5 @@
 // Copyright (c) 2026, Lu Lu
-// Production row submit/retire code with deferred MTE3 writes. This checks UB,
+// Production synchronous single-row code with deferred DMA writes. This checks UB,
 // event and ready publication lifetimes; it does not emulate NPU coherence.
 #include <algorithm>
 #include <array>
@@ -13,7 +13,8 @@
 using bfloat16_t = uint16_t;
 using GM_ADDR = uint8_t*;
 constexpr uint32_t META_INFO_SIZE = 8U, RANK_ID = 0U, TOKEN_ID = 1U, TOPK_INDEX = 2U;
-constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U;
+constexpr uint32_t HIERARCHICAL_FLAG_BYTES = 512U, EVENT_ID0 = 0U;
+constexpr uint32_t META_INFO_TENSOR_ADDR = 200U * 1024U;
 enum class TPosition { VECCALC, VECIN };
 enum class HardEvent { S_MTE2, MTE2_S, MTE2_MTE3, MTE3_S };
 using TEventID = uint32_t;
@@ -59,31 +60,43 @@ struct PendingWrite {
     uint32_t bytes;
 };
 std::vector<PendingWrite> pending;
+std::vector<PendingWrite> pendingLoads;
+std::array<std::vector<PendingWrite>, 4> loadEvents;
 template <typename T>
 void DataCopy(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count)
 {
-    std::memcpy(dst.data, src.data, count * sizeof(T));
+    pendingLoads.push_back({dst.data, src.data, static_cast<uint32_t>(count * sizeof(T))});
 }
 template <typename T>
 void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtParams copy, DataCopyPadExtParams<T>)
 {
-    std::memcpy(dst.data, src.data, copy.bytes);
+    pendingLoads.push_back({dst.data, src.data, copy.bytes});
 }
 template <typename T>
 void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, DataCopyExtParams copy)
 {
+    assert(pendingLoads.empty());
+    for (const auto& loads : loadEvents) assert(loads.empty());
     pending.push_back({dst.data, src.data, copy.bytes});
 }
 template <HardEvent E>
 void SetFlag(TEventID id)
 {
-    assert(id == 6U && !events[static_cast<size_t>(E)][id]);
+    assert(id == 0U && !events[static_cast<size_t>(E)][id]);
     events[static_cast<size_t>(E)][id] = true;
+    if constexpr (E == HardEvent::MTE2_S || E == HardEvent::MTE2_MTE3) {
+        assert(loadEvents[static_cast<size_t>(E)].empty());
+        loadEvents[static_cast<size_t>(E)].swap(pendingLoads);
+    }
 }
 template <HardEvent E>
 void WaitFlag(TEventID id)
 {
-    assert(id == 6U && events[static_cast<size_t>(E)][id]);
+    assert(id == 0U && events[static_cast<size_t>(E)][id]);
+    if constexpr (E == HardEvent::MTE2_S || E == HardEvent::MTE2_MTE3) {
+        for (auto load : loadEvents[static_cast<size_t>(E)]) std::memcpy(load.target, load.source, load.bytes);
+        loadEvents[static_cast<size_t>(E)].clear();
+    }
     if constexpr (E == HardEvent::MTE3_S) {
         for (auto write : pending) std::memcpy(write.target, write.source, write.bytes);
         pending.clear();
@@ -101,39 +114,6 @@ void WriteGmByPassDCache(int32_t* address, int32_t value)
     assert(pending.empty());  // No ready store before payload visibility.
     *address = value;
 }
-int64_t GetSystemCycle()
-{
-    static int64_t cycle = 0;
-    return ++cycle;
-}
-namespace AscendTimer {
-constexpr int64_t NO_WAVE = -1;
-enum DynamicTimingType { AIV_COMBINE_ASYNC };
-}  // namespace AscendTimer
-struct AscendTimerDevice {
-    uint32_t rows = 0U;
-    int64_t wave = -1;
-    bool Enabled() const
-    {
-        return true;
-    }
-    void SetWave(int64_t value)
-    {
-        wave = value;
-    }
-    void RecordDetail(AscendTimer::DynamicTimingType, int64_t start, int64_t end, uint64_t first, uint64_t second)
-    {
-        assert(end > start && first >> 32 == 4U && second == 1U && wave == 2);
-        ++rows;
-    }
-};
-struct WorkRange {
-    uint32_t start, count;
-};
-struct ExpertLoopState {
-    uint64_t globalTokenStartIndex;
-    uint32_t expertIdx;
-};
 struct MoeStageCommonConfig {
     uint32_t tokenHiddenDim, rankId;
 };
@@ -170,11 +150,11 @@ uint32_t HierarchicalGateway(uint32_t rank)
 namespace CombineImpl {
 /* PRODUCTION_ROUTES */
 }
-/* PRODUCTION_ASYNC */
+/* PRODUCTION_SINGLE_ROW */
 
 int main()
 {
-    for (uint32_t hidden : {1024U, 7168U, 8192U}) {
+    for (uint32_t hidden : {1024U, 3584U, 7168U, 8192U}) {
         for (uint32_t sequence : {1U, 129U, 0xffffffffU}) {
             ub.fill(0xcc);
             events = {};
@@ -197,26 +177,19 @@ int main()
                 for (uint32_t n = 0; n < hidden; ++n) source[(7U + i) * hidden + n] = (i + 1U) * 19U + n;
             }
             WaveCombineScratch scratch;
-            scratch.asyncWave = 2;
-            AscendTimerDevice timer;
-            ExpertLoopState state{3U, 3U};
-            WorkRange owned{2U, 3U};
-            assert(!ProgressAsyncCombineSlice(common, params, state, 2U, owned, timer, scratch));
-            assert(scratch.asyncInFlight && scratch.asyncRowsDone == 0U && pending.size() == 1U);
-            auto* flag =
-                reinterpret_cast<int32_t*>(params.peermemInfo.gatewayCombineReadyPtr + HIERARCHICAL_FLAG_BYTES);
-            assert(*flag == 0);
-            // Simulate a complete small activation between submit and retire.
-            std::fill(ub.begin(), ub.begin() + 192U * 1024U, uint8_t{0x55});
-            assert(!ProgressAsyncCombineSlice(common, params, state, 2U, owned, timer, scratch));
-            assert(static_cast<uint32_t>(*flag) == sequence && scratch.asyncRowsDone == 1U);
-            // Large activation fallback explicitly retires before overwriting UB.
-            RetireAsyncCombineRow(params, scratch, timer);
-            assert(!scratch.asyncInFlight && scratch.asyncRowsDone == 2U);
-            ub.fill(0xaa);
-            assert(!ProgressAsyncCombineSlice(common, params, state, 2U, owned, timer, scratch));
-            assert(ProgressAsyncCombineSlice(common, params, state, 2U, owned, timer, scratch));
-            assert(!scratch.asyncInFlight && scratch.asyncRowsDone == 0U && pending.empty() && timer.rows == 3U);
+            for (uint32_t i = 0; i < 3U; ++i) {
+                RunSingleRowCombine(common, params, 7U + i, scratch);
+                assert(pending.empty());
+                for (auto type : events)
+                    for (bool live : type) assert(!live);
+                // Every call fully retires its transfer before activation can
+                // reuse UB. Cached addresses remain valid across those stages.
+                ub.fill(0xaa);
+                const uint32_t destinationRow = i == 0U ? 1U : 5U + i;
+                auto* flag = reinterpret_cast<uint32_t*>(params.peermemInfo.gatewayCombineReadyPtr +
+                                                         destinationRow * HIERARCHICAL_FLAG_BYTES);
+                assert(*flag == (i == 1U ? 0U : sequence));
+            }
             for (uint32_t i = 0; i < 3U; ++i) {
                 const uint32_t row = i == 0U ? 1U : 5U + i;
                 auto* target = i == 1U ? peer.data() : params.peermemInfo.gatewayCombinePtr;

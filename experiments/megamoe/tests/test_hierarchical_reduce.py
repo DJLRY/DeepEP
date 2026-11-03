@@ -36,6 +36,7 @@ def test_production_weighted_gateway_reduction_and_unpermute(tmp_path):
         [
             compiler,
             "-std=c++17",
+            "-O2",
             "-Wall",
             "-Wextra",
             "-Werror",

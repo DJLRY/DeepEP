@@ -590,9 +590,8 @@ def test_pipeline_options_reach_every_bs_plan(backend, qps, workers, lane_init, 
         dict(dispatch_workers=-1),
         dict(dispatch_workers=129),
         dict(dispatch_workers=True),
-        dict(combine_reduce_qps=8, combine_async=True),
-        dict(combine_owner_half=True),
-        dict(combine_sync_progress=True),
+        dict(combine_reduce_qps=8, combine_single_row=True),
+        dict(reduce_double_buffer=True),
         dict(combine_ready_trace=True),
         dict(mma_type="fp8xfp8", dispatch_workers=14),
         dict(size=16, dispatch_workers=14),
@@ -609,7 +608,7 @@ def test_invalid_pipeline_configuration_does_not_start_runtime(backend, monkeypa
         hierarchical_buffer(backend, **options)
 
 
-@pytest.mark.parametrize("field", [11, 12, 13, 14, 15, 16, 17])
+@pytest.mark.parametrize("field", [11, 12, 13, 14, 15, 16])
 def test_pipeline_options_must_match_on_all_ranks(backend, monkeypatch, field):
     from deep_ep._store import StoreGroup
 
@@ -731,7 +730,7 @@ def test_hierarchical_a8w8_bs32_uses_fp8_weights_without_layout_conversion(backe
         b.destroy()
 
 
-@pytest.mark.parametrize("protocol", [5, 6, 7, 8, 9])
+@pytest.mark.parametrize("protocol", [5, 6, 7, 8, 9, 10])
 def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypatch, protocol):
     api._extension.cache_clear()
     core = SimpleNamespace(create_megamoe_runtime=lambda: None)
@@ -739,7 +738,7 @@ def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypa
     monkeypatch.setattr(api, "require_native", lambda _: core)
     monkeypatch.setattr(api.importlib, "import_module", lambda _: extension)
     try:
-        if protocol != 9:
+        if protocol != 10:
             with pytest.raises(RuntimeError, match="versions differ"):
                 api._extension()
         else:
@@ -751,12 +750,11 @@ def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypa
 @pytest.mark.parametrize(
     "qps,options,flags",
     [
-        (0, dict(combine_async=True), 16),
-        (0, dict(combine_async=True, combine_sparse_scan=True), 20),
-        (8, dict(combine_owner_half=True, dispatch_workers=14, reduce_lane_init=True), 10),
-        (8, dict(combine_sync_progress=True), 32),
+        (0, dict(combine_single_row=True), 128),
+        (0, dict(combine_single_row=True, combine_sparse_scan=True), 132),
+        (8, dict(reduce_double_buffer=True, dispatch_workers=14, reduce_lane_init=True), 258),
+        (4, dict(reduce_double_buffer=True, combine_ready_trace=True), 320),
         (4, dict(combine_ready_trace=True), 64),
-        (8, dict(combine_owner_half=True, combine_sync_progress=True, combine_ready_trace=True), 104),
     ],
 )
 def test_tail_pipeline_options_reach_plan(backend, qps, options, flags):

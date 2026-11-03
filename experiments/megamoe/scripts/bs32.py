@@ -244,7 +244,7 @@ import torch, torch_npu, deep_ep
 from deep_ep._native import require_native
 import deep_ep_experimental.megamoe._C as megamoe
 require_native('BS32 preflight')
-if getattr(megamoe, 'api_protocol', None) != 9:
+if getattr(megamoe, 'api_protocol', None) != 10:
     raise RuntimeError('Installed MegaMoE protocol is outdated; run run_bs32.sh build on both hosts first')
 info = json.loads(files('deep_ep').joinpath('_build_info.json').read_text())
 if Path(deep_ep.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()):
@@ -285,9 +285,8 @@ def test_commands(
     dispatch_workers=0,
     reduce_lane_init=False,
     combine_sparse_scan=False,
-    combine_owner_half=False,
-    combine_async=False,
-    combine_sync_progress=False,
+    reduce_double_buffer=False,
+    combine_single_row=False,
     combine_ready_trace=False,
 ):
     python = [config["python"], "-I", "-m"]
@@ -353,12 +352,10 @@ def test_commands(
         benchmark.append("--reduce-lane-init")
     if combine_sparse_scan:
         benchmark.append("--combine-sparse-scan")
-    if combine_owner_half:
-        benchmark.append("--combine-owner-half")
-    if combine_async:
-        benchmark.append("--combine-async")
-    if combine_sync_progress:
-        benchmark.append("--combine-sync-progress")
+    if reduce_double_buffer:
+        benchmark.append("--reduce-double-buffer")
+    if combine_single_row:
+        benchmark.append("--combine-single-row")
     if combine_ready_trace:
         benchmark.append("--combine-ready-trace")
     return golden, benchmark
@@ -400,9 +397,8 @@ def performance_summary(config, run_dir, bs_values=(32,)):
             f"Pipeline: dispatch_workers={report.get('dispatch_workers', 0)}, "
             f"reduce_lane_init={report.get('reduce_lane_init', False)}, "
             f"combine_sparse_scan={report.get('combine_sparse_scan', False)}, "
-            f"combine_owner_half={report.get('combine_owner_half', False)}, "
-            f"combine_async={report.get('combine_async', False)}, "
-            f"combine_sync_progress={report.get('combine_sync_progress', False)}, "
+            f"reduce_double_buffer={report.get('reduce_double_buffer', False)}, "
+            f"combine_single_row={report.get('combine_single_row', False)}, "
             f"combine_ready_trace={report.get('combine_ready_trace', False)}",
             f"All-rank kernel Duration; {report['rounds']}/{report['recorded_rounds']} rounds (tail half)",
             f"Mean of per-round minimum rank: {report['mean_us']:.3f} us",
@@ -420,9 +416,8 @@ def performance_summary(config, run_dir, bs_values=(32,)):
                 dispatch_workers=report.get("dispatch_workers", 0),
                 reduce_lane_init=report.get("reduce_lane_init", False),
                 combine_sparse_scan=report.get("combine_sparse_scan", False),
-                combine_owner_half=report.get("combine_owner_half", False),
-                combine_async=report.get("combine_async", False),
-                combine_sync_progress=report.get("combine_sync_progress", False),
+                reduce_double_buffer=report.get("reduce_double_buffer", False),
+                combine_single_row=report.get("combine_single_row", False),
                 combine_ready_trace=report.get("combine_ready_trace", False),
                 rounds=report["rounds"],
                 recorded_rounds=report["recorded_rounds"],
@@ -474,9 +469,8 @@ def dispatch(
     dispatch_workers=0,
     reduce_lane_init=False,
     combine_sparse_scan=False,
-    combine_owner_half=False,
-    combine_async=False,
-    combine_sync_progress=False,
+    reduce_double_buffer=False,
+    combine_single_row=False,
     combine_ready_trace=False,
 ):
     if extra_bs and action != "perf":
@@ -487,9 +481,8 @@ def dispatch(
         dispatch_workers
         or reduce_lane_init
         or combine_sparse_scan
-        or combine_owner_half
-        or combine_async
-        or combine_sync_progress
+        or reduce_double_buffer
+        or combine_single_row
         or combine_ready_trace
     ) and action not in (
         "run",
@@ -503,10 +496,10 @@ def dispatch(
         raise ValueError("--reduce-lane-init requires --combine-reduce-qps 4 or 8")
     if combine_sparse_scan and combine_reduce_qps:
         raise ValueError("--combine-sparse-scan requires --combine-reduce-qps 0")
-    if (combine_owner_half or combine_sync_progress or combine_ready_trace) and not combine_reduce_qps:
-        raise ValueError("owner-half, sync-progress and ready-trace require q=4 or 8")
-    if combine_async and combine_reduce_qps:
-        raise ValueError("--combine-async requires q=0")
+    if (reduce_double_buffer or combine_ready_trace) and not combine_reduce_qps:
+        raise ValueError("reduce-double-buffer and ready-trace require q=4 or 8")
+    if combine_single_row and combine_reduce_qps:
+        raise ValueError("--combine-single-row requires q=0")
     if platform.system() != "Linux":
         raise RuntimeError("Build/run require Linux; configure/show-config can run without devices")
     env = environment(config)
@@ -564,9 +557,8 @@ def dispatch(
                 dispatch_workers=dispatch_workers,
                 reduce_lane_init=reduce_lane_init,
                 combine_sparse_scan=combine_sparse_scan,
-                combine_owner_half=combine_owner_half,
-                combine_async=combine_async,
-                combine_sync_progress=combine_sync_progress,
+                reduce_double_buffer=reduce_double_buffer,
+                combine_single_row=combine_single_row,
                 combine_ready_trace=combine_ready_trace,
                 bs_values=case["bs_values"],
             ),
@@ -593,9 +585,8 @@ def dispatch(
                 dispatch_workers=dispatch_workers,
                 reduce_lane_init=reduce_lane_init,
                 combine_sparse_scan=combine_sparse_scan,
-                combine_owner_half=combine_owner_half,
-                combine_async=combine_async,
-                combine_sync_progress=combine_sync_progress,
+                reduce_double_buffer=reduce_double_buffer,
+                combine_single_row=combine_single_row,
                 combine_ready_trace=combine_ready_trace,
             )
             print(f"[PERF] EP32 BS={bs} output={case_dir}", flush=True)
@@ -613,9 +604,8 @@ def dispatch(
         dispatch_workers=dispatch_workers,
         reduce_lane_init=reduce_lane_init,
         combine_sparse_scan=combine_sparse_scan,
-        combine_owner_half=combine_owner_half,
-        combine_async=combine_async,
-        combine_sync_progress=combine_sync_progress,
+        reduce_double_buffer=reduce_double_buffer,
+        combine_single_row=combine_single_row,
         combine_ready_trace=combine_ready_trace,
     )
     if not sampling:
@@ -687,17 +677,12 @@ def main(argv=None):
         "--reduce-lane-init", action="store_true", help="q=4/8 run/perf/trace: parse only lane-owned routes"
     )
     parser.add_argument(
-        "--combine-owner-half", action="store_true", help="q=4/8: give reduction owners half the local Combine share"
+        "--reduce-double-buffer", action="store_true", help="q=4/8: overlap expert row loads with FP32 reduction"
     )
     parser.add_argument(
-        "--combine-async",
+        "--combine-single-row",
         action="store_true",
-        help="q=0: issue one local Combine row and retire it on a later scheduler visit",
-    )
-    parser.add_argument(
-        "--combine-sync-progress",
-        action="store_true",
-        help="q=4/8: bounded ready-token progress while waiting for producer barriers",
+        help="q=0: use a synchronous lightweight path for single-row Combine tasks",
     )
     parser.add_argument(
         "--combine-ready-trace",
@@ -758,9 +743,8 @@ def main(argv=None):
         args.dispatch_workers is not None
         or args.reduce_lane_init
         or args.combine_sparse_scan
-        or args.combine_owner_half
-        or args.combine_async
-        or args.combine_sync_progress
+        or args.reduce_double_buffer
+        or args.combine_single_row
         or args.combine_ready_trace
     ) and args.action not in (
         "run",
@@ -772,12 +756,10 @@ def main(argv=None):
         parser.error("--reduce-lane-init requires --combine-reduce-qps 4 or 8")
     if args.combine_sparse_scan and args.combine_reduce_qps:
         parser.error("--combine-sparse-scan requires --combine-reduce-qps 0")
-    if (
-        args.combine_owner_half or args.combine_sync_progress or args.combine_ready_trace
-    ) and not args.combine_reduce_qps:
-        parser.error("owner-half, sync-progress and ready-trace require --combine-reduce-qps 4 or 8")
-    if args.combine_async and args.combine_reduce_qps:
-        parser.error("--combine-async requires --combine-reduce-qps 0")
+    if (args.reduce_double_buffer or args.combine_ready_trace) and not args.combine_reduce_qps:
+        parser.error("reduce-double-buffer and ready-trace require --combine-reduce-qps 4 or 8")
+    if args.combine_single_row and args.combine_reduce_qps:
+        parser.error("--combine-single-row requires --combine-reduce-qps 0")
     if args.timer and args.action != "build":
         parser.error("--timer requires build; use the trace action for collection")
     if args.timer_ranks is not None and args.action != "trace":
@@ -814,12 +796,10 @@ def main(argv=None):
         options["reduce_lane_init"] = True
     if args.combine_sparse_scan:
         options["combine_sparse_scan"] = True
-    if args.combine_owner_half:
-        options["combine_owner_half"] = True
-    if args.combine_async:
-        options["combine_async"] = True
-    if args.combine_sync_progress:
-        options["combine_sync_progress"] = True
+    if args.reduce_double_buffer:
+        options["reduce_double_buffer"] = True
+    if args.combine_single_row:
+        options["combine_single_row"] = True
     if args.combine_ready_trace:
         options["combine_ready_trace"] = True
     if args.extra_bs:

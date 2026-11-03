@@ -284,15 +284,11 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
                 "reduce_lane_init requires combine_reduce_qps=4 or 8");
     TORCH_CHECK(!(pipeline_flags & megamoe_config::COMBINE_SPARSE_SCAN) || combine_reduce_qps == 0,
                 "combine_sparse_scan requires combine_reduce_qps=0");
-    TORCH_CHECK(!(pipeline_flags & (megamoe_config::COMBINE_OWNER_HALF | megamoe_config::COMBINE_SYNC_PROGRESS |
-                                    megamoe_config::COMBINE_READY_TRACE)) ||
+    TORCH_CHECK(!(pipeline_flags & (megamoe_config::REDUCE_DOUBLE_BUFFER | megamoe_config::COMBINE_READY_TRACE)) ||
                     combine_reduce_qps != 0,
-                "owner_half, sync_progress and ready_trace require combine_reduce_qps=4 or 8");
-    TORCH_CHECK(!(pipeline_flags & megamoe_config::COMBINE_ASYNC) || combine_reduce_qps == 0,
-                "combine_async requires combine_reduce_qps=0");
-    TORCH_CHECK(
-        !(pipeline_flags & megamoe_config::COMBINE_SYNC_PROGRESS) || p.aiv <= MegaMoeImpl::HIERARCHICAL_MAX_AIV_WORKERS,
-        "Too many AIV workers for Combine producer rendezvous");
+                "reduce_double_buffer and ready_trace require combine_reduce_qps=4 or 8");
+    TORCH_CHECK(!(pipeline_flags & megamoe_config::COMBINE_SINGLE_ROW) || combine_reduce_qps == 0,
+                "combine_single_row requires combine_reduce_qps=0");
     t.pipelineFlags = static_cast<uint32_t>(pipeline_flags);
     t.dispatchWorkers = static_cast<uint32_t>(dispatch_workers);
     TORCH_CHECK(
@@ -304,9 +300,8 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     TORCH_CHECK(!hierarchical || p.ub > MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES,
                 "Not enough UB for MegaMoE RoCE scratch");
     const uint32_t stage_ub = hierarchical ? p.ub - MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES : p.ub;
-    TORCH_CHECK(!(pipeline_flags & megamoe_config::COMBINE_ASYNC) || stage_ub >= 240U * 1024U + 32U,
-                "combine_async requires at least 240 KiB + 32 B of stage UB");
-    TORCH_CHECK(combine_reduce_qps == 0 || stage_ub >= t.h * 10U + AlignUp(t.topK * 4U, 32U),
+    const uint32_t reduce_bytes_per_element = (pipeline_flags & megamoe_config::REDUCE_DOUBLE_BUFFER) ? 12U : 10U;
+    TORCH_CHECK(combine_reduce_qps == 0 || stage_ub >= t.h * reduce_bytes_per_element + AlignUp(t.topK * 4U, 32U),
                 "Not enough UB for FP32 gateway reduction");
     t.roceScratchUbOffset = hierarchical ? stage_ub : 0U;
     t.sharedExpertNum = static_cast<uint32_t>(shared_experts);

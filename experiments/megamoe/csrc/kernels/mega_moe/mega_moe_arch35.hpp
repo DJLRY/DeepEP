@@ -37,7 +37,6 @@
 #include "stage/mega_moe_gmm2_combine.hpp"
 #include "stage/mega_moe_hierarchical_combine.hpp"
 #include "stage/mega_moe_hierarchical_reduce.hpp"
-#include "stage/mega_moe_hierarchical_combine_sync.hpp"
 #include "stage/mega_moe_unpermute.hpp"
 #include "mc2_common/quantize_functions.hpp"
 
@@ -1035,12 +1034,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                                              timer_.Enabled() ? &timer_ : nullptr, 1U);
         }
         PipeBarrier<PIPE_ALL>();
-        if (UseHierarchicalCombineReduction(params_.tilingData) && (params_.tilingData->pipelineFlags & 32U) != 0U) {
-            JoinHierarchicalCombineProducers(aivJob_, commonConfig_, params_, hierarchicalCombine_,
-                                             timer_.Enabled() ? &timer_ : nullptr, 0U);
-        } else {
-            SyncAll<true>();
-        }
+        SyncAll<true>();
         if (reduceOwner) {
             TraceHierarchicalCombineBoundary(commonConfig_, params_, hierarchicalCombine_,
                                              HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex),
@@ -1072,12 +1066,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                     TraceHierarchicalCombineBoundary(commonConfig_, params_, hierarchicalCombine_, lane,
                                                      timer_.Enabled() ? &timer_ : nullptr, 3U);
                 }
-                if (reduction && (params_.tilingData->pipelineFlags & 32U) != 0U) {
-                    CrossRankSyncInHierarchicalHostWithProgress(aivJob_, commonConfig_, params_, hierarchicalCombine_,
-                                                                timer_.Enabled() ? &timer_ : nullptr);
-                } else {
-                    CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
-                }
+                CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
                 if (owner) {
                     TraceHierarchicalCombineBoundary(commonConfig_, params_, hierarchicalCombine_, lane,
                                                      timer_.Enabled() ? &timer_ : nullptr, 4U);

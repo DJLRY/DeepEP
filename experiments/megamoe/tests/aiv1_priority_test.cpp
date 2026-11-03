@@ -76,13 +76,6 @@ struct Fixture {
             finalWave = wave;
         }
     } timer_;
-    struct {
-        bool asyncInFlight = false;
-    } waveCombineScratch_;
-    template <typename Params, typename Scratch, typename Timer>
-    void RetireAsyncCombineRow(Params&, Scratch&, Timer&)
-    {
-    }
     uint32_t sharedExpertNum_ = 0;
     uint32_t mGroupsPerWave_ = 2;
 
@@ -91,7 +84,6 @@ struct Fixture {
     std::set<std::pair<uint32_t, uint32_t>> readyTiles;
     std::set<std::pair<uint32_t, uint32_t>> consumedTiles;
     uint32_t combineSlices = 0;
-    bool asyncCombine = false;
     std::set<uint32_t> readyCombines;
     std::set<uint32_t> consumedCombines;
     bool sharedReady = false;
@@ -176,13 +168,6 @@ struct Fixture {
         if (readyCombines.count(cursor.sliceIndex) == 0) {
             return false;
         }
-        if (asyncCombine && !waveCombineScratch_.asyncInFlight) {
-            waveCombineScratch_.asyncInFlight = true;
-            events.push_back("I" + std::to_string(cursor.sliceIndex));
-            ReadyAllActivationTiles();
-            return false;
-        }
-        waveCombineScratch_.asyncInFlight = false;
         assert(consumedCombines.insert(cursor.sliceIndex).second);
         events.push_back("C" + std::to_string(cursor.sliceIndex));
         if (afterCombine) {
@@ -270,19 +255,6 @@ void CombineReleasesMultipleTilesAndSlices()
     f.Expect({"C0", "R:init", "A0:1", "A0:3", "A0:5", "A1:0", "A1:2", "C1", "R:scan"});
     assert(f.remoteForeground == std::vector<bool>({true, false}));
     assert(f.clock == 0);
-}
-
-void AsyncSubmitYieldsToActivationBeforeRetire()
-{
-    Fixture f;
-    f.aivJob_.jobIndex = 3U;  // q=0 nonowner performs local Combine.
-    f.asyncCombine = true;
-    f.activationPlans = {{0, 1}};
-    f.combineSlices = 1;
-    f.ReadyAllCombines();
-    f.Run(1);
-    f.Expect({"I0", "R:noop", "A0:0", "C0", "R:noop"});
-    assert(f.clock == 0 && !f.waveCombineScratch_.asyncInFlight);
 }
 
 void RemoteProgressRunsAfterEveryCombine()
@@ -400,7 +372,6 @@ void NonOwnersLeaveRemoteProgressToTheOwner()
 
 int main()
 {
-    AsyncSubmitYieldsToActivationBeforeRetire();
     CombineReleasesMultipleTilesAndSlices();
     RemoteProgressRunsAfterEveryCombine();
     SharedActivationReleasedByCombineFollowsRemoteProgress();

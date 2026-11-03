@@ -7,6 +7,7 @@
 #include <cstdint>
 #include <cstring>
 #include <iostream>
+#include <map>
 #include <random>
 #include <set>
 #include <stdexcept>
@@ -63,6 +64,17 @@ inline uint8_t* remoteBase = nullptr;
 inline size_t heapBytes = 0;
 inline bool recordRouteReads = false;
 inline std::vector<std::pair<const int32_t*, uint32_t>> routeReads;
+struct InputLoad {
+    bfloat16_t* destination;
+    std::vector<bfloat16_t> values;
+};
+inline bool deferInputs = false;
+inline std::vector<InputLoad> queuedInputs;
+inline std::array<std::vector<InputLoad>, 8> inputEvents;
+inline std::array<bfloat16_t*, 8> releaseInputs{};
+inline std::map<bfloat16_t*, bool> busyInputs;
+inline bfloat16_t* lastCastInput = nullptr;
+inline uint32_t overlappedCasts = 0;
 struct Post {
     uint32_t qp;
     uint8_t* source;
@@ -139,6 +151,14 @@ void DataCopy(LocalTensor<T> dst, GlobalTensor<T> src, uint32_t count)
     if constexpr (std::is_same_v<T, int32_t>) {
         if (ReduceTest::recordRouteReads) ReduceTest::routeReads.emplace_back(src.data, count);
     }
+    if constexpr (std::is_same_v<T, bfloat16_t>) {
+        if (ReduceTest::deferInputs) {
+            ReduceTest::Check(!ReduceTest::busyInputs[dst.data], "input buffer reused before vector release");
+            ReduceTest::busyInputs[dst.data] = true;
+            ReduceTest::queuedInputs.push_back({dst.data, {src.data, src.data + count}});
+            return;
+        }
+    }
     std::memcpy(dst.data, src.data, count * sizeof(T));
 }
 template <typename T>
@@ -174,6 +194,20 @@ void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, DataCopyExtParams p)
 template <typename D, typename S>
 void Cast(LocalTensor<D> dst, LocalTensor<S> src, RoundMode, uint32_t count)
 {
+    if constexpr (std::is_same_v<S, bfloat16_t>) {
+        if (ReduceTest::deferInputs) {
+            ReduceTest::Check(ReduceTest::queuedInputs.empty(), "input load lacks a completion event");
+            bool prefetched = false;
+            for (const auto& loads : ReduceTest::inputEvents) {
+                for (const auto& load : loads) {
+                    ReduceTest::Check(load.destination != src.data, "Cast before input DMA completed");
+                    prefetched = true;
+                }
+            }
+            ReduceTest::overlappedCasts += prefetched;
+            ReduceTest::lastCastInput = src.data;
+        }
+    }
     for (uint32_t i = 0; i < count; ++i) dst.data[i] = D(static_cast<float>(src.data[i]));
 }
 inline void Muls(LocalTensor<float> dst, LocalTensor<float> src, float weight, uint32_t count)
@@ -190,6 +224,16 @@ void SetFlag(TEventID id)
     auto& flag = ReduceTest::events[static_cast<size_t>(E)][id];
     ReduceTest::Check(flag == 0, "reusing a live event");
     flag = 1;
+    if (ReduceTest::deferInputs) {
+        if constexpr (E == HardEvent::MTE2_V) {
+            ReduceTest::Check(ReduceTest::inputEvents[id].empty(), "input event still owns a load");
+            ReduceTest::inputEvents[id].swap(ReduceTest::queuedInputs);
+        } else if constexpr (E == HardEvent::V_MTE2) {
+            ReduceTest::Check(ReduceTest::lastCastInput != nullptr, "release before Cast");
+            ReduceTest::releaseInputs[id] = ReduceTest::lastCastInput;
+            ReduceTest::lastCastInput = nullptr;
+        }
+    }
 }
 template <HardEvent E>
 void WaitFlag(TEventID id)
@@ -197,6 +241,17 @@ void WaitFlag(TEventID id)
     auto& flag = ReduceTest::events[static_cast<size_t>(E)][id];
     ReduceTest::Check(flag == 1, "waiting on an unpublished event");
     flag = 0;
+    if (ReduceTest::deferInputs) {
+        if constexpr (E == HardEvent::MTE2_V) {
+            for (const auto& load : ReduceTest::inputEvents[id])
+                std::copy(load.values.begin(), load.values.end(), load.destination);
+            ReduceTest::inputEvents[id].clear();
+        } else if constexpr (E == HardEvent::V_MTE2) {
+            ReduceTest::Check(ReduceTest::releaseInputs[id] != nullptr, "missing input release");
+            ReduceTest::busyInputs[ReduceTest::releaseInputs[id]] = false;
+            ReduceTest::releaseInputs[id] = nullptr;
+        }
+    }
 }
 template <int>
 void PipeBarrier()
@@ -293,6 +348,11 @@ inline void RocePutBytes(uint8_t* dst, uint8_t* src, uint32_t bytes, uint32_t pe
 {
     using namespace ReduceTest;
     Check(!commit && qp == activeLane + 1U && peer == expectedPeer, "foreign QP owner/destination");
+    Check(queuedInputs.empty(), "input DMA not submitted before POST");
+    for (const auto& loads : inputEvents) Check(loads.empty(), "input DMA still pending before POST");
+    for (const auto& input : busyInputs) Check(!input.second, "input buffer not released before POST");
+    for (const auto& type : events)
+        for (int live : type) Check(live == 0, "reduction leaked an event");
     Check(src >= localBase && src + bytes <= localBase + heapBytes && dst >= localBase &&
               dst + bytes <= localBase + heapBytes,
           "non-symmetric operand");
@@ -322,12 +382,19 @@ namespace MegaMoeImpl {
 using namespace MegaMoeImpl;
 
 void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity, uint32_t topk, uint32_t hidden,
-               uint32_t pattern, uint32_t sequence, bool shared, bool laneInit = false, bool diagnostic = false)
+               uint32_t pattern, uint32_t sequence, bool shared, bool laneInit = false, bool diagnostic = false,
+               bool doubleBuffer = false)
 {
     using namespace ReduceTest;
     ub.fill(0);
     events = {};
     posts.clear();
+    queuedInputs.clear();
+    inputEvents = {};
+    releaseInputs = {};
+    busyInputs.clear();
+    lastCastInput = nullptr;
+    overlappedCasts = 0;
     MegaMoeTilingData t{};
     t.bs = bs;
     t.numMaxTokensPerRank = capacity;
@@ -341,7 +408,7 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     t.topoType = TOPO_TYPE_MTE_ROCE;
     t.groupedMatmulMode = GROUPED_MATMUL_MODE_A8W4;
     t.combineReduceQps = qps;
-    t.pipelineFlags = (laneInit ? 2U : 0U) | (diagnostic ? 64U : 0U);
+    t.pipelineFlags = (laneInit ? 2U : 0U) | (diagnostic ? 64U : 0U) | (doubleBuffer ? 256U : 0U);
     t.roceScratchUbOffset = 256U * 1024U - 512U;
     t.hierarchicalSequence = sequence;
     t.sharedExpertNum = shared ? 1U : 0U;
@@ -350,11 +417,7 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     heapBytes = CalcPeermemLeastSize(sizes);
     std::vector<uint8_t> sourceHeap(heapBytes, 0xA5), gatewayHeap(heapBytes, 0xA5);
     PeermemInfo source(sourceHeap.data(), &t), gateway(gatewayHeap.data(), &t);
-    Check(gateway.combineReduceCommitPtr + qps * 512U == gateway.combineProducerDonePtr,
-          "producer flags overlap QP commits");
-    Check(gateway.combineProducerDonePtr + HIERARCHICAL_PRODUCER_PHASES * HIERARCHICAL_MAX_AIV_WORKERS * 512U ==
-              gatewayHeap.data() + heapBytes,
-          "layout budget mismatch");
+    Check(gateway.combineReduceCommitPtr + qps * 512U == gatewayHeap.data() + heapBytes, "layout budget mismatch");
     localBase = gatewayHeap.data();
     remoteBase = sourceHeap.data();
     expectedPeer = sourceRank;
@@ -458,6 +521,7 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
         TraceHierarchicalCombineBoundary(gwCommon, params, state[activeLane], activeLane, &timer, 2U);
     }
     // Publish expert rows in reverse order. A partial token must never be posted.
+    deferInputs = true;
     std::vector<uint32_t> published(bs, 0U);
     for (uint32_t row = bs * topk; row-- > 0;) {
         const uint32_t token = row / topk, k = row % topk;
@@ -492,6 +556,11 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     }
     for (uint32_t token = 0; token < bs; ++token)
         Check(sent[token] == static_cast<uint32_t>(masks[token] != 0), "missing or duplicate token");
+    uint32_t expectedOverlap = 0;
+    for (const auto mask : masks)
+        if (doubleBuffer && mask != 0U) expectedOverlap += CombineMaskCount(mask) - 1U;
+    Check(overlappedCasts == expectedOverlap, "next expert load did not overlap current Cast");
+    deferInputs = false;
     Check(timer.reduced == posts.size(), "missing reduction timing record");
     // UB can be reused while the NIC owns immutable symmetric GM sources.
     ub.fill(0xCC);
@@ -537,20 +606,25 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
 int main()
 {
     try {
-        for (bool laneInit : {false, true}) {
-            for (uint32_t qps : {4U, 8U})
-                for (uint32_t rank : {0U, 21U})
-                    for (uint32_t pattern = 0; pattern < 5; ++pattern) {
-                        CheckCase(qps, rank, 32U, 64U, 8U, 3584U, pattern, 0x80000101U, false, laneInit);
-                        CheckCase(qps, rank, 7U, 32U, 1U, 1024U, pattern, 0xffffffffU, true, laneInit);
-                        CheckCase(qps, rank, 1U, 8U, 32U, 8192U, pattern, 129U, false, laneInit);
-                    }
-            CheckCase(4U, 0U, 256U, 256U, 32U, 1024U, 2U, 257U, true, laneInit);
-            CheckCase(8U, 0U, 3U, 8U, 7U, 1024U, 2U, 3U, false, laneInit);
-            CheckCase(8U, 16U, 37U, 64U, 7U, 1024U, 2U, 3U, false, laneInit);
+        for (bool doubleBuffer : {false, true}) {
+            for (bool laneInit : {false, true}) {
+                for (uint32_t qps : {4U, 8U})
+                    for (uint32_t rank : {0U, 21U})
+                        for (uint32_t pattern = 0; pattern < 5; ++pattern) {
+                            CheckCase(qps, rank, 32U, 64U, 8U, 3584U, pattern, 0x80000101U, false, laneInit, false,
+                                      doubleBuffer);
+                            CheckCase(qps, rank, 7U, 32U, 1U, 1024U, pattern, 0xffffffffU, true, laneInit, false,
+                                      doubleBuffer);
+                            CheckCase(qps, rank, 1U, 8U, 32U, 8192U, pattern, 129U, false, laneInit, false,
+                                      doubleBuffer);
+                        }
+                CheckCase(4U, 0U, 256U, 256U, 32U, 1024U, 2U, 257U, true, laneInit, false, doubleBuffer);
+                CheckCase(8U, 0U, 3U, 8U, 7U, 1024U, 2U, 3U, false, laneInit, false, doubleBuffer);
+                CheckCase(8U, 16U, 37U, 64U, 7U, 1024U, 2U, 3U, false, laneInit, false, doubleBuffer);
+            }
+            CheckCase(8U, 0U, 32U, 64U, 8U, 3584U, 2U, 0x80000101U, false, true, true, doubleBuffer);
+            CheckCase(4U, 16U, 7U, 32U, 32U, 1024U, 2U, 0xffffffffU, true, false, true, doubleBuffer);
         }
-        CheckCase(8U, 0U, 32U, 64U, 8U, 3584U, 2U, 0x80000101U, false, true, true);
-        CheckCase(4U, 16U, 7U, 32U, 32U, 1024U, 2U, 0xffffffffU, true, false, true);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

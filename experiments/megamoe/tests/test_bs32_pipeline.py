@@ -15,16 +15,13 @@ MODULE = runpy.run_path(str(SCRIPT))
 def test_independent_cases_only_change_one_factor():
     cases = MODULE["CASES"]
     pairs = {
-        "q0_scan": ("q0_base", {"--combine-sparse-scan"}),
-        "q0_async": ("q0_base", {"--combine-async"}),
-        "q8_owner_half": ("q8_base", {"--combine-owner-half"}),
-        "q8_sync": ("q8_base", {"--combine-sync-progress"}),
+        "q0_single_row": ("q0_scan", {"--combine-single-row"}),
+        "q8_double_buffer": ("q8_dispatch14", {"--reduce-double-buffer"}),
     }
     for name, (baseline, additions) in pairs.items():
         assert set(cases[name]) - set(cases[baseline]) == additions
         assert set(cases[baseline]) - set(cases[name]) == set()
-    assert cases["q8_dispatch14"] == tuple("14" if arg == "28" else arg for arg in cases["q8_base"])
-    assert len(MODULE["INDEPENDENT_CASES"]) == 7
+    assert len(MODULE["INDEPENDENT_CASES"]) == 4
     assert not any(name.endswith("_all") for name in MODULE["INDEPENDENT_CASES"])
 
 
@@ -32,7 +29,7 @@ def test_independent_cases_only_change_one_factor():
 def test_matrix_uses_matching_q8_diagnostics_only_for_trace(action, capsys):
     MODULE["main"]([action, "--dry-run", "--config", "/tmp/host settings.json"])
     output = capsys.readouterr().out
-    assert output.count("[CASE]") == 7 and "q0_all" not in output and "q8_all" not in output
+    assert output.count("[CASE]") == 4 and "q0_all" not in output and "q8_all" not in output
     for name in MODULE["INDEPENDENT_CASES"]:
         args = MODULE["case_arguments"](action, name)
         assert ("--combine-ready-trace" in args) == (action == "trace" and name.startswith("q8_"))
@@ -70,12 +67,12 @@ def test_matrix_stops_at_first_failure(monkeypatch, tmp_path, capsys):
     fake_launcher(monkeypatch, tmp_path, fail)
     with pytest.raises(RuntimeError, match="accuracy failed"):
         MODULE["main"](["run"])
-    assert len(launches) == 1 and launches[0] == ["run", *MODULE["CASES"]["q0_base"]]
+    assert len(launches) == 1 and launches[0] == ["run", *MODULE["CASES"]["q0_scan"]]
     output = capsys.readouterr().out
     assert "BEGIN MEGAMOE PIPELINE SUMMARY" in output and "accuracy failed" in output
     summary = next((tmp_path / "results").glob("pipeline_run_*/summary.json"))
     rows = json.loads(summary.read_text())
-    assert [row["status"] for row in rows] == ["FAILED", *["NOT_RUN"] * 6]
+    assert [row["status"] for row in rows] == ["FAILED", *["NOT_RUN"] * 3]
     assert not any("mean_us" in row for row in rows)
 
 
@@ -83,7 +80,9 @@ def test_matrix_stops_at_first_failure(monkeypatch, tmp_path, capsys):
 def test_matrix_summarizes_exact_returned_directories(monkeypatch, tmp_path, capsys, action):
     launches = []
     # Unrelated historical results must never be mistaken for this invocation.
-    write_result(tmp_path / "results" / "perf_node_0_newest", dict(dispatch_workers=14), low=1, high=2)
+    write_result(
+        tmp_path / "results" / "perf_node_0_newest", dict(dispatch_workers=14, combine_sparse_scan=True), low=1, high=2
+    )
 
     def launch(args):
         index = len(launches)
@@ -100,10 +99,10 @@ def test_matrix_summarizes_exact_returned_directories(monkeypatch, tmp_path, cap
     rows = json.loads((directory / "summary.json").read_text())
     assert [row["case"] for row in rows] == list(MODULE["INDEPENDENT_CASES"])
     assert all(row["status"] == "OK" for row in rows)
-    assert [row["run_dir"] for row in rows] == [str((tmp_path / "results" / f"run {i}").resolve()) for i in range(7)]
+    assert [row["run_dir"] for row in rows] == [str((tmp_path / "results" / f"run {i}").resolve()) for i in range(4)]
     if action == "perf":
-        assert [row["mean_us"] for row in rows] == [101.25 + i for i in range(7)]
-        assert [row["rank_max_mean_us"] for row in rows] == [202.5 + i for i in range(7)]
+        assert [row["mean_us"] for row in rows] == [101.25 + i for i in range(4)]
+        assert [row["rank_max_mean_us"] for row in rows] == [202.5 + i for i in range(4)]
     else:
         assert not any("mean_us" in row for row in rows)
     output = capsys.readouterr().out
@@ -119,14 +118,14 @@ def test_partial_results_survive_failure(monkeypatch, tmp_path):
         launches.append(args)
         if len(launches) == 2:
             raise RuntimeError("second case failed")
-        return write_result(tmp_path / "results" / "first", dict(dispatch_workers=14))
+        return write_result(tmp_path / "results" / "first", dict(dispatch_workers=14, combine_sparse_scan=True))
 
     fake_launcher(monkeypatch, tmp_path, launch)
     with pytest.raises(RuntimeError, match="second case failed"):
         MODULE["main"](["perf", "--suite", "q0"])
     assert len(launches) == 2
     rows = json.loads(next((tmp_path / "results").glob("pipeline_perf_*/summary.json")).read_text())
-    assert [row["status"] for row in rows] == ["OK", "FAILED", "NOT_RUN"]
+    assert [row["status"] for row in rows] == ["OK", "FAILED"]
     assert rows[0]["rank_max_mean_us"] == 202.5
 
 
@@ -141,14 +140,24 @@ def test_existing_results_identify_cases_from_configuration(monkeypatch, tmp_pat
     )
     directory = MODULE["main"](["summary", str(sync), str(scan)])
     rows = json.loads((directory / "summary.json").read_text())
-    assert [row["case"] for row in rows] == ["q8_sync", "q0_scan"]
+    assert [row["case"] for row in rows] == ["custom", "q0_scan"]
     assert [row["rank_max_mean_us"] for row in rows] == [202.5, 150]
+    assert rows[0]["combine_sync_progress"] is True
+    assert "combine_sync_progress" in (directory / "summary.txt").read_text()
 
 
 def test_wrong_case_or_incomplete_metrics_are_rejected(tmp_path):
-    path = write_result(tmp_path / "run", dict(dispatch_workers=14))
+    path = write_result(tmp_path / "run", dict(dispatch_workers=14, combine_sparse_scan=True))
     with pytest.raises(ValueError, match="does not match"):
-        MODULE["read_result"](path, "q8_base")
+        MODULE["read_result"](path, "q8_dispatch14")
     (path / "summary.csv").unlink()
     with pytest.raises(FileNotFoundError):
-        MODULE["read_result"](path, "q0_base")
+        MODULE["read_result"](path, "q0_scan")
+
+
+@pytest.mark.parametrize("retired", ["combine_async", "combine_owner_half", "combine_sync_progress"])
+def test_retired_flags_cannot_be_relabelled_as_current_baseline(tmp_path, retired):
+    path = write_result(tmp_path / "old", dict(dispatch_workers=14, combine_sparse_scan=True, **{retired: True}))
+    assert MODULE["read_result"](path)["case"] == "custom"
+    with pytest.raises(ValueError, match="does not match"):
+        MODULE["read_result"](path, "q0_scan")

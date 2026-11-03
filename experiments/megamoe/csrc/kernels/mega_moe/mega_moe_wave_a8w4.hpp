@@ -11,7 +11,6 @@
 
 #include "common/mega_moe_utils.hpp"
 #include "mega_moe_arch35.hpp"
-#include "common/megamoe_pipeline_schedule.hpp"
 
 namespace MegaMoeImpl {
 
@@ -256,11 +255,6 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     }
 
     uint32_t rows = static_cast<uint32_t>(cursor.slice.end.globalTokenIndex - begin.globalTokenIndex);
-    // Full 256-row activation can reach the high UB reservation. Small tiles
-    // (<=128 rows) stay below 192 KiB and can overlap the independent row DMA.
-    if (rows > 128U) {
-        RetireAsyncCombineRow(params_, waveCombineScratch_, timer_);
-    }
     ExpertLoopState state = CreateExpertLoopState(commonConfig_);
     state.expertIdx = begin.expertIdx;
     state.globalTokenStartIndex = begin.globalTokenIndex - begin.tokenIndexInExpert;
@@ -322,12 +316,6 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     // mod consumer 数；同 wave 跨专家的 slice 使用同一偏移。
     // 空任务判断必须使用轮换后的 owner，否则小 batch/尾片可能被错误跳过而漏发。
     WorkRange owned = GetWaveCombineOwnedRange(combineJob, rows, begin.globalTokenIndex);
-    if (UseHierarchicalCombineReduction(params_.tilingData) && (params_.tilingData->pipelineFlags & 8U) != 0U) {
-        const auto weighted = deepep::megamoe_config::HalfOwnerCombineRange(
-            rows, waveCombineJob_.jobIndex, waveCombineJob_.totalJobs, params_.tilingData->combineReduceQps,
-            begin.globalTokenIndex, cursor.wave);
-        owned = {weighted.start, weighted.count};
-    }
     if (owned.count == 0U && !roceOwner) {
         return true;
     }
@@ -350,18 +338,13 @@ __aicore__ inline bool MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::TryRunR
     // 将就绪检查使用的同一份 job 传给实际发送，保证判定和发送的行范围一致。
     // 当前 slice 已检查就绪，模板 true 跳过发送入口内的重复等待。计数只增不减，
     // 到本次算子结束前不会重置，因此检查与发送之间无需再次轮询。
-    // timer 仍记录物理核。同步路径在返回前排空；异步路径跨调度步保留独立行状态。
-    if ((params_.tilingData->pipelineFlags & 16U) != 0U) {
-        waveCombineScratch_.asyncWave = static_cast<int64_t>(cursor.wave);
-        return ProgressAsyncCombineSlice(commonConfig_, params_, state, begin.tokenIndexInExpert, owned, timer_,
-                                         waveCombineScratch_);
-    }
+    // timer records the physical worker; each synchronous call returns with drained buffers.
     RunTokenCombineSlice<true>(commonConfig_, combineJob, params_, state, begin.tokenIndexInExpert, rows, timer_,
                                waveCombineScratch_, &owned);
     return true;
 }
 
-// 每个调度步后重新检查 SwiGLU，不阻塞等待 GMM ready；异步搬行可跨调度步存活。
+// 每个调度步后重新检查 SwiGLU，不阻塞等待 GMM ready。
 template <TemplateMegaMoeA8W4WaveTypeClass>
 __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::ProcessAiv1PriorityStages(
     int32_t& readySequence)
@@ -390,25 +373,15 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
             DispatchNextExpertSlice(dispatch, dispatchGroups, dispatchWave);
             continue;
         }
-        if (!shared.done && commonConfig_.tokenNum > 128U) {
-            RetireAsyncCombineRow(params_, waveCombineScratch_, timer_);
-        }
         if (!shared.done && TryRunSharedExpertActivation(shared)) {
             continue;
         }
-        // Experimental gating also covers shared activation. The independent
-        // remote-progress path below remains live while local Combine is gated.
         if (hasCombine && TryRunReadyCombine(combine)) {
             hasCombine = NextAivSlice(combine, false);
             this->TryProgressRemoteCombine(hasActivation || !shared.done);
             continue;
         }
         if (this->TryProgressRemoteCombine(hasActivation || !shared.done)) {
-            continue;
-        }
-        if (waveCombineScratch_.asyncInFlight) {
-            // The next visit retires one row; first give activation another
-            // readiness check. Do not insert a polling backoff after submission.
             continue;
         }
         // 没有可执行任务才退避；不能进入 Combine 的阻塞等待，否则可能挡住 GMM2 所需的 SwiGLU。

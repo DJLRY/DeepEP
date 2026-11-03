@@ -142,17 +142,12 @@ def main():
         "--reduce-lane-init", action="store_true", help="q=4/8 only: initialize only this lane's routes"
     )
     parser.add_argument(
-        "--combine-owner-half", action="store_true", help="q=4/8: give reduction owners half the local Combine share"
+        "--reduce-double-buffer", action="store_true", help="q=4/8: overlap expert row loads with FP32 reduction"
     )
     parser.add_argument(
-        "--combine-async",
+        "--combine-single-row",
         action="store_true",
-        help="q=0: issue one local Combine row and retire it on a later scheduler visit",
-    )
-    parser.add_argument(
-        "--combine-sync-progress",
-        action="store_true",
-        help="q=4/8: bounded ready-token progress while waiting for producer barriers",
+        help="q=0: use a synchronous lightweight path for single-row Combine tasks",
     )
     parser.add_argument(
         "--combine-ready-trace",
@@ -225,9 +220,8 @@ def run(args, config, group):
             args.dispatch_workers,
             args.reduce_lane_init,
             args.combine_sparse_scan,
-            args.combine_owner_half,
-            args.combine_async,
-            args.combine_sync_progress,
+            args.reduce_double_buffer,
+            args.combine_single_row,
             args.combine_ready_trace,
         ),
     )
@@ -282,9 +276,8 @@ def run(args, config, group):
         dispatch_workers=args.dispatch_workers,
         reduce_lane_init=args.reduce_lane_init,
         combine_sparse_scan=args.combine_sparse_scan,
-        combine_owner_half=args.combine_owner_half,
-        combine_async=args.combine_async,
-        combine_sync_progress=args.combine_sync_progress,
+        reduce_double_buffer=args.reduce_double_buffer,
+        combine_single_row=args.combine_single_row,
         combine_ready_trace=args.combine_ready_trace,
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
@@ -299,9 +292,8 @@ def run(args, config, group):
         dispatch_workers=args.dispatch_workers,
         reduce_lane_init=args.reduce_lane_init,
         combine_sparse_scan=args.combine_sparse_scan,
-        combine_owner_half=args.combine_owner_half,
-        combine_async=args.combine_async,
-        combine_sync_progress=args.combine_sync_progress,
+        reduce_double_buffer=args.reduce_double_buffer,
+        combine_single_row=args.combine_single_row,
         combine_ready_trace=args.combine_ready_trace,
         **model,
     )
@@ -462,9 +454,8 @@ def run(args, config, group):
                 dispatch_workers=args.dispatch_workers,
                 reduce_lane_init=args.reduce_lane_init,
                 combine_sparse_scan=args.combine_sparse_scan,
-                combine_owner_half=args.combine_owner_half,
-                combine_async=args.combine_async,
-                combine_sync_progress=args.combine_sync_progress,
+                reduce_double_buffer=args.reduce_double_buffer,
+                combine_single_row=args.combine_single_row,
                 combine_ready_trace=args.combine_ready_trace,
             )
             (case / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")

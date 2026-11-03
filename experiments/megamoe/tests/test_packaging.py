@@ -146,8 +146,10 @@ def test_stale_or_missing_beta_rejected(tmp_path, enabled, payload):
 
 
 @pytest.mark.parametrize("fault", ["missing", "json", "list", "revision", "header", "checksum"])
-def test_megamoe_build_keeps_strict_sdk_validation(tmp_path, fault):
+def test_megamoe_build_keeps_strict_sdk_validation(tmp_path, monkeypatch, fault):
     build = load(ROOT / "build_support.py")
+    # Exercise SDK validation independently of the machine running this unit test.
+    monkeypatch.setattr(build.platform, "system", lambda: "Linux")
     lock = json.loads((ROOT / "dependencies.lock.json").read_text())["shmem"]
     cann, sdk = tmp_path / "cann", tmp_path / "sdk"
     (cann / "include/acl").mkdir(parents=True)

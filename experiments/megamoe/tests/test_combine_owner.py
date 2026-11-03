@@ -77,7 +77,7 @@ def combine_owner_binary(tmp_path_factory):
     return binary
 
 
-@pytest.mark.parametrize("scenario", ["coverage", "weighted", "readiness", "scheduler", "dispatch"])
+@pytest.mark.parametrize("scenario", ["coverage", "readiness", "scheduler", "dispatch"])
 def test_combine_owner_contract(combine_owner_binary, scenario):
     result = subprocess.run([str(combine_owner_binary), scenario], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr

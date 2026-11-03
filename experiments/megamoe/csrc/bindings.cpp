@@ -15,7 +15,7 @@ namespace py = pybind11;
 PYBIND11_MODULE(_C, module)
 {
     using deepep::megamoe::Plan;
-    module.attr("api_protocol") = 9;
+    module.attr("api_protocol") = 10;
     module.attr("combine_reduce_version") = 1;
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.attr("hierarchical_max_tokens") = MegaMoeImpl::HIERARCHICAL_MAX_TOKENS;

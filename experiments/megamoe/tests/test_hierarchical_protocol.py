@@ -758,8 +758,16 @@ def test_real_kernel_entrypoints_overlap_owner_retirement_after_output_ready(hea
     # reached on empty-route calls too; it must not be guarded by sentRows.
     tail_begin = body.index("Stage::UNPERMUTE")
     tail = body[tail_begin : body.index("Stage::COMPLETE")]
-    assert "UseHierarchicalRoce(params_.tilingData)" in tail
-    assert "aivJob_.jobIndex == HierarchicalSendJob()" in tail
+    if header == "mega_moe_arch35.hpp":
+        # A8W4 supports one or multiple fixed QP owners through this predicate.
+        assert "IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)" in tail
+        owner = cpp_function_body(kernels / "common/mega_moe_peermem.hpp", "bool IsHierarchicalCombineOwner(")
+        assert "UseHierarchicalRoce(t)" in owner
+        assert "HierarchicalCombineLane(t, physicalJob) < HierarchicalCombineOwnerCount(t)" in owner
+        assert "HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex) + 1U" in tail
+    else:
+        assert "UseHierarchicalRoce(params_.tilingData)" in tail
+        assert "aivJob_.jobIndex == HierarchicalSendJob()" in tail
     assert "expectedRows" not in tail and "sentRows" not in tail
     assert "} else {" in tail[tail.index("HierarchicalSignal::TxDone") : tail.index("UnpermuteTokens<")]
     assert "SyncAll<true>()" in body[body.index("RoceWaitCommit(") : tail_begin]
