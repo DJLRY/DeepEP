@@ -288,6 +288,9 @@ def test_commands(
     reduce_double_buffer=False,
     combine_single_row=False,
     combine_ready_trace=False,
+    dispatch_skip_empty=False,
+    dispatch_lookahead=False,
+    dispatch_single_row=False,
 ):
     python = [config["python"], "-I", "-m"]
     golden_dir = str(Path(config["case_dir"]) / "golden")
@@ -358,6 +361,12 @@ def test_commands(
         benchmark.append("--combine-single-row")
     if combine_ready_trace:
         benchmark.append("--combine-ready-trace")
+    if dispatch_skip_empty:
+        benchmark.append("--dispatch-skip-empty")
+    if dispatch_lookahead:
+        benchmark.append("--dispatch-lookahead")
+    if dispatch_single_row:
+        benchmark.append("--dispatch-single-row")
     return golden, benchmark
 
 
@@ -399,7 +408,10 @@ def performance_summary(config, run_dir, bs_values=(32,)):
             f"combine_sparse_scan={report.get('combine_sparse_scan', False)}, "
             f"reduce_double_buffer={report.get('reduce_double_buffer', False)}, "
             f"combine_single_row={report.get('combine_single_row', False)}, "
-            f"combine_ready_trace={report.get('combine_ready_trace', False)}",
+            f"combine_ready_trace={report.get('combine_ready_trace', False)}, "
+            f"dispatch_skip_empty={report.get('dispatch_skip_empty', False)}, "
+            f"dispatch_lookahead={report.get('dispatch_lookahead', False)}, "
+            f"dispatch_single_row={report.get('dispatch_single_row', False)}",
             f"All-rank kernel Duration; {report['rounds']}/{report['recorded_rounds']} rounds (tail half)",
             f"Mean of per-round minimum rank: {report['mean_us']:.3f} us",
             f"Mean of per-round maximum rank: {report['rank_max_mean_us']:.3f} us",
@@ -419,6 +431,9 @@ def performance_summary(config, run_dir, bs_values=(32,)):
                 reduce_double_buffer=report.get("reduce_double_buffer", False),
                 combine_single_row=report.get("combine_single_row", False),
                 combine_ready_trace=report.get("combine_ready_trace", False),
+                dispatch_skip_empty=report.get("dispatch_skip_empty", False),
+                dispatch_lookahead=report.get("dispatch_lookahead", False),
+                dispatch_single_row=report.get("dispatch_single_row", False),
                 rounds=report["rounds"],
                 recorded_rounds=report["recorded_rounds"],
                 mean_us=report["mean_us"],
@@ -489,6 +504,9 @@ def dispatch(
     reduce_double_buffer=False,
     combine_single_row=False,
     combine_ready_trace=False,
+    dispatch_skip_empty=False,
+    dispatch_lookahead=False,
+    dispatch_single_row=False,
     print_text=True,
 ):
     if extra_bs and action != "perf":
@@ -502,6 +520,9 @@ def dispatch(
         or reduce_double_buffer
         or combine_single_row
         or combine_ready_trace
+        or dispatch_skip_empty
+        or dispatch_lookahead
+        or dispatch_single_row
     ) and action not in (
         "run",
         "perf",
@@ -578,6 +599,9 @@ def dispatch(
                 reduce_double_buffer=reduce_double_buffer,
                 combine_single_row=combine_single_row,
                 combine_ready_trace=combine_ready_trace,
+                dispatch_skip_empty=dispatch_skip_empty,
+                dispatch_lookahead=dispatch_lookahead,
+                dispatch_single_row=dispatch_single_row,
                 bs_values=case["bs_values"],
             ),
             indent=2,
@@ -606,6 +630,9 @@ def dispatch(
                 reduce_double_buffer=reduce_double_buffer,
                 combine_single_row=combine_single_row,
                 combine_ready_trace=combine_ready_trace,
+                dispatch_skip_empty=dispatch_skip_empty,
+                dispatch_lookahead=dispatch_lookahead,
+                dispatch_single_row=dispatch_single_row,
             )
             print(f"[PERF] EP32 BS={bs} output={case_dir}", flush=True)
             execute(benchmark, env, case_dir / "console.log")
@@ -625,6 +652,9 @@ def dispatch(
         reduce_double_buffer=reduce_double_buffer,
         combine_single_row=combine_single_row,
         combine_ready_trace=combine_ready_trace,
+        dispatch_skip_empty=dispatch_skip_empty,
+        dispatch_lookahead=dispatch_lookahead,
+        dispatch_single_row=dispatch_single_row,
     )
     if not sampling:
         execute(golden, env, run_dir / "golden.log")
@@ -705,6 +735,19 @@ def main(argv=None, *, print_text=True):
         help="q=0: use a synchronous lightweight path for single-row Combine tasks",
     )
     parser.add_argument(
+        "--dispatch-skip-empty",
+        action="store_true",
+        help="Skip prefix reload on Dispatch workers with no assigned rows",
+    )
+    parser.add_argument(
+        "--dispatch-lookahead",
+        action="store_true",
+        help="Let one ready completed-wave Combine precede future-wave Dispatch",
+    )
+    parser.add_argument(
+        "--dispatch-single-row", action="store_true", help="Yield after each assigned Dispatch row for BS <= 256"
+    )
+    parser.add_argument(
         "--combine-ready-trace",
         action="store_true",
         help="q=4/8: record readiness snapshots and synchronization boundaries (timer builds)",
@@ -766,6 +809,9 @@ def main(argv=None, *, print_text=True):
         or args.reduce_double_buffer
         or args.combine_single_row
         or args.combine_ready_trace
+        or args.dispatch_skip_empty
+        or args.dispatch_lookahead
+        or args.dispatch_single_row
     ) and args.action not in (
         "run",
         "perf",
@@ -822,6 +868,12 @@ def main(argv=None, *, print_text=True):
         options["combine_single_row"] = True
     if args.combine_ready_trace:
         options["combine_ready_trace"] = True
+    if args.dispatch_skip_empty:
+        options["dispatch_skip_empty"] = True
+    if args.dispatch_lookahead:
+        options["dispatch_lookahead"] = True
+    if args.dispatch_single_row:
+        options["dispatch_single_row"] = True
     if args.extra_bs:
         options["extra_bs"] = True
     if args.timer:

@@ -88,6 +88,9 @@ class SymmBuffer:
         reduce_double_buffer: bool = False,
         combine_single_row: bool = False,
         combine_ready_trace: bool = False,
+        dispatch_skip_empty: bool = False,
+        dispatch_lookahead: bool = False,
+        dispatch_single_row: bool = False,
     ):
         import torch
         import torch.distributed as dist
@@ -116,6 +119,9 @@ class SymmBuffer:
                     reduce_double_buffer,
                     combine_single_row,
                     combine_ready_trace,
+                    dispatch_skip_empty,
+                    dispatch_lookahead,
+                    dispatch_single_row,
                 )
             ):
                 raise TypeError("Pipeline switches must be bool")
@@ -130,6 +136,9 @@ class SymmBuffer:
                 or reduce_double_buffer
                 or combine_single_row
                 or combine_ready_trace
+                or dispatch_skip_empty
+                or dispatch_lookahead
+                or dispatch_single_row
             ) and (size != 32 or ranks_per_node != 16 or mma_type != "fp8xfp4"):
                 raise ValueError("Pipeline experiments require EP32, ranks_per_node=16 and FP8xFP4")
             if reduce_lane_init and not combine_reduce_qps:
@@ -174,6 +183,9 @@ class SymmBuffer:
             reduce_double_buffer,
             combine_single_row,
             combine_ready_trace,
+            dispatch_skip_empty,
+            dispatch_lookahead,
+            dispatch_single_row,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
@@ -197,6 +209,9 @@ class SymmBuffer:
         self.reduce_double_buffer = reduce_double_buffer
         self.combine_single_row = combine_single_row
         self.combine_ready_trace = combine_ready_trace
+        self.dispatch_skip_empty = dispatch_skip_empty
+        self.dispatch_lookahead = dispatch_lookahead
+        self.dispatch_single_row = dispatch_single_row
         self._hierarchical_roce = ranks_per_node == 16 and size > 16
         self._sequence = 0
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
@@ -265,7 +280,10 @@ class SymmBuffer:
             | (int(self.combine_sparse_scan) << 2)
             | (int(self.reduce_double_buffer) << 8)
             | (int(self.combine_single_row) << 7)
-            | (int(self.combine_ready_trace) << 6),
+            | (int(self.combine_ready_trace) << 6)
+            | (int(self.dispatch_skip_empty) << 9)
+            | (int(self.dispatch_lookahead) << 10)
+            | (int(self.dispatch_single_row) << 11),
             self.dispatch_workers,
         )
         self._plan_bs = bs

@@ -218,7 +218,8 @@ struct MegaMoeTilingData {
     // Independent runtime experiments; zero preserves the existing scheduler.
     uint32_t dispatchWorkers;  // 0: all AIV1 workers; otherwise a rotating subset per expert.
     // Bits: 1 lane init, 2 sparse scan, 6 ready/boundary diagnostics,
-    // 7 synchronous single-row Combine, 8 double-buffered reduction inputs.
+    // 7 synchronous single-row Combine, 8 double-buffered reduction inputs,
+    // 9 skip empty Dispatch, 10 bounded Dispatch lookahead, 11 single-row Dispatch.
     uint32_t pipelineFlags;
 };
 #endif

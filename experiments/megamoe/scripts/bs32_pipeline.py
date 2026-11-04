@@ -31,13 +31,29 @@ CASES = {
         "--reduce-double-buffer",
     ),
 }
-INDEPENDENT_CASES = tuple(CASES)
+INDEPENDENT_CASES = []
+for prefix, baseline in (("q0", "q0_scan"), ("q8", "q8_double_buffer")):
+    INDEPENDENT_CASES.append(baseline)
+    for suffix, switch in (("skip", "skip-empty"), ("lookahead", "lookahead"), ("row", "single-row")):
+        name = f"{prefix}_dispatch_{suffix}"
+        CASES[name] = (*CASES[baseline], "--dispatch-" + switch)
+        INDEPENDENT_CASES.append(name)
+    CASES[f"{prefix}_dispatch_all"] = (
+        *CASES[baseline],
+        "--dispatch-skip-empty",
+        "--dispatch-lookahead",
+        "--dispatch-single-row",
+    )
+INDEPENDENT_CASES = tuple(INDEPENDENT_CASES)
 SWITCHES = {
     "reduce_lane_init": "lane",
     "combine_sparse_scan": "scan",
     "combine_single_row": "single_row",
     "reduce_double_buffer": "double_buffer",
     "combine_ready_trace": "ready_trace",
+    "dispatch_skip_empty": "skip",
+    "dispatch_lookahead": "lookahead",
+    "dispatch_single_row": "row",
 }
 
 
@@ -51,7 +67,7 @@ def settings(options):
         **{
             key: value
             for key, value in options.items()
-            if key not in SWITCHES and key.startswith(("combine_", "reduce_")) and value is True
+            if key not in SWITCHES and key.startswith(("combine_", "reduce_", "dispatch_")) and value is True
         },
     }
 
@@ -109,7 +125,7 @@ def save_summary(directory, rows, *, display=False):
         labels.extend(
             key
             for key, value in row.items()
-            if key not in SWITCHES and key.startswith(("combine_", "reduce_")) and value is True
+            if key not in SWITCHES and key.startswith(("combine_", "reduce_", "dispatch_")) and value is True
         )
         flags = "+".join(labels) or "-"
         low = f"{row['mean_us']:.3f}" if "mean_us" in row else "-"

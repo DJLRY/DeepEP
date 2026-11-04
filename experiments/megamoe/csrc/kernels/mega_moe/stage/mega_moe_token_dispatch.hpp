@@ -496,7 +496,8 @@ template <typename ActivationType, typename QuantScaleType, uint32_t PipelineTil
 __aicore__ inline void DispatchTokenRange(const TokenDispatchConfig& context, const MoeStageCommonConfig& common,
                                           const BlockJobContext& blockJob, const MoeSyncWorkspaceLayout& syncLayout,
                                           const Params& params, GM_ADDR* winRankAddr,
-                                          TokenDispatchScratch<ActivationType>& scratch, const ExpertTokenRange& range)
+                                          TokenDispatchScratch<ActivationType>& scratch, const ExpertTokenRange& range,
+                                          const WorkRange* assigned = nullptr)
 {
     if constexpr (g_coreType == AIC) {
         return;
@@ -516,8 +517,12 @@ __aicore__ inline void DispatchTokenRange(const TokenDispatchConfig& context, co
 
     uint32_t dispatchRowCount = dispatchGlobalRowEnd - dispatchGlobalRowBegin;
     // 对整个输入范围一次连续均分；按全局起点轮转首 owner，避免余数长期集中在低编号 AIV1。
-    WorkRange ownedRange =
-        GetRotatedBalancedTokenRange(dispatchRowCount, blockJob.jobIndex, blockJob.totalJobs, dispatchGlobalRowBegin);
+    // A yielded task supplies a subrange of its original ownership. Never repartition
+    // each one-row chunk across workers: that would duplicate or omit source rows.
+    WorkRange ownedRange = assigned != nullptr
+                               ? *assigned
+                               : GetRotatedBalancedTokenRange(dispatchRowCount, blockJob.jobIndex, blockJob.totalJobs,
+                                                              dispatchGlobalRowBegin);
     if (ownedRange.count == 0U) {
         return;
     }

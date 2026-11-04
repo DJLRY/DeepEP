@@ -150,6 +150,19 @@ def main():
         help="q=0: use a synchronous lightweight path for single-row Combine tasks",
     )
     parser.add_argument(
+        "--dispatch-skip-empty",
+        action="store_true",
+        help="Skip prefix reload on Dispatch workers with no assigned rows",
+    )
+    parser.add_argument(
+        "--dispatch-lookahead",
+        action="store_true",
+        help="Let one ready completed-wave Combine precede future-wave Dispatch",
+    )
+    parser.add_argument(
+        "--dispatch-single-row", action="store_true", help="Yield after each assigned Dispatch row for BS <= 256"
+    )
+    parser.add_argument(
         "--combine-ready-trace",
         action="store_true",
         help="q=4/8: record readiness snapshots and synchronization boundaries (timer builds)",
@@ -223,6 +236,9 @@ def run(args, config, group):
             args.reduce_double_buffer,
             args.combine_single_row,
             args.combine_ready_trace,
+            args.dispatch_skip_empty,
+            args.dispatch_lookahead,
+            args.dispatch_single_row,
         ),
     )
     timer_ranks = args.timer_ranks if args.timer_ranks is not None else list(range(min(world, 8)))
@@ -279,6 +295,9 @@ def run(args, config, group):
         reduce_double_buffer=args.reduce_double_buffer,
         combine_single_row=args.combine_single_row,
         combine_ready_trace=args.combine_ready_trace,
+        dispatch_skip_empty=args.dispatch_skip_empty,
+        dispatch_lookahead=args.dispatch_lookahead,
+        dispatch_single_row=args.dispatch_single_row,
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
     )
@@ -295,6 +314,9 @@ def run(args, config, group):
         reduce_double_buffer=args.reduce_double_buffer,
         combine_single_row=args.combine_single_row,
         combine_ready_trace=args.combine_ready_trace,
+        dispatch_skip_empty=args.dispatch_skip_empty,
+        dispatch_lookahead=args.dispatch_lookahead,
+        dispatch_single_row=args.dispatch_single_row,
         **model,
     )
 
@@ -457,6 +479,9 @@ def run(args, config, group):
                 reduce_double_buffer=args.reduce_double_buffer,
                 combine_single_row=args.combine_single_row,
                 combine_ready_trace=args.combine_ready_trace,
+                dispatch_skip_empty=args.dispatch_skip_empty,
+                dispatch_lookahead=args.dispatch_lookahead,
+                dispatch_single_row=args.dispatch_single_row,
             )
             (case / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             if rank == 0:

@@ -25,6 +25,7 @@ int64_t GetSystemCycle()
 
 struct TilingData {
     bool hierarchicalRoce = true;
+    uint32_t pipelineFlags = 0U;
 };
 bool UseHierarchicalRoce(const TilingData* tiling)
 {
@@ -41,6 +42,7 @@ struct Fixture {
         uint32_t tileCount = 0;
         uint32_t sliceIndex = 0;
         uint32_t nextSlice = 0;
+        uint64_t wave = 0U;
     };
     struct SharedActivationCursor {
         bool done = false;
@@ -98,6 +100,7 @@ struct Fixture {
     std::vector<std::string> events;
     std::function<void(Fixture&, uint32_t)> afterCombine;
     std::function<void(Fixture&, uint32_t, uint32_t)> afterActivation;
+    std::function<void(Fixture&)> afterDispatch;
     std::function<bool(Fixture&)> remoteProgress;
     std::function<void(Fixture&)> onClock;
 
@@ -144,6 +147,7 @@ struct Fixture {
             }
             cursor.sliceIndex = cursor.nextSlice++;
         }
+        cursor.wave = cursor.sliceIndex / mGroupsPerWave_;
         return true;
     }
     bool TryRunReadyActivation(const AivTaskCursor& cursor, int32_t& readySequence)
@@ -181,6 +185,9 @@ struct Fixture {
         events.push_back("D" + std::to_string(position.expertIdx) + ":" + std::to_string(wave));
         ++position.expertIdx;
         ++groups;
+        if (afterDispatch) {
+            afterDispatch(*this);
+        }
     }
     bool TryRunSharedExpertActivation(SharedActivationCursor& cursor)
     {
@@ -370,6 +377,50 @@ void NonOwnersLeaveRemoteProgressToTheOwner()
     }
 }
 
+void ReadyCombineCanOvertakeFutureDispatchWithoutStarvingIt()
+{
+    Fixture f;
+    f.tiling.pipelineFlags = 1024U;
+    f.aivJob_.jobIndex = 3U;
+    f.commonConfig_.moeExpertPerRank = 6;
+    f.combineSlices = 4;
+    f.ReadyAllCombines();
+    f.Run(0);
+    f.Expect({"D0:0", "D1:0", "C0", "R:noop", "D2:1", "C1", "R:noop", "D3:1", "C2", "R:noop", "D4:2", "C3", "R:noop",
+              "D5:2"});
+}
+
+void UnreadyCombineDoesNotStopDispatch()
+{
+    Fixture f;
+    f.tiling.pipelineFlags = 1024U;
+    f.aivJob_.jobIndex = 3U;
+    f.commonConfig_.moeExpertPerRank = 4;
+    f.combineSlices = 2;
+    uint32_t dispatches = 0;
+    f.afterDispatch = [&dispatches](Fixture& fixture) {
+        if (++dispatches == 4U) {
+            fixture.ReadyAllCombines();
+        }
+    };
+    f.Run(0);
+    f.Expect({"D0:0", "D1:0", "D2:1", "D3:1", "C0", "R:noop", "C1", "R:noop"});
+}
+
+void EarlyCombineImmediatelyYieldsToNewActivation()
+{
+    Fixture f;
+    f.tiling.pipelineFlags = 1024U;
+    f.aivJob_.jobIndex = 3U;
+    f.commonConfig_.moeExpertPerRank = 4;
+    f.combineSlices = 1;
+    f.activationPlans = {{0, 1}};
+    f.ReadyAllCombines();
+    f.afterCombine = [](Fixture& fixture, uint32_t) { fixture.ReadyAllActivationTiles(); };
+    f.Run(1);
+    f.Expect({"D0:0", "D1:0", "C0", "R:noop", "A0:0", "D2:1", "D3:1"});
+}
+
 int main()
 {
     CombineReleasesMultipleTilesAndSlices();
@@ -380,4 +431,7 @@ int main()
     FallbackRemoteProgressCanReleaseActivation();
     BackoffCanReleaseActivationAndCombine();
     NonOwnersLeaveRemoteProgressToTheOwner();
+    ReadyCombineCanOvertakeFutureDispatchWithoutStarvingIt();
+    UnreadyCombineDoesNotStopDispatch();
+    EarlyCombineImmediatelyYieldsToNewActivation();
 }

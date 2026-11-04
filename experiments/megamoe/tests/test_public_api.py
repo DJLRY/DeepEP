@@ -596,6 +596,12 @@ def test_pipeline_options_reach_every_bs_plan(backend, qps, workers, lane_init, 
         dict(mma_type="fp8xfp8", dispatch_workers=14),
         dict(size=16, dispatch_workers=14),
         dict(combine_sparse_scan=1),
+        dict(dispatch_skip_empty=1),
+        dict(dispatch_lookahead="yes"),
+        dict(dispatch_single_row=None),
+        dict(size=16, dispatch_skip_empty=True),
+        dict(mma_type="fp8xfp8", dispatch_lookahead=True),
+        dict(size=16, dispatch_single_row=True),
         dict(combine_reduce_qps=8, combine_sparse_scan=True),
         dict(combine_reduce_qps=4, combine_sparse_scan=True),
         dict(mma_type="fp8xfp8", combine_sparse_scan=True),
@@ -608,7 +614,7 @@ def test_invalid_pipeline_configuration_does_not_start_runtime(backend, monkeypa
         hierarchical_buffer(backend, **options)
 
 
-@pytest.mark.parametrize("field", [11, 12, 13, 14, 15, 16])
+@pytest.mark.parametrize("field", [11, 12, 13, 14, 15, 16, 17, 18, 19])
 def test_pipeline_options_must_match_on_all_ranks(backend, monkeypatch, field):
     from deep_ep._store import StoreGroup
 
@@ -755,6 +761,10 @@ def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypa
         (8, dict(reduce_double_buffer=True, dispatch_workers=14, reduce_lane_init=True), 258),
         (4, dict(reduce_double_buffer=True, combine_ready_trace=True), 320),
         (4, dict(combine_ready_trace=True), 64),
+        (0, dict(dispatch_skip_empty=True), 512),
+        (8, dict(dispatch_lookahead=True), 1024),
+        (0, dict(dispatch_single_row=True), 2048),
+        (8, dict(dispatch_skip_empty=True, dispatch_lookahead=True, dispatch_single_row=True), 3584),
     ],
 )
 def test_tail_pipeline_options_reach_plan(backend, qps, options, flags):

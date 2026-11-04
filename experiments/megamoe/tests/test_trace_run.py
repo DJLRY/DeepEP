@@ -65,6 +65,9 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
         combine_single_row=rank == 0,
         reduce_double_buffer=rank == 16,
         combine_ready_trace=rank == 16,
+        dispatch_skip_empty=rank == 0,
+        dispatch_lookahead=rank == 16,
+        dispatch_single_row=rank == 16,
     )
     if rank == 16:
         sys.argv.extend(
@@ -76,10 +79,12 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
                 "14",
                 "--reduce-double-buffer",
                 "--combine-ready-trace",
+                "--dispatch-lookahead",
+                "--dispatch-single-row",
             ]
         )
     elif rank == 0:
-        sys.argv.extend(["--combine-sparse-scan", "--combine-single-row"])
+        sys.argv.extend(["--combine-sparse-scan", "--combine-single-row", "--dispatch-skip-empty"])
     torch = MagicMock()
     torch.npu.get_device_properties.return_value.L2_cache_size = 128
     monkeypatch.setitem(sys.modules, "torch", torch)

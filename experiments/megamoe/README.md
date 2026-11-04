@@ -378,60 +378,75 @@ bash experiments/megamoe/scripts/run_bs32.sh trace --combine-reduce-qps 0 --disp
 不等于flag DMA数或标量循环次数；末次发送完成后早退出会减少该次调用跨越的行数。
 因此不能只凭`scanned_rows`判断跳过空token的收益。端到端收益需要上机验证。
 
-#### 本轮：同步Combine单行路径与归并双缓冲
+#### 本轮：机内Dispatch调度与Combine提前消费
 
-保留14核Dispatch、QP=0扫描优化与QP=8 lane初始化；移除上一轮未见净收益的异步Combine、
-owner搬行减半和同步等待期间progress实现及开关。本轮新增开关默认关闭，分别对照：
+本轮先实施机内流水计划的前两项。三个新增开关默认关闭，QP=0与QP=8分别使用已测基线：
+QP=0保留14核Dispatch和扫描优化；QP=8保留14核Dispatch、lane初始化和归并双缓冲。
+QP=0单行Combine仍可单独实验，但不加入默认基线。下一阶段的跨任务Combine小流水与wave粒度调整尚未实施。
 
-| 用例 | 配置 | 新增开关 |
+| 用例 | 相对对应基线的新增开关 | 验证目标 |
 |---|---|---|
-| `q0_scan` | QP=0，14核Dispatch，扫描优化 | 基线 |
-| `q0_single_row` | 同上 | `--combine-single-row` |
-| `q8_dispatch14` | QP=8，14核Dispatch，lane初始化 | 基线 |
-| `q8_double_buffer` | 同上 | `--reduce-double-buffer` |
+| `q0_scan` | 无 | QP=0基线 |
+| `q0_dispatch_skip` | `--dispatch-skip-empty` | 无行worker跳过prefix恢复 |
+| `q0_dispatch_lookahead` | `--dispatch-lookahead` | 完成wave的ready Combine获得提前执行机会 |
+| `q0_dispatch_row` | `--dispatch-single-row` | 每搬完一行重新检查激活 |
+| `q8_double_buffer` | 无 | QP=8双缓冲基线 |
+| `q8_dispatch_skip` | `--dispatch-skip-empty` | 无行worker跳过prefix恢复 |
+| `q8_dispatch_lookahead` | `--dispatch-lookahead` | 完成wave的ready Combine获得提前执行机会 |
+| `q8_dispatch_row` | `--dispatch-single-row` | 每搬完一行重新检查激活 |
 
-上一轮基线的min／max分别为173.963／185.986µs和200.267／225.727µs；
-清理后的基线需重新实测，确认没有明显变化，再评估新开关收益。
-两端同步代码并完整重建wheel：Python/native协议升至10，已删除多QP生产者标记区，旧wheel会被拒绝。
-现有机器配置、Golden和SHMEM SDK可继续使用；本轮不要求重建SHMEM SDK。
+八组默认独立测试；`q0_dispatch_all`和`q8_dispatch_all`显式同时打开三个新开关，
+仅在单因素结果明确后通过`--case`选用。历史`q0_single_row`与`q8_dispatch14`仍可通过`--case`复测，
+历史结果目录继续按实际配置识别。最近基线min／max为173.674／186.566µs与190.115／213.267µs；
+应先复测本次构建的两个基线，再比较同构建的新开关。收益须上机验证。
 
-QP=0的单行路径仅在当前worker负责恰好一行时使用，其他任务沿用原行环。
-它缓存本次调用中不变的行字节数和对称窗口偏移，按需读取metadata，直接完成一次机内MTE搬运；
-数据写入完成后才发布网关ready，返回调度器前已排空。不改变RoCE发送字节数、POST次数和owner分工。
+`dispatch-skip-empty`先按完整slice、原worker映射和容量裁剪计算行归属，无行时仅推进游标，
+不恢复prefix到UB。原先14核Dispatch之外的核仍会做prefix DMA和同步，之后才在搬运入口返回。
+减少的Dispatch事件数不是等比例性能收益，尤其prefix恢复本身位于`AIV_DISPATCH`计时区间之前。
 
-QP=8的双缓冲仅作用于单个已ready token的归并内部：两个BF16输入缓冲交替使用，
-预取下一条被选中的专家行，与当前行的转换、加权、累加重叠；保持原top-k顺序和FP32乘加顺序。
-归并结果完整写入GM后才POST，QP归属、commit和quiet协议不变。
-输入缓冲区从一份增至两份，归并UB预算由10H增至12H字节，另加对齐后的top-k权重；host侧检查容量。
+`dispatch-lookahead`是有界的ready任务插队：仅当本核Dispatch已进入较新的wave，
+才让较早wave的一个已ready机内Combine先执行；随后必须推进一次Dispatch才能再次插队。
+激活仍有最高优先级，Combine未ready时立即继续Dispatch。它不等待输入来限制提前量，
+也不引入跨核屏障；代价是下一wave的Dispatch可能被一次Combine延后，因此需要检查GMM1输入等待。
+
+`dispatch-single-row`在BS<=256时，每次只搬本核原分工中的一行，排空搬运和事件后返回调度器。
+续跑保存完整slice及已搬行数，每次恢复可能被激活覆盖的prefix，不重新分配行。
+每行数据、scale与metadata完成后累加原GMM1 ready计数，累计完整tile行数后GMM1才能消费。
+最后一行完成才推进专家/wave游标。BS>256沿用原整段路径；多一次prefix恢复、通知和调度可能抵消收益。
+
+RoCE头尾协议、QP归属、commit/quiet以及归并算法保持当前实现。每次成功Combine之后仍调用原远端progress；
+调度时机变化可能间接改变progress和POST发生的时刻，本轮没有新增POST合并策略。
+两台同步本次源码并完整重建wheel，复用现有机器配置、Golden与SHMEM SDK；不需要重建SHMEM SDK。
+新开关使用现有pipelineFlags中的新位，Python/native协议保持10，内存布局不变；旧native会拒绝未知位。
 
 两端在仓库根目录执行同一组命令。脚本逐项串行执行，出错立即停止；每项打印`[CASE]`和完整命令，
 配置写入结果目录的`run.json`及rank manifest。先通过全部精度检查，再测性能：
 
 ```bash
-# 两端构建timer OFF；四组各验证一次精度，然后各测一次性能
+# 两端构建timer OFF；八组各验证一次精度，然后各测一次性能
 bash experiments/megamoe/scripts/run_bs32.sh build --errors-only
 bash experiments/megamoe/scripts/run_bs32_pipeline.sh run
 bash experiments/megamoe/scripts/run_bs32_pipeline.sh perf
 
-# 两端重建timer ON，采集同样四组
+# 两端重建timer ON，采集同样八组
 bash experiments/megamoe/scripts/run_bs32.sh build --timer --errors-only
 bash experiments/megamoe/scripts/run_bs32_pipeline.sh trace
 ```
 
 `perf`默认warmup 20、iters 100；`trace`默认warmup 20、iters 30，保留WAIT并采rank 0/14/16/30。
-两组8QP trace均加`--combine-ready-trace`，以相同诊断开销对照。
+所有8QP trace均加`--combine-ready-trace`，以相同诊断开销对照。
 只跑一条路线可加`--suite q0`或`--suite q8`；单项用`--case q0_scan`、`--case q8_double_buffer`等。
 执行前可加`--dry-run`查看命令；支持`--config`、性能/trace的`--warmup`与`--iters`。
 同一构建支持全部开关，不需要逐项重编译；仅在timer OFF性能和timer ON trace之间重建。
 
-`trace`默认自动打印可复制的TXT分段。矩阵脚本等待本机四组完成后，按用例名将全部本地rank的CSV与配置
+`trace`默认自动打印可复制的TXT分段。矩阵脚本等待本机八组完成后，按用例名将全部本地rank的CSV与配置
 一起无损压缩，再统一分段；不会逐组重复打印。两台分别输出自己的集合，每段以`[TEXT PART i/N]`标识，
 复制其后完整的`BEGIN MEGAMOE TRACE TEXT V1`至`END MEGAMOE TRACE TEXT V1`即可，一次复制一段。
 每段正文连同头尾与CRLF换行最多65535字节；采用LZMA加强压缩并按完整块大小填充分段，减少part数。
 实际数量取决于trace大小，不过滤WAIT、空闲核、原始周期或任务metadata。
 分段文件保存在打印出的`[TEXT] output=...`目录，完整终端导出内容也保存为矩阵目录的`trace_text.log`。
-直接运行`run_bs32.sh trace`时，只导出并打印该次采集。恢复集合后，四组分别位于`captures/<用例名>/`。
-这是脚本改动；已有timer ON构建可直接采集，无需为文本导出重编wheel。
+直接运行`run_bs32.sh trace`时，只导出并打印该次采集。恢复集合后，各组分别位于`captures/<用例名>/`。
+文本导出本身无需额外重编；本轮内核改动仍需按上面的命令完整构建。
 
 
 每轮结束集中打印`BEGIN MEGAMOE PIPELINE SUMMARY`到`END MEGAMOE PIPELINE SUMMARY`，可直接复制回传。
@@ -441,7 +456,7 @@ bash experiments/megamoe/scripts/run_bs32_pipeline.sh trace
 汇总保存在`<case_dir>/pipeline_<action>_node_<节点>_<随机字符>/summary.txt`，同时保存CSV和JSON。
 每完成一项即更新文件，中途失败也会输出汇总；失败项标为`FAILED`，后续项标为`NOT_RUN`。
 
-已有性能结果无需重跑：把四个`[RUN]`结果目录交给`summary`，脚本读取各自的`run.json`和`summary.csv`，
+已有性能结果无需重跑：把各个`[RUN]`结果目录交给`summary`，脚本读取各自的`run.json`和`summary.csv`，
 不按输入顺序猜测配置。每台机器分别汇总自己的目录：
 
 ```bash
@@ -449,19 +464,21 @@ bash experiments/megamoe/scripts/run_bs32_pipeline.sh summary \
   /path/to/perf_node_0_first /path/to/perf_node_0_second
 ```
 
-历史目录仍可汇总；带已移除策略的配置标为`custom`并显示原开关，不归入当前四组。
+历史目录仍可汇总；带已移除策略的配置标为`custom`并显示原开关，不归入当前用例。
 
 验收重点：
 
-- QP=0：单次`AIV_COMBINE`耗时、末次机内Combine、激活等待、末次payload POST及timer OFF的`max_us`。
-- QP=8：每token的`AIV_COMBINE_REDUCE`耗时、owner末次归并、末次POST、commit等待及timer OFF的`max_us`。
-- 两条路线均检查精度和缓冲区复用；基线有明显变化时先排查清理影响，不能直接归因于新开关。
+- 两条路线均比较首次机内Dispatch到末次机内Combine的跨度，以及timer OFF全32 rank的`max_us`。
+- 检查GMM1 tile结束到对应激活开始、专家GMM2输出完成到机内Combine开始的间隔，
+  同时看AIC等待Dispatch/激活与GMM2结束后的Combine积压；事件结束只作为就绪时刻的近似。
+- QP=8分别观察owner和其他AIV1的积压，避免把网关工作竞争与普通搬运耗时混为一谈。
+- 检查精度、行分配和缓冲区复用；重复交错运行基线与修改组，避免用启动抖动解释中间阶段的收益。
 
 `AIV_COMBINE_READY`是轮询观察到的pending/ready mask，不是硬件精确到达时刻；
 `AIV_COMBINE_SYNC`标记Export与host barrier前后，配合`AIV_COMBINE_PROGRESS`定位同步尾部。
 旧`AIV_COMBINE_ASYNC`事件编号仅保留用于历史trace解码，当前内核不再生成该事件。
 诊断会增加timer ON开销，不能将扫描、同步和重叠时间相加作为收益。
-小批完成通知和连续结果POST合并留待本轮实测后单独验证；Wave大小和增加QP暂不调整。
+本轮之后再根据结果推进机内Combine小流水与wave粒度实验；RoCE头尾优化暂时搁置。
 本地CPU回归不代替CANN编译、NPU精度和性能实测。
 
 #### BS32：Dispatch 单次完成通知，双机 A/B（历史实验）

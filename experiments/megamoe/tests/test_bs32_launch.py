@@ -192,6 +192,14 @@ def test_stage_separation_and_fixed_case(saved, monkeypatch, action, expected):
     "qps,flags,expected",
     [
         (0, ["--combine-single-row"], dict(combine_single_row=True)),
+        (0, ["--dispatch-skip-empty"], dict(dispatch_skip_empty=True)),
+        (8, ["--dispatch-lookahead"], dict(dispatch_lookahead=True)),
+        (0, ["--dispatch-single-row"], dict(dispatch_single_row=True)),
+        (
+            8,
+            ["--dispatch-skip-empty", "--dispatch-lookahead", "--dispatch-single-row"],
+            dict(dispatch_skip_empty=True, dispatch_lookahead=True, dispatch_single_row=True),
+        ),
         (8, ["--dispatch-workers", "14", "--reduce-lane-init"], dict(dispatch_workers=14, reduce_lane_init=True)),
         (8, ["--reduce-double-buffer"], dict(reduce_double_buffer=True)),
         (
