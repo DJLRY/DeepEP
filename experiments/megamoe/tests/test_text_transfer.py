@@ -6,6 +6,7 @@
 import csv
 import io
 import json
+import lzma
 from pathlib import Path
 import random
 import subprocess
@@ -362,3 +363,99 @@ def test_export_prints_single_capture_parts(capture, tmp_path):
     )
     status, payload = transfer.parse_parts([result.stdout])
     assert status["missing"] == [] and payload is not None
+
+
+@pytest.mark.parametrize("line_ending", ["\n", "\r\n"])
+def test_compact_cycles_and_derived_durations_are_byte_exact(line_ending):
+    rows = list(csv.reader(io.StringIO(csv_bytes(9_000_000_000_000).decode(), newline="")))
+    cycles, durations = transfer.csv_columns(rows[0])
+    for row in rows[1:]:
+        for i, start, end in durations:
+            row[i] = transfer.duration_text(row, start, end)
+    # Preserve a noncanonical duration spelling rather than rounding it away.
+    rows[1][durations[0][0]] = "0.500000"
+    text = transfer.write_csv(rows, line_ending)
+    packed = transfer.compact_csv(text)
+    assert packed is not None and packed["text"] != text
+    assert transfer.expand_csv(packed) == text
+    # Delta zero (equal timestamps) must be distinct from an absent timestamp.
+    for i in cycles:
+        rows[1][i] = "9000000000001"
+    text = transfer.write_csv(rows, line_ending)
+    assert transfer.expand_csv(transfer.compact_csv(text)) == text
+
+
+@pytest.mark.parametrize("change", ["quoted", "leading_zero", "empty_duration", "no_final_newline"])
+def test_noncanonical_csv_falls_back_to_original_bytes(capture, change):
+    bundle = transfer.collect_bundle(capture[0])
+    record = bundle["files"][0]
+    rows = list(csv.reader(io.StringIO(record["text"], newline="")))
+    cycles, durations = transfer.csv_columns(rows[0])
+    if change == "leading_zero":
+        rows[1][cycles[0]] = "0" + rows[1][cycles[0]]
+    elif change == "empty_duration":
+        rows[1][durations[0][0]] = ""
+    stream = io.StringIO(newline="")
+    csv.writer(stream, quoting=csv.QUOTE_ALL if change == "quoted" else csv.QUOTE_MINIMAL).writerows(rows)
+    text = stream.getvalue().rstrip("\r\n") if change == "no_final_newline" else stream.getvalue()
+    assert transfer.compact_csv(text) is None
+    record.update(text=text, bytes=len(text.encode()), sha256=transfer.digest(text.encode()))
+    _, _, parts = transfer.make_parts(bundle)
+    restored, _ = transfer.unpack_bundle(transfer.parse_parts(parts)[1])
+    assert restored == bundle
+
+
+def test_old_and_compact_payloads_restore_identically(capture):
+    bundle = transfer.collect_bundle(capture[0])
+    original = lzma.compress(transfer.json_bytes(bundle), preset=6 | lzma.PRESET_EXTREME)
+    compact = transfer.compact_bundle(bundle)
+    assert "csv_delta" in compact["bundle"]["files"][0]
+    candidate = lzma.compress(transfer.json_bytes(compact), preset=6 | lzma.PRESET_EXTREME)
+    _, size, parts = transfer.make_parts(bundle)
+    assert size == min(len(original), len(candidate))
+    for payload in (original, candidate, transfer.parse_parts(parts)[1]):
+        restored, files = transfer.unpack_bundle(payload)
+        assert restored == bundle
+        assert files[bundle["files"][0]["name"]] == bundle["files"][0]["text"].encode()
+    compact["bundle"]["files"][0]["csv_delta"]["base"] += 1
+    with pytest.raises(ValueError, match="File size/SHA-256 mismatch"):
+        transfer.unpack_bundle(lzma.compress(transfer.json_bytes(compact)))
+
+
+def test_export_existing_pipeline_q0_only_without_rerunning(capture, tmp_path):
+    pipeline = tmp_path / "pipeline"
+    pipeline.mkdir()
+    rows = [
+        dict(case=case, status=status, action="trace", node=0, run_dir=str(capture[0]))
+        for case, status in [("q0_scan", "OK"), ("q0_dispatch_skip", "OK"), ("q8_double_buffer", "FAILED")]
+    ]
+    (pipeline / "summary.json").write_text(json.dumps(rows))
+    with pytest.raises(ValueError, match="completed trace"):
+        transfer.collect_pipeline(pipeline)
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            "-X",
+            "utf8",
+            str(SCRIPT),
+            "export-pipeline",
+            str(pipeline),
+            "--suite",
+            "q0",
+            "--print-parts",
+        ],
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    bundle, _ = transfer.unpack_bundle(transfer.parse_parts([result.stdout])[1])
+    assert [capture["name"] for capture in bundle["captures"]] == ["q0_scan", "q0_dispatch_skip"]
+    assert all(capture["bundle"]["ranks"] == [0, 16] for capture in bundle["captures"])
+    rows[0]["status"] = "FAILED"
+    (pipeline / "summary.json").write_text(json.dumps(rows))
+    with pytest.raises(ValueError, match="completed trace"):
+        transfer.collect_pipeline(pipeline, "q0")
+    (pipeline / "summary.json").write_text(json.dumps(rows[2:]))
+    with pytest.raises(ValueError, match="completed trace"):
+        transfer.collect_pipeline(pipeline, "q0")

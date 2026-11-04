@@ -21,6 +21,7 @@ from .parse_timer_csv import core_info
 
 FORMAT = "megamoe_trace_text_v1"
 COLLECTION_FORMAT = "megamoe_trace_collection_v1"
+COMPACT_FORMAT = "megamoe_trace_compact_v1"
 BEGIN = "-----BEGIN MEGAMOE TRACE TEXT V1-----"
 END = "-----END MEGAMOE TRACE TEXT V1-----"
 DEFAULT_MAX_BYTES = 60000
@@ -189,6 +190,132 @@ def text_sizes(text):
     return len(text.encode("ascii")), len(text.replace("\n", "\r\n").encode("ascii"))
 
 
+def csv_columns(fields):
+    cycles = [i for i, field in enumerate(fields) if field.endswith("_cycle")]
+    positions = {field: i for i, field in enumerate(fields)}
+    durations = [
+        (
+            i,
+            positions[field.removesuffix("_duration(us)") + "_start_cycle"],
+            positions[field.removesuffix("_duration(us)") + "_end_cycle"],
+        )
+        for i, field in enumerate(fields)
+        if field.endswith("_duration(us)")
+    ]
+    return cycles, durations
+
+
+def duration_text(row, start, end):
+    start, end = int(row[start]), int(row[end])
+    return f"{(end - start) / protocol.CYCLE_TO_US if end > start else 0.0:.3f}"
+
+
+def write_csv(rows, line_ending):
+    stream = io.StringIO(newline="")
+    csv.writer(stream, lineterminator=line_ending).writerows(rows)
+    return stream.getvalue()
+
+
+def compact_csv(text):
+    """Encode cycles as deltas and omit only exactly reconstructible durations.
+
+    Noncanonical CSV dialects and numeric spellings stay as original text. The
+    full byte comparison also protects quoting, line endings and future fields.
+    """
+    rows = list(csv.reader(io.StringIO(text, newline=""), strict=True))
+    if len(rows) != protocol.N_CORE_COUNT + 1 or any(len(row) != len(rows[0]) for row in rows):
+        return None
+    line_ending = "\r\n" if text.endswith("\r\n") else "\n"
+    if write_csv(rows, line_ending) != text:
+        return None
+    try:
+        cycles, durations = csv_columns(rows[0])
+    except KeyError:
+        return None
+    if not cycles or any(str(int(row[i])) != row[i] for row in rows[1:] for i in cycles):
+        return None
+    # Empty duration cells are reserved for the derived value in this codec.
+    if any(not row[i] for row in rows[1:] for i, _, _ in durations):
+        return None
+    base = min((int(row[i]) for row in rows[1:] for i in cycles if int(row[i])), default=0)
+    for row in rows[1:]:
+        for i, start, end in durations:
+            if row[i] == duration_text(row, start, end):
+                row[i] = ""
+        previous = base
+        for i in cycles:
+            value = int(row[i])
+            row[i] = str(value - previous) if value else ""
+            if value:
+                previous = value
+    packed = dict(base=base, line_ending=line_ending, text=write_csv(rows, line_ending))
+    return packed if expand_csv(packed) == text else None
+
+
+def expand_csv(packed):
+    if packed["line_ending"] not in ("\n", "\r\n") or type(packed["base"]) is not int:
+        raise ValueError("Invalid compact CSV layout")
+    rows = list(csv.reader(io.StringIO(packed["text"], newline=""), strict=True))
+    if len(rows) != protocol.N_CORE_COUNT + 1 or any(len(row) != len(rows[0]) for row in rows):
+        raise ValueError("Invalid compact CSV dimensions")
+    cycles, durations = csv_columns(rows[0])
+    for row in rows[1:]:
+        previous = packed["base"]
+        for i in cycles:
+            if row[i]:
+                previous += int(row[i])
+                row[i] = str(previous)
+            else:
+                row[i] = "0"
+        for i, start, end in durations:
+            if not row[i]:
+                row[i] = duration_text(row, start, end)
+    return write_csv(rows, packed["line_ending"])
+
+
+def map_bundle_files(bundle, transform):
+    if bundle.get("format") == COLLECTION_FORMAT:
+        return dict(
+            bundle,
+            captures=[
+                dict(capture, bundle=map_bundle_files(capture["bundle"], transform)) for capture in bundle["captures"]
+            ],
+        )
+    return dict(bundle, files=[transform(record) for record in bundle["files"]])
+
+
+def compact_bundle(bundle):
+    def pack(record):
+        if record["name"].startswith("timer/") and CSV_NAME.fullmatch(record["name"][6:]):
+            packed = compact_csv(record["text"])
+            if packed is not None:
+                return {**{key: value for key, value in record.items() if key != "text"}, "csv_delta": packed}
+        return record
+
+    return dict(format=COMPACT_FORMAT, bundle=map_bundle_files(bundle, pack))
+
+
+def expand_bundle(bundle):
+    remaining = MAX_BUNDLE_BYTES
+
+    def unpack(record):
+        nonlocal remaining
+        if type(record["bytes"]) is not int or not 0 <= record["bytes"] <= remaining:
+            raise ValueError("Invalid or oversized restored file")
+        remaining -= record["bytes"]
+        if "csv_delta" in record:
+            if "text" in record:
+                raise ValueError("Ambiguous compact CSV encoding")
+            text = expand_csv(record["csv_delta"])
+            data = text.encode("utf-8")
+            if len(data) != record["bytes"] or digest(data) != record["sha256"]:
+                raise ValueError(f"File size/SHA-256 mismatch: {record['name']}")
+            return {**{key: value for key, value in record.items() if key != "csv_delta"}, "text": text}
+        return record
+
+    return map_bundle_files(bundle, unpack)
+
+
 def make_parts(bundle, max_bytes=DEFAULT_MAX_BYTES):
     if not 1024 <= max_bytes <= CLIPBOARD_LIMIT:
         raise ValueError("--max-bytes must be between 1024 and 65535, including headers and CRLF")
@@ -196,6 +323,11 @@ def make_parts(bundle, max_bytes=DEFAULT_MAX_BYTES):
     if len(raw) > MAX_BUNDLE_BYTES:
         raise ValueError("Unpacked transfer exceeds 512 MiB; export fewer ranks per bundle")
     compressed = lzma.compress(raw, preset=6 | lzma.PRESET_EXTREME)
+    compact = json_bytes(compact_bundle(bundle)) if "files" in bundle or "captures" in bundle else raw
+    if compact != raw and len(compact) <= MAX_BUNDLE_BYTES:
+        candidate = lzma.compress(compact, preset=6 | lzma.PRESET_EXTREME)
+        if len(candidate) < len(compressed):
+            compressed = candidate
     if len(compressed) > MAX_BUNDLE_BYTES:
         raise ValueError("Compressed transfer exceeds 512 MiB; export fewer ranks per bundle")
     bundle_hash = digest(compressed)
@@ -227,8 +359,12 @@ def export_text(source, output=None, *, ranks=None, attachments=(), label=None, 
     return export_bundle(bundle, output, find_timer_directory(source), max_bytes)
 
 
-def collect_pipeline(source):
+def collect_pipeline(source, suite="all"):
     rows = json.loads((Path(source) / "summary.json").read_text(encoding="utf-8"))
+    if suite not in ("all", "q0", "q8"):
+        raise ValueError("Unknown pipeline suite")
+    if suite != "all":
+        rows = [row for row in rows if row["case"].startswith(suite + "_")]
     if not rows or any(row["status"] != "OK" or row["action"] != "trace" for row in rows):
         raise ValueError("Pipeline export requires completed trace cases")
     if len({row["node"] for row in rows}) != 1:
@@ -365,7 +501,10 @@ def unpack_bundle(compressed):
     raw = decoder.decompress(compressed, max_length=MAX_BUNDLE_BYTES + 1)
     if len(raw) > MAX_BUNDLE_BYTES or not decoder.eof or decoder.unused_data:
         raise ValueError("Invalid or oversized compressed bundle")
-    return validate_bundle(json.loads(raw))
+    bundle = json.loads(raw)
+    if bundle.get("format") == COMPACT_FORMAT:
+        bundle = expand_bundle(bundle["bundle"])
+    return validate_bundle(bundle)
 
 
 def validate_bundle(bundle):
@@ -486,6 +625,12 @@ def main(argv=None):
     pipeline = commands.add_parser("export-pipeline", help="Compress all completed cases from one pipeline together")
     pipeline.add_argument("source", type=Path)
     pipeline.add_argument("--output-dir", type=Path)
+    pipeline.add_argument(
+        "--suite",
+        choices=("all", "q0", "q8"),
+        default="all",
+        help="Export only the selected cases without rerunning experiments",
+    )
     pipeline.add_argument("--max-bytes", type=int, default=CLIPBOARD_LIMIT)
     pipeline.add_argument("--print-parts", action="store_true")
     show = commands.add_parser("show", help="Print exactly one block, with no other stdout")
@@ -502,7 +647,7 @@ def main(argv=None):
         if args.command in ("export", "export-pipeline"):
             if args.command == "export-pipeline":
                 output, index = export_bundle(
-                    collect_pipeline(args.source), args.output_dir, args.source, args.max_bytes
+                    collect_pipeline(args.source, args.suite), args.output_dir, args.source, args.max_bytes
                 )
             else:
                 output, index = export_text(

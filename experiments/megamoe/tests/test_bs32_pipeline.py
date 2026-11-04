@@ -32,7 +32,10 @@ def test_independent_cases_only_change_one_factor():
 def test_matrix_uses_matching_q8_diagnostics_only_for_trace(action, capsys):
     MODULE["main"]([action, "--dry-run", "--config", "/tmp/host settings.json"])
     output = capsys.readouterr().out
-    assert output.count("[CASE]") == 8 and "q0_all" not in output and "q8_all" not in output
+    assert output.count("[CASE]") == (4 if action == "trace" else 8)
+    assert "q0_all" not in output and "q8_all" not in output
+    if action == "trace":
+        assert "q8_" not in output
     for name in MODULE["INDEPENDENT_CASES"]:
         args = MODULE["case_arguments"](action, name)
         assert ("--combine-ready-trace" in args) == (action == "trace" and name.startswith("q8_"))
@@ -105,9 +108,12 @@ def test_matrix_summarizes_exact_returned_directories(monkeypatch, tmp_path, cap
     fake_launcher(monkeypatch, tmp_path, launch)
     directory = MODULE["main"]([action])
     rows = json.loads((directory / "summary.json").read_text())
-    assert [row["case"] for row in rows] == list(MODULE["INDEPENDENT_CASES"])
+    selected = [name for name in MODULE["INDEPENDENT_CASES"] if action != "trace" or name.startswith("q0_")]
+    assert [row["case"] for row in rows] == selected
     assert all(row["status"] == "OK" for row in rows)
-    assert [row["run_dir"] for row in rows] == [str((tmp_path / "results" / f"run {i}").resolve()) for i in range(8)]
+    assert [row["run_dir"] for row in rows] == [
+        str((tmp_path / "results" / f"run {i}").resolve()) for i in range(len(selected))
+    ]
     if action == "perf":
         assert [row["mean_us"] for row in rows] == [101.25 + i for i in range(8)]
         assert [row["rank_max_mean_us"] for row in rows] == [202.5 + i for i in range(8)]
@@ -175,17 +181,18 @@ def test_retired_flags_cannot_be_relabelled_as_current_baseline(tmp_path, retire
 
 def test_trace_prints_one_collection_after_all_cases(monkeypatch, tmp_path):
     calls = []
+    selected = [name for name in MODULE["INDEPENDENT_CASES"] if name.startswith("q0_")]
     config = tmp_path / "host.json"
     config.write_text(json.dumps(dict(case_dir=str(tmp_path / "results"), node_rank=0)))
 
     def launch(args, *, print_text=True):
         assert print_text is False
-        name = MODULE["INDEPENDENT_CASES"][len(calls)]
+        name = selected[len(calls)]
         calls.append(name)
         return write_result(tmp_path / name, MODULE["expected_settings"](name, "trace"), action="trace")
 
     def show(directory, config, *, pipeline):
-        assert pipeline and calls == list(MODULE["INDEPENDENT_CASES"])
+        assert pipeline and calls == selected
         assert all(row["status"] == "OK" for row in json.loads((directory / "summary.json").read_text()))
         calls.append("printed")
 
@@ -196,3 +203,11 @@ def test_trace_prints_one_collection_after_all_cases(monkeypatch, tmp_path):
     )
     MODULE["main"](["trace"])
     assert calls[-1] == "printed"
+
+
+@pytest.mark.parametrize("suite,count", [("q0", 4), ("q8", 4), ("all", 8)])
+def test_trace_explicit_suite_overrides_q0_default(suite, count, capsys):
+    MODULE["main"](["trace", "--suite", suite, "--dry-run"])
+    output = capsys.readouterr().out
+    assert output.count("[CASE]") == count
+    assert ("q8_" in output) == (suite in ("all", "q8"))

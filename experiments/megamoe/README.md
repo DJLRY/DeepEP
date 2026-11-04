@@ -428,25 +428,39 @@ bash experiments/megamoe/scripts/run_bs32.sh build --errors-only
 bash experiments/megamoe/scripts/run_bs32_pipeline.sh run
 bash experiments/megamoe/scripts/run_bs32_pipeline.sh perf
 
-# 两端重建timer ON，采集同样八组
+# 两端重建timer ON，本轮默认只采QP=0四组
 bash experiments/megamoe/scripts/run_bs32.sh build --timer --errors-only
 bash experiments/megamoe/scripts/run_bs32_pipeline.sh trace
 ```
 
 `perf`默认warmup 20、iters 100；`trace`默认warmup 20、iters 30，保留WAIT并采rank 0/14/16/30。
+`trace`默认仅跑`q0_scan`、`q0_dispatch_skip`、`q0_dispatch_lookahead`、`q0_dispatch_row`四组。
+`run`/`perf`仍默认八组；需要八组trace时显式加`--suite all`。
 所有8QP trace均加`--combine-ready-trace`，以相同诊断开销对照。
 只跑一条路线可加`--suite q0`或`--suite q8`；单项用`--case q0_scan`、`--case q8_double_buffer`等。
 执行前可加`--dry-run`查看命令；支持`--config`、性能/trace的`--warmup`与`--iters`。
 同一构建支持全部开关，不需要逐项重编译；仅在timer OFF性能和timer ON trace之间重建。
 
-`trace`默认自动打印可复制的TXT分段。矩阵脚本等待本机八组完成后，按用例名将全部本地rank的CSV与配置
+`trace`默认自动打印可复制的TXT分段。矩阵脚本等待本机所选用例完成后，按用例名将全部本地rank的CSV与配置
 一起无损压缩，再统一分段；不会逐组重复打印。两台分别输出自己的集合，每段以`[TEXT PART i/N]`标识，
 复制其后完整的`BEGIN MEGAMOE TRACE TEXT V1`至`END MEGAMOE TRACE TEXT V1`即可，一次复制一段。
-每段正文连同头尾与CRLF换行最多65535字节；采用LZMA加强压缩并按完整块大小填充分段，减少part数。
+每段正文连同头尾与CRLF换行最多65535字节；压缩前对原始周期做整数差分，并省略可精确重建的duration文本。
+恢复时逐文件校验原始字节数和SHA-256，CSV逐字节一致；非标准CSV保留原文。
+脚本比较原文和重编码后的LZMA大小，选更小的一种，再按完整块大小填充分段。
 实际数量取决于trace大小，不过滤WAIT、空闲核、原始周期或任务metadata。
 分段文件保存在打印出的`[TEXT] output=...`目录，完整终端导出内容也保存为矩阵目录的`trace_text.log`。
 直接运行`run_bs32.sh trace`时，只导出并打印该次采集。恢复集合后，各组分别位于`captures/<用例名>/`。
 文本导出本身无需额外重编；本轮内核改动仍需按上面的命令完整构建。
+恢复端需同步新版`trace_text.py`及timer Python源码；新版仍可读取旧文本包。
+
+如果已采完八组，不需要重跑。在两台机器上分别指定各自打印的`[PIPELINE] output=...`目录，仅重新导出QP=0：
+
+```bash
+python3 experiments/megamoe/scripts/trace_text.py export-pipeline \
+  /实际的pipeline_trace_node_0_目录 --suite q0 --print-parts
+```
+
+两端分别回传各自的全部分段；保持四个采样rank、WAIT、空闲核和任务metadata完整。
 
 
 每轮结束集中打印`BEGIN MEGAMOE PIPELINE SUMMARY`到`END MEGAMOE PIPELINE SUMMARY`，可直接复制回传。

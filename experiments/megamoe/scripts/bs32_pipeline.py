@@ -176,7 +176,7 @@ def main(argv=None):
     parser.add_argument("action", choices=("run", "perf", "trace", "summary"))
     parser.add_argument("result_dirs", nargs="*", type=Path, help="summary only: existing perf run directories")
     selection = parser.add_mutually_exclusive_group()
-    selection.add_argument("--suite", choices=("all", "q0", "q8"), default="all")
+    selection.add_argument("--suite", choices=("all", "q0", "q8"), help="Default: q0 for trace, all for run/perf")
     selection.add_argument("--case", choices=tuple(CASES))
     parser.add_argument("--config", type=Path)
     parser.add_argument("--warmup", type=int)
@@ -189,7 +189,7 @@ def main(argv=None):
             or args.dry_run
             or args.config
             or args.case
-            or args.suite != "all"
+            or args.suite not in (None, "all")
             or args.warmup is not None
             or args.iters is not None
         ):
@@ -209,10 +209,11 @@ def main(argv=None):
         parser.error("--warmup and --iters require perf or trace")
     if args.warmup is not None and args.warmup < 0 or args.iters is not None and args.iters < 1:
         parser.error("warmup must be >= 0 and iters must be >= 1")
+    suite = args.suite or ("q0" if args.action == "trace" else "all")
     selected = (
         (args.case,)
         if args.case
-        else tuple(name for name in INDEPENDENT_CASES if args.suite == "all" or name.startswith(args.suite + "_"))
+        else tuple(name for name in INDEPENDENT_CASES if suite == "all" or name.startswith(suite + "_"))
     )
     if args.dry_run:
         for name in selected:
