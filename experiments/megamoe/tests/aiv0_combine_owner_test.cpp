@@ -20,6 +20,8 @@ namespace MegaMoeImpl {
 struct State {
     uint32_t physical = 0, qps = 0, preDrains = 0, payloads = 0, commits = 0, waits = 0, quiets = 0;
     uint32_t hostCqCalls = 0, unpermutes = 0, expectedRows = 0;
+    uint32_t singleSweeps = 0;
+    bool scanInScheduler = false;
     bool routedDone = false, sharedDone = false, drained = false, hostDone = false, exported = false;
     bool timer = false;
 } current;
@@ -41,6 +43,7 @@ struct Params {
 };
 struct Progress {
     uint32_t sentRows = 0;
+    bool initialized = false;
 };
 struct AscendTimerDevice {
     bool Enabled() const
@@ -62,8 +65,8 @@ struct Dump {
 };
 struct MegaMoeUnpermuteBufferConfig {};
 struct HierarchicalCombineProgressBudget {
-    uint32_t posts, rows;
-    bool bounded, scan;
+    uint32_t posts = 0xffffffffU, rows = 0xffffffffU;
+    bool bounded = false, scan = false;
 };
 enum class RoceWaitKind { HostProducerBarrier };
 
@@ -101,9 +104,9 @@ uint8_t* HierarchicalRoceScratch(const Params&)
 {
     return scratch.data();
 }
-int32_t* HierarchicalSignalAddress(const decltype(Params::peermemInfo)&, HierarchicalSignal)
+int32_t* HierarchicalSignalAddress(const decltype(Params::peermemInfo)&, HierarchicalSignal signal)
 {
-    return reinterpret_cast<int32_t*>(window.data() + 8192);
+    return reinterpret_cast<int32_t*>(window.data() + 8192 + static_cast<uint32_t>(signal) * 512U);
 }
 void RoceWaitFlagEquals(int32_t*, uint32_t, uint32_t, uint8_t* ub, RoceWaitKind)
 {
@@ -132,10 +135,18 @@ bool TryProgressHierarchicalReducedCombine(const MoeStageCommonConfig&, const Pa
     progress.sentRows = current.expectedRows;
     return true;
 }
-bool TryProgressHierarchicalCombine(const MoeStageCommonConfig&, const Params&, Progress&, uint8_t*, AscendTimerDevice*,
-                                    HierarchicalCombineProgressBudget)
+bool TryProgressHierarchicalCombine(const MoeStageCommonConfig&, const Params&, Progress& progress, uint8_t*,
+                                    AscendTimerDevice*, HierarchicalCombineProgressBudget budget, bool waitForAll)
 {
-    return false;
+    CheckOwner(1U);
+    assert(current.qps == 0U && !current.hostDone);
+    assert(!progress.initialized && ++current.singleSweeps == 1U);
+    assert(budget.posts == 0xffffffffU && budget.rows == 0xffffffffU && !budget.bounded && !budget.scan);
+    assert(waitForAll);
+    progress.initialized = true;
+    progress.sentRows = current.expectedRows;
+    current.payloads += current.expectedRows;
+    return current.expectedRows != 0U;
 }
 void DrainHierarchicalReducedCombine(const MoeStageCommonConfig&, const Params&, Progress& progress, uint32_t lane,
                                      uint8_t*, AscendTimerDevice*)
@@ -151,24 +162,31 @@ void DrainHierarchicalReducedCombine(const MoeStageCommonConfig&, const Params&,
     current.payloads += current.expectedRows - progress.sentRows;
     progress.sentRows = current.expectedRows;
 }
-void DrainHierarchicalCombine(const MoeStageCommonConfig&, const Params&, Progress&, uint8_t*, AscendTimerDevice*)
-{
-    assert(current.qps == 0U && current.hostDone);
-}
 void TraceHierarchicalCombineBoundary(const MoeStageCommonConfig&, const Params&, Progress&, uint32_t,
                                       AscendTimerDevice*, uint32_t)
 {
 }
-void RocePublishCommit(GM_ADDR, GM_ADDR, uint32_t, uint8_t*, AscendTimerDevice*, AscendTimer::RdmaPhase, uint32_t qp)
+void RocePublishCommit(GM_ADDR dst, GM_ADDR src, uint32_t, uint8_t*, AscendTimerDevice*, AscendTimer::RdmaPhase phase,
+                       uint32_t qp = 1U)
 {
     CheckOwner(qp);
-    assert(current.hostDone);
+    assert(current.hostDone && phase == AscendTimer::RdmaPhase::Combine);
+    assert(src == reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress({}, HierarchicalSignal::Sequence)));
+    if (current.qps == 0U) {
+        assert(dst == reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress({}, HierarchicalSignal::CombineCommit)));
+        assert(current.singleSweeps == 1U && current.payloads == current.expectedRows);
+    }
     ++current.commits;
 }
-void RoceWaitCommit(int32_t*, uint32_t, AscendTimerDevice*, AscendTimer::RdmaPhase, uint32_t, uint8_t*, uint32_t qp)
+void RoceWaitCommit(int32_t* flag, uint32_t, AscendTimerDevice*, AscendTimer::RdmaPhase phase, uint32_t, uint8_t*,
+                    uint32_t qp = 1U)
 {
     CheckOwner(qp);
-    assert(current.commits == 1U);
+    assert(current.commits == 1U && current.hostDone);
+    assert(phase == AscendTimer::RdmaPhase::Combine);
+    if (current.qps == 0U) {
+        assert(flag == HierarchicalSignalAddress({}, HierarchicalSignal::CombineCommit));
+    }
     ++current.waits;
 }
 void RoceFinishOutstanding(uint32_t, uint8_t*, AscendTimerDevice*, AscendTimer::RdmaPhase, uint32_t qp)
@@ -218,6 +236,10 @@ struct Kernel {
     void ProcessMoeExpertStages(int32_t&)
     {
         assert(current.preDrains == 0U);
+        if (current.qps == 0U) {
+            for (uint32_t i = 0U; i < 4U; ++i) assert(!TryProgressRemoteCombine(true));
+            assert(!hierarchicalCombine_.initialized && current.singleSweeps == 0U);
+        }
         if (current.qps == 8U) {
             assert(!TryProgressRemoteCombine(true));
             assert(!TryProgressRemoteCombine(false));
@@ -225,6 +247,13 @@ struct Kernel {
         current.routedDone = true;
         current.sharedDone = sharedExpertNum_ == 0U;
         current.drained = true;
+        if (current.qps == 0U && !current.sharedDone) assert(!TryProgressRemoteCombine(true));
+        if (current.qps == 0U && current.sharedDone && current.scanInScheduler) CheckSingleSweep();
+    }
+    void CheckSingleSweep()
+    {
+        TryProgressRemoteCombine(false);
+        for (uint32_t i = 0U; i < 4U; ++i) assert(!TryProgressRemoteCombine(false));
     }
     void ProcessMoeExpertStages()
     {
@@ -235,7 +264,9 @@ struct Kernel {
         assert(current.routedDone && !current.sharedDone && current.preDrains == 0U);
         current.drained = false;  // Shared prologue still owns UB/events here.
         if (current.qps == 8U) assert(!TryProgressRemoteCombine(false));
+        if (current.qps == 0U) assert(!TryProgressRemoteCombine(true));
         current.sharedDone = current.drained = true;
+        if (current.qps == 0U && current.scanInScheduler) CheckSingleSweep();
     }
     void ProcessSharedExpertGmm2()
     {
@@ -263,30 +294,33 @@ int main()
             for (bool timer : {false, true})
                 for (uint32_t rank : {0U, 30U})
                     for (uint32_t rows : {0U, 16U})
-                        for (uint32_t physical = 0; physical < 56U; ++physical) {
-                            current = {};
-                            current.physical = physical;
-                            current.qps = qps;
-                            current.expectedRows = rows;
-                            current.timer = timer;
-                            Kernel kernel;
-                            kernel.rankId_ = kernel.commonConfig_.rankId = rank;
-                            kernel.tiling.topoType = TOPO_TYPE_MTE_ROCE;
-                            kernel.tiling.combineReduceQps = qps;
-                            kernel.tiling.blockAivNum = 56U;
-                            kernel.sharedExpertNum_ = shared ? 1U : 0U;
-                            kernel.Run();
-                            const bool owner = ExpectedOwner();
-                            assert(current.preDrains == static_cast<uint32_t>(qps == 8U && owner));
-                            if (qps == 8U && owner) assert(current.payloads == rows);
-                            assert(current.commits == static_cast<uint32_t>(owner));
-                            assert(current.waits == static_cast<uint32_t>(owner));
-                            assert(current.quiets == static_cast<uint32_t>(owner));
-                            assert(current.unpermutes == static_cast<uint32_t>(!owner));
+                        for (bool scanInScheduler : {false, true})
+                            for (uint32_t physical = 0; physical < 56U; ++physical) {
+                                current = {};
+                                current.physical = physical;
+                                current.qps = qps;
+                                current.expectedRows = rows;
+                                current.scanInScheduler = scanInScheduler;
+                                current.timer = timer;
+                                Kernel kernel;
+                                kernel.rankId_ = kernel.commonConfig_.rankId = rank;
+                                kernel.tiling.topoType = TOPO_TYPE_MTE_ROCE;
+                                kernel.tiling.combineReduceQps = qps;
+                                kernel.tiling.blockAivNum = 56U;
+                                kernel.sharedExpertNum_ = shared ? 1U : 0U;
+                                kernel.Run();
+                                const bool owner = ExpectedOwner();
+                                assert(current.preDrains == static_cast<uint32_t>(qps == 8U && owner));
+                                if ((qps == 0U || qps == 8U) && owner) assert(current.payloads == rows);
+                                assert(current.singleSweeps == static_cast<uint32_t>(qps == 0U && owner));
+                                assert(current.commits == static_cast<uint32_t>(owner));
+                                assert(current.waits == static_cast<uint32_t>(owner));
+                                assert(current.quiets == static_cast<uint32_t>(owner));
+                                assert(current.unpermutes == static_cast<uint32_t>(!owner));
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-                            assert(current.hostCqCalls == static_cast<uint32_t>(physical == (qps == 8U ? 0U : 1U)));
+                                assert(current.hostCqCalls == static_cast<uint32_t>(physical == (qps == 8U ? 0U : 1U)));
 #else
-                            assert(current.hostCqCalls == 0U);
+                                assert(current.hostCqCalls == 0U);
 #endif
-                        }
+                            }
 }

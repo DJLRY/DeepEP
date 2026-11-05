@@ -111,15 +111,19 @@ protected:
                     timer_.Enabled() ? &timer_ : nullptr);
             }
             if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
-                // Bound both posting and flag scans before returning to the
-                // next activation/dispatch task on the fixed AIV1 owner.
-                const HierarchicalCombineProgressBudget budget =
-                    foregroundPending ? HierarchicalCombineProgressBudget{2U, 64U, true, true}
-                                      : HierarchicalCombineProgressBudget{
-                                            8U, HIERARCHICAL_MAX_TOKENS * commonConfig_.topK, true, true};
-                return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_,
-                                                      HierarchicalRoceScratch(params_),
-                                                      timer_.Enabled() ? &timer_ : nullptr, budget);
+                // QP=0: enter once after all owner-side producers have finished.
+                // Other AIV1s own the local Combine rows, so this owner can wait
+                // for late rows without blocking their production. A one-core
+                // fallback must finish its own local Combine before this call.
+                if (foregroundPending || hierarchicalCombine_.initialized) {
+                    return false;
+                }
+                auto* scratch = HierarchicalRoceScratch(params_);
+                auto* rdmaTimer = timer_.Enabled() ? &timer_ : nullptr;
+                // Only payloads are posted here. The single terminal commit
+                // remains after the host barrier to close all reader lifetimes.
+                return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch, rdmaTimer,
+                                                      {}, true);
             }
         }
         return false;
@@ -1096,11 +1100,10 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                                                     rdmaTimer);
                     commit = reinterpret_cast<__gm__ int32_t*>(params_.peermemInfo.combineReduceCommitPtr +
                                                                lane * HIERARCHICAL_FLAG_BYTES);
-                } else {
-                    DrainHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch, rdmaTimer);
                 }
-                // No QP orders another QP's payload. Every owner posts its own
-                // commit before waiting; the existing SyncAll joins all lanes.
+                // QP=0 already submitted every payload in completion progress;
+                // no final drain is needed. All modes keep one commit per QP,
+                // after the host barrier, including calls with no remote rows.
                 RocePublishCommit(reinterpret_cast<GM_ADDR>(commit),
                                   reinterpret_cast<GM_ADDR>(
                                       HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::Sequence)),

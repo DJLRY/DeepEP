@@ -424,7 +424,10 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
                 TryRunReadyCombine(combine)) {
                 hasCombine = NextAivSlice(combine, false);
                 allowEarlyCombine = false;
-                this->TryProgressRemoteCombine(hasActivation || !shared.done);
+                // Future Dispatch still needs this AIV. QP=0 completion may
+                // block, so it cannot run from this lookahead branch.
+                this->TryProgressRemoteCombine(hasActivation || !shared.done ||
+                                               !UseHierarchicalCombineReduction(params_.tilingData));
                 continue;
             }
             DispatchNextExpertSlice(dispatch, dispatchGroups, dispatchWave);
@@ -436,10 +439,12 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
         }
         if (hasCombine && TryRunReadyCombine(combine)) {
             hasCombine = NextAivSlice(combine, false);
-            this->TryProgressRemoteCombine(hasActivation || !shared.done);
+            this->TryProgressRemoteCombine(hasActivation || !shared.done ||
+                                           (gmmExecutionConfig_.blockJob.totalJobs == 1U && hasCombine));
             continue;
         }
-        if (this->TryProgressRemoteCombine(hasActivation || !shared.done)) {
+        if (this->TryProgressRemoteCombine(hasActivation || !shared.done ||
+                                           (gmmExecutionConfig_.blockJob.totalJobs == 1U && hasCombine))) {
             continue;
         }
         // 没有可执行任务才退避；不能进入 Combine 的阻塞等待，否则可能挡住 GMM2 所需的 SwiGLU。

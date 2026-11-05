@@ -1300,6 +1300,83 @@ void RetrySpacing()
         f.CheckPayload();
     }
 }
+void SingleSweepThenDrain()
+{
+    for (uint32_t rank : {0U, 30U}) {
+        for (uint32_t mode : {0U, 1U, 2U, 3U}) {
+            Fixture f(32U, 8U, rank);
+            f.Routes(mode == 0U ? "holes" : "all");
+            // Empty routes, no ready producers, fragmented ready rows (>8
+            // POSTs), and an entirely ready tensor all get just one sweep.
+            for (uint32_t row = 0U; row < f.s.rows; ++row) {
+                if (mode == 3U || (mode == 2U && row % 2U == 0U)) f.Publish(row, f.s.sequence);
+            }
+            AscendTimerDevice timer;
+            const bool made = TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {});
+            const uint32_t expectedSent = mode == 3U ? 256U : (mode == 2U ? 128U : 0U);
+            Check(made == (expectedSent != 0U) && f.progress.sentRows == expectedSent,
+                  "single sweep deferred ready rows or retained a POST cap");
+            Check(f.progress.initialized && timer.initializations == 1U, "single attempt lost initialization");
+            Check(f.s.waitChecks == 0U, "single sweep blocked on an unfinished producer");
+            for (auto mask : f.progress.deferredTopkMasks) Check(mask == 0U, "single sweep retained deferral");
+            Check(timer.records.size() == (mode == 0U ? 0U : 1U), "single sweep repeated its scan");
+            ReleaseAll();
+            DrainHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer);
+            Check(timer.initializations == 1U, "final drain reinitialized pending masks");
+            f.CheckPayload();  // Every routed row exactly once, including late rows.
+        }
+    }
+}
+void CompletionProgress()
+{
+    for (uint32_t rank : {0U, 30U}) {
+        for (uint32_t mode : {0U, 1U, 2U, 3U}) {
+            Fixture f(32U, 8U, rank);
+            f.Routes(mode == 0U ? "holes" : "all");
+            for (uint32_t row = 0U; row < f.s.rows; ++row) {
+                if (mode == 3U || (mode == 2U && row % 2U == 0U)) f.Publish(row, f.s.sequence);
+            }
+            if (mode == 1U || mode == 2U) f.s.releaseAtCycle = 10000U;
+            AscendTimerDevice timer;
+            // Completion overrides legacy tiny budgets, deferral and backoff.
+            const bool made = TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer,
+                                                             {1U, 1U, true, true}, true);
+            Check(made == (mode != 0U) && f.progress.sentRows == f.Expected(), "completion returned with unsent rows");
+            Check(timer.initializations == 1U && timer.records.size() == (mode == 0U ? 0U : 1U),
+                  "completion must produce one progress envelope, without a tail drain");
+            if (mode != 0U) {
+                const auto& record = timer.records.front();
+                Check(record.type == AscendTimer::AIV_COMBINE_PROGRESS && record.before == 256U && record.after == 0U,
+                      "completion did not report its full pending lifetime");
+                Check(record.posts == f.s.posts.size(), "completion lost retry POST counts");
+                if (mode == 1U) Check(record.scanned == 0xffffU, "long retry scan count did not saturate");
+            }
+            for (auto mask : f.progress.deferredTopkMasks) Check(mask == 0U, "completion deferred a ready run");
+            f.CheckPayload();
+        }
+    }
+    {
+        Fixture f(1U, 8U);
+        f.RouteRows({0U, 1U});
+        f.Publish(0U, f.s.sequence);
+        f.s.releaseAfterSnapshot = 1U;
+        TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {}, true);
+        Check(f.s.flagDmas >= 2U, "completion reused an old negative ready snapshot");
+        f.CheckPayload();
+    }
+    {
+        Fixture f(1U, 8U);
+        f.Routes("all");
+        f.s.failAfterWaitChecks = 3U;
+        bool failed = false;
+        try {
+            TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {}, true);
+        } catch (const std::runtime_error&) {
+            failed = true;
+        }
+        Check(failed && f.s.posts.empty(), "stalled completion lost timeout diagnostics");
+    }
+}
 }  // namespace ProgressTest
 
 int main(int argc, char** argv)
@@ -1345,6 +1422,10 @@ int main(int argc, char** argv)
         Coalescing();
     else if (std::strcmp(scenario, "retry-spacing") == 0)
         RetrySpacing();
+    else if (std::strcmp(scenario, "single-sweep") == 0)
+        SingleSweepThenDrain();
+    else if (std::strcmp(scenario, "completion") == 0)
+        CompletionProgress();
     else
         Check(false, "unknown test scenario");
     return 0;

@@ -234,23 +234,29 @@ __aicore__ inline void ClearHierarchicalCombineRun(HierarchicalCombineProgress& 
     }
 }
 
-// Probe at most one sweep without waiting for unfinished producers. The cursor
+// By default probe at most one sweep without waiting for unfinished producers. The cursor
 // survives a bounded call, so late slots cannot starve behind early ready rows.
 // Adjacent ready slots form one Put; holes, the row budget, and the tensor end
 // terminate a run. No weighting, reduction, padding copy, or quantization occurs.
 //
 // Only the rank's designated communication owner may call this routine. Its UB
 // scratch and QP are the same resources used by the completed Dispatch stage.
+// waitForAll is legal only when no unfinished producer needs this owner to run:
+// it repeats scans inside ONE timed progress call until every routed row posts.
 __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig& common, const Params& params,
                                                       HierarchicalCombineProgress& progress,
                                                       __ubuf__ uint8_t* roceScratch, AscendTimerDevice* timer = nullptr,
-                                                      HierarchicalCombineProgressBudget budget = {})
+                                                      HierarchicalCombineProgressBudget budget = {},
+                                                      bool waitForAll = false)
 {
     if constexpr (g_coreType == AIC) {
         return false;
     }
     if (!UseHierarchicalRoce(params.tilingData)) {
         return false;
+    }
+    if (waitForAll) {
+        budget = {};  // Completion never defers ready runs or stops at a POST budget.
     }
     if (budget.maxPosts == 0U || budget.maxScannedRows == 0U) {
         return false;
@@ -272,88 +278,112 @@ __aicore__ inline bool TryProgressHierarchicalCombine(const MoeStageCommonConfig
     const uint32_t destination = HierarchicalGateway(common.rankId);
     const bool sparseScan = (params.tilingData->pipelineFlags & 4U) != 0U;
     HierarchicalCombineScanCursor cursor(progress, common.topK);
-    HierarchicalCombineReadySnapshot snapshot;
     uint32_t scanned = 0U;
     uint32_t posts = 0U;
-    while (scanned < scanLimit && posts < budget.maxPosts) {
-        if (sparseScan && cursor.pending == 0U) {
-            scanned += cursor.SkipEmptySuffix(common, progress, scanLimit - scanned);
-            if (cursor.row == rowCount) {
-                cursor.Wrap(progress);
+    uint32_t totalScanned = 0U;
+    RoceWaitState waitState{};
+    do {
+        // A fresh DMA image is essential when late producers publish between scans.
+        HierarchicalCombineReadySnapshot snapshot;
+        scanned = 0U;
+        const uint32_t postsBefore = posts;
+        while (scanned < scanLimit && posts < budget.maxPosts) {
+            if (sparseScan && cursor.pending == 0U) {
+                scanned += cursor.SkipEmptySuffix(common, progress, scanLimit - scanned);
+                if (cursor.row == rowCount) {
+                    cursor.Wrap(progress);
+                }
+                continue;
             }
-            continue;
-        }
-        ++scanned;
-        if (!cursor.Ready(params, snapshot, rowCount - cursor.row, scanLimit - scanned + 1U)) {
-            cursor.Advance(common, progress);
-            if (cursor.row == rowCount) {
-                cursor.Wrap(progress);
-            }
-            continue;
-        }
-        const uint32_t runStart = cursor.row;
-        const int64_t runCycle = timer != nullptr && timer->Enabled() ? GetSystemCycle() : 0;
-        const uint32_t runToken = cursor.token;
-        const uint32_t runTopk = cursor.topk;
-        cursor.Advance(common, progress);
-        // Probe a terminating hole only once. It remains pending and is retried
-        // on a later sweep if its producer publishes readiness in the meantime.
-        bool skippedHole = false;
-        while (cursor.row < rowCount && scanned < scanLimit) {
             ++scanned;
             if (!cursor.Ready(params, snapshot, rowCount - cursor.row, scanLimit - scanned + 1U)) {
-                skippedHole = true;
+                cursor.Advance(common, progress);
+                if (cursor.row == rowCount) {
+                    cursor.Wrap(progress);
+                }
+                continue;
+            }
+            const uint32_t runStart = cursor.row;
+            const int64_t runCycle = timer != nullptr && timer->Enabled() ? GetSystemCycle() : 0;
+            const uint32_t runToken = cursor.token;
+            const uint32_t runTopk = cursor.topk;
+            cursor.Advance(common, progress);
+            // Probe a terminating hole only once. It remains pending and is retried
+            // on a later sweep if its producer publishes readiness in the meantime.
+            bool skippedHole = false;
+            while (cursor.row < rowCount && scanned < scanLimit) {
+                ++scanned;
+                if (!cursor.Ready(params, snapshot, rowCount - cursor.row, scanLimit - scanned + 1U)) {
+                    skippedHole = true;
+                    break;
+                }
+                cursor.Advance(common, progress);
+            }
+            const uint32_t runRows = cursor.row - runStart;
+            const bool nextPending = cursor.row < rowCount && (cursor.pending & 1U) != 0U;
+            const bool alreadyDeferred = (progress.deferredTopkMasks[runToken] & (uint32_t(1) << runTopk)) != 0U;
+            // 0=tensor end, 1=route/sent gap, 2=producer not ready, 3=scan budget.
+            const uint32_t stopReason = cursor.row == rowCount ? 0U : (skippedHole ? (nextPending ? 2U : 1U) : 3U);
+            bool defer = false;
+            if (budget.deferPartialRuns && !alreadyDeferred) {
+                const uint32_t previous = runStart == 0U ? 0U : runStart - 1U;
+                const bool previousPending = runStart != 0U && (progress.pendingTopkMasks[previous / common.topK] &
+                                                                (uint32_t(1) << (previous % common.topK))) != 0U;
+                defer = nextPending || previousPending;
+            }
+            if (defer) {
+                progress.deferredTopkMasks[runToken] |= uint32_t(1) << runTopk;
+            } else {
+                const uint64_t byteOffset = static_cast<uint64_t>(runStart) * rowBytes;
+                timing.StopScan();
+                RocePutBytes(params.peermemInfo.combineSendPtr + byteOffset,
+                             params.peermemInfo.gatewayCombinePtr + byteOffset, runRows * rowBytes, destination,
+                             roceScratch, timer, AscendTimer::RdmaPhase::Combine);
+                timing.StartScan();
+                ClearHierarchicalCombineRun(progress, common.topK, runToken, runTopk, runRows);
+                // The cached bits begin at cursor.row, beyond the cleared run. A
+                // wrap reloads token zero so sent rows cannot reappear.
+                progress.sentRows += runRows;
+                ++posts;
+            }
+            if (timer != nullptr && timer->Enabled()) {
+                timer->RecordDetail(AscendTimer::AIV_COMBINE_RUN, runCycle, GetSystemCycle(),
+                                    (static_cast<uint64_t>(runStart) << 32) | runRows,
+                                    stopReason | (static_cast<uint64_t>(defer) << 8) |
+                                        (static_cast<uint64_t>(nextPending) << 9) |
+                                        (static_cast<uint64_t>(alreadyDeferred) << 10));
+            }
+            if (skippedHole) {
+                cursor.Advance(common, progress);
+            }
+            if (cursor.row == rowCount) {
+                cursor.Wrap(progress);
+            }
+            if ((sparseScan || waitForAll) && progress.sentRows == progress.expectedRows) {
                 break;
             }
-            cursor.Advance(common, progress);
         }
-        const uint32_t runRows = cursor.row - runStart;
-        const bool nextPending = cursor.row < rowCount && (cursor.pending & 1U) != 0U;
-        const bool alreadyDeferred = (progress.deferredTopkMasks[runToken] & (uint32_t(1) << runTopk)) != 0U;
-        // 0=tensor end, 1=route/sent gap, 2=producer not ready, 3=scan budget.
-        const uint32_t stopReason = cursor.row == rowCount ? 0U : (skippedHole ? (nextPending ? 2U : 1U) : 3U);
-        bool defer = false;
-        if (budget.deferPartialRuns && !alreadyDeferred) {
-            const uint32_t previous = runStart == 0U ? 0U : runStart - 1U;
-            const bool previousPending = runStart != 0U && (progress.pendingTopkMasks[previous / common.topK] &
-                                                            (uint32_t(1) << (previous % common.topK))) != 0U;
-            defer = nextPending || previousPending;
-        }
-        if (defer) {
-            progress.deferredTopkMasks[runToken] |= uint32_t(1) << runTopk;
-        } else {
-            const uint64_t byteOffset = static_cast<uint64_t>(runStart) * rowBytes;
-            timing.StopScan();
-            RocePutBytes(params.peermemInfo.combineSendPtr + byteOffset,
-                         params.peermemInfo.gatewayCombinePtr + byteOffset, runRows * rowBytes, destination,
-                         roceScratch, timer, AscendTimer::RdmaPhase::Combine);
-            timing.StartScan();
-            ClearHierarchicalCombineRun(progress, common.topK, runToken, runTopk, runRows);
-            // The cached bits begin at cursor.row, beyond the cleared run. A
-            // wrap reloads token zero so sent rows cannot reappear.
-            progress.sentRows += runRows;
-            ++posts;
-        }
-        if (timer != nullptr && timer->Enabled()) {
-            timer->RecordDetail(AscendTimer::AIV_COMBINE_RUN, runCycle, GetSystemCycle(),
-                                (static_cast<uint64_t>(runStart) << 32) | runRows,
-                                stopReason | (static_cast<uint64_t>(defer) << 8) |
-                                    (static_cast<uint64_t>(nextPending) << 9) |
-                                    (static_cast<uint64_t>(alreadyDeferred) << 10));
-        }
-        if (skippedHole) {
-            cursor.Advance(common, progress);
-        }
-        if (cursor.row == rowCount) {
-            cursor.Wrap(progress);
-        }
-        if (sparseScan && progress.sentRows == progress.expectedRows) {
+        progress.nextRow = cursor.row;
+        // The existing trace wire field is 16 bits. Saturate long retry counts
+        // instead of wrapping; scan/control cycles retain the full measurement.
+        totalScanned = scanned >= 0xffffU - totalScanned ? 0xffffU : totalScanned + scanned;
+        if (!waitForAll || progress.sentRows == progress.expectedRows) {
             break;
         }
-    }
-    progress.nextRow = cursor.row;
+        timing.StopScan();
+        if (posts == postsBefore) {
+            RoceCheckWait(waitState, destination, roceScratch, RoceWaitKind::CombineRows, progress.expectedRows,
+                          progress.sentRows);
+            const int64_t waitStart = GetSystemCycle();
+            while (GetSystemCycle() - waitStart < GM_FLAG_POLL_BACKOFF_CYCLES) {
+            }
+        } else {
+            waitState = {};
+        }
+        timing.StartScan();
+    } while (true);
     progress.retryDeferred = budget.backoffAfterEmptySweep && posts == 0U && scanned == rowCount;
-    timing.Finish(pendingBefore, progress.expectedRows - progress.sentRows, posts, scanned);
+    timing.Finish(pendingBefore, progress.expectedRows - progress.sentRows, posts, totalScanned);
     return posts != 0U;
 }
 

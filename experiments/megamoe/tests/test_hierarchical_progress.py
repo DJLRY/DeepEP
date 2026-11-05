@@ -56,6 +56,8 @@ def hierarchical_progress_binary(tmp_path_factory):
         "ready-snapshot",
         "coalescing",
         "retry-spacing",
+        "single-sweep",
+        "completion",
     ],
 )
 @pytest.mark.parametrize("sparse_scan", [False, True], ids=["baseline", "sparse"])

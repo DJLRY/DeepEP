@@ -374,6 +374,39 @@ def ancestors(graph, event):
     return result
 
 
+@pytest.mark.parametrize("backend", ["HNS_1825", "XSCALE"])
+@pytest.mark.parametrize("remote_rows", [0, 1])
+@pytest.mark.parametrize("late_rank", [0, 15, 16, 31])
+def test_completion_progress_keeps_single_commit_after_host_barrier(backend, remote_rows, late_rank):
+    graph = lifecycle_dependencies(backend=backend, remote_rows=remote_rows)
+    for rank in range(WORLD):
+        graph["owner-ready", rank] = set()
+        # Completion can post payloads before unrelated host producers finish.
+        # These routes only need the next neighbour; empty routes need no rows.
+        producer = host(rank) * 16 + (rank + 1) % 16
+        graph["post", rank] = {("owner-ready", rank)}
+        if remote_rows:
+            graph["post", rank].add(("produce", producer))
+        # The sole commit still closes the entire host's old-reader lifetime.
+        phase = "commit" if backend == "HNS_1825" else "quiet"
+        graph[phase, rank].add(("host", host(rank)))
+    all_producers = {("produce", rank) for rank in range(WORLD)}
+    for rank in range(WORLD):
+        assert all_producers <= ancestors(graph, ("reuse", rank))
+        assert ("host", host(rank)) not in ancestors(graph, ("post", rank))
+        assert ("host", host(rank)) in ancestors(graph, ("commit", rank))
+    finished = set()
+    scheduler = random.Random(late_rank)
+    while len(finished) < len(graph):
+        runnable = [event for event, deps in graph.items() if event not in finished and deps <= finished]
+        assert runnable, "completion progress and host commit created a cyclic wait"
+        ordinary = [event for event in runnable if event != ("produce", late_rank)]
+        event = scheduler.choice(ordinary or runnable)
+        if event[0] == "reuse":
+            assert all_producers <= finished
+        finished.add(event)
+
+
 @pytest.mark.parametrize("late_rank", [0, 15, 16, 31])
 @pytest.mark.parametrize("late_stage", ["produce", "commit", "commit-complete"])
 @pytest.mark.parametrize("backend", ["HNS_1825", "XSCALE"])
@@ -743,7 +776,7 @@ def test_real_kernel_entrypoints_overlap_owner_retirement_after_output_ready(hea
     body = cpp_function_body(kernels / header, signature)
     expected = (
         "CrossRankSyncInHierarchicalHost(",
-        "DrainHierarchicalCombine(",
+        "DrainHierarchicalReducedCombine(" if timed else "DrainHierarchicalCombine(",
         "RocePublishCommit(",
         "RoceWaitCommit(",
         "RoceFinishOutstanding(",
@@ -751,7 +784,9 @@ def test_real_kernel_entrypoints_overlap_owner_retirement_after_output_ready(hea
         "UnpermuteTokens<",
         "Stage::COMPLETE",
     )
-    positions = [body.index(token) for token in expected]
+    positions = []
+    for token in expected:
+        positions.append(body.index(token, positions[-1] + 1 if positions else 0))
     assert positions == sorted(positions), "Both entrypoints must close all RDMA lifetimes before kernel return"
     assert body.count("RoceFinishOutstanding(") == 1
     # The final retirement remains on the designated communication owner and is
@@ -759,6 +794,7 @@ def test_real_kernel_entrypoints_overlap_owner_retirement_after_output_ready(hea
     tail_begin = body.index("Stage::UNPERMUTE")
     tail = body[tail_begin : body.index("Stage::COMPLETE")]
     if header == "mega_moe_arch35.hpp":
+        assert "DrainHierarchicalCombine(" not in body
         # A8W4 supports one or multiple fixed QP owners through this predicate.
         assert "IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)" in tail
         owner = cpp_function_body(kernels / "common/mega_moe_peermem.hpp", "bool IsHierarchicalCombineOwner(")

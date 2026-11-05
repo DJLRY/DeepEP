@@ -422,10 +422,19 @@ QP=0单行Combine仍可单独实验，但不加入默认基线。下一阶段的
 每行数据、scale与metadata完成后累加原GMM1 ready计数，累计完整tile行数后GMM1才能消费。
 最后一行完成才推进专家/wave游标。BS>256沿用原整段路径；多一次prefix恢复、通知和调度可能抵消收益。
 
-RoCE头尾协议、QP归属、commit/quiet以及归并算法保持当前实现。每次成功Combine之后仍调用原远端progress；
-调度时机变化可能间接改变progress和POST发生的时刻，本轮没有新增POST合并策略。
+QP=0的A8W4路径现在只在g00 AIV1全部路由/共享SwiGLU及Dispatch完成后进入一次远端progress。
+它持续扫描并POST，直到全部应发行都已提交；每轮重新读取ready标志，空转时退避并保留停滞超时。
+就绪片段直接发送，不做defer、不受原2/8个POST预算限制。全部应发行提交后返回，
+后续调度及Export处直接返回，删除原host barrier后的QP=0 drain调用。
+仅一个AIC的回退还必须先完成本核机内Combine，避免等待自己的生产任务。
+原host barrier保留，之后仍只发送一个4字节Combine commit（零远端行也必须发送），
+同时确认结果就绪及本机所有生产者、旧Dispatch读取均已结束；不新增完成信号或等待。
+收到对端commit并完成本卡同步后，owner执行quiet，与其他AIV的Unpermute重叠。
+trace只记录一个完整`AIV_COMBINE_PROGRESS`区间（内部可多轮扫描），不再有该路径的`AIV_COMBINE_DRAIN`。
+QP=4/8和A8W8保留原协议。所有QP=0 A8W4用例自动生效，无新增开关。
 两台同步本次源码并完整重建wheel，复用现有机器配置、Golden与SHMEM SDK；不需要重建SHMEM SDK。
-新开关使用现有pipelineFlags中的新位，Python/native协议保持10，内存布局不变；旧native会拒绝未知位。
+Dispatch开关使用现有pipelineFlags中的位，Python/native接口协议保持10；通信内存布局、控制槽位及
+RDMA事件阶段保持原样。两端同步完整构建即可；SHMEM SDK无需重建。
 
 两端在仓库根目录执行同一组命令。脚本逐项串行执行，出错立即停止；每项打印`[CASE]`和完整命令，
 配置写入结果目录的`run.json`及rank manifest。先通过全部精度检查，再测性能：
@@ -712,13 +721,15 @@ BS32/K8 的256个 top-k 条目需要3个包，UB 配置为512个槽（有效容�
 | 事件 | 测量范围 |
 | --- | --- |
 | `AIV_COMBINE_INIT` | 首次构建私有 pending masks 的元数据 DMA 和标量处理；每次算子只记录一次 |
-| `AIV_COMBINE_PROGRESS` | 初始化后的单次扫描和提交；记录进入/退出时待发的行数、POST 数、扫描槽位数及扫描/控制累计周期 |
+| `AIV_COMBINE_PROGRESS` | 初始化后的一次推进调用；QP=0 A8W4可包含多轮扫描直至全部应发行提交，记录进入/退出待发行数、POST数、累计扫描槽位及扫描/控制周期 |
 | `AIV_HOST_COMBINE_BARRIER_WAIT` | 已有16卡机内完成屏障的完整调用，包含发布、轮询及本卡同步 |
 | `AIV_COMBINE_DRAIN` | 屏障后最终 drain 的父区间，包含子 progress 和退避；记录进入/退出时待发行数 |
 | `AIV_COMBINE_RUN` | `/COMBINE_RUN` 轨道记录每个连续段的起点、行数、发送或延后决策、终止原因以及是否曾延后 |
 
 `scan_control_us` 包含游标扫描、ready flag 检查和私有 pending 状态维护，排除初始化、
 `RocePutBytes` 调用和 drain 退避；它仍包含测量边界的开销，不能当作纯 GM 访存耗时。
+QP=0 A8W4完成式progress的总区间包含重试退避；`scan_control_us`排除退避。
+其累计`scanned_rows`使用原16位字段，在65535饱和（达到该值表示至少扫描这么多位置）。
 progress/drain 的父区间不能与内部 RDMA 或子 progress 相加。初始化是独立区间，
 已全部发送的 progress 快返不产生扫描记录；零待发的最终 drain 仍记录0行，便于确认完成。
 这些观测不新增流水排空、跨核同步或通信，不以计时结果决定调度。
@@ -892,36 +903,41 @@ AIV1 随后用一次带 stride 的 DMA 获取本卡16个槽的首32 B，共512 B
 转发前后保留 DDR 顺序保障，A8W4/A8W8 共用此协议；单机 MTE/EP16 不进入该路径。
 稀疏路由也等待全部网关，可能等到并不需要的慢来源；当前优化重点是 EP32、BS32 场景。
 
-A8W4 的跨机 Combine 在 AIV1 的计算间隙分批推进：仍有本核路由或共享 activation 时，每次最多提交2个 Put、
-扫描64个 `[token, top-k]` 槽位；这些前台工作完成后扩大为最多8个 Put和一个完整槽位扫描。
-输出 export 前的最后一次推进也使用扩大后的预算。扫描游标跨调用保留，已发送槽位不再参与就绪判定；
-全部发送后立即返回。固定物理 AIV1 保留 activation、dispatch 和远端推进，
+A8W4 的QP=0跨机 Combine 由g00 AIV1在本核全部路由/共享activation及Dispatch结束后进入一次完成式progress，
+此前不初始化pending masks、不扫描ready flags。每个就绪连续段直接发送，不延后片段、不限制POST数量；
+未就绪行在同一次调用中重新扫描，全部应发行提交后才返回。唯一的commit仍在host barrier之后发送。
+若调度循环尚未进入该调用，输出Export阶段补做一次；已完成则直接返回。
+游标和已发送槽位跨内部扫描保留，避免重发；ready快照每轮重读。固定物理 AIV1 保留 activation、dispatch 和远端推进，
 本地 Combine 搬运交给其余 AIV1：28个 AIC 时由剩余27个 AIV1 均衡分配完整行，
 在27个 consumer 的空间内按 Combine wave 和全局行前缀轮换，确保每行只搬运一次。
 GMM2 仍使用原28个生产核及其实际完成计数，不能用27个搬运核代替生产核数。
-owner 对每个 Combine slice 保留非阻塞生产完成检查，就绪后推进 slice 并尝试远端发送，
-再回到循环入口检查 activation；尚未就绪时继续其他任务和有预算的远端推进。
+owner 对每个 Combine slice 保留非阻塞生产完成检查，就绪后推进 slice，
+再回到循环入口检查 activation；各处远端调用均受上述一次扫描门控。
 这避免 owner 因无本地行而立即跳完所有 slice、提前进入 SyncAll。非 RoCE、A8W8 路径
-及仅一个 AIC 的回退路径沿用原本地 Combine 分工；QP1 始终由固定物理 AIV1 独占。
-最终 host barrier 后完整 drain，HNS1825 直接提交 Combine commit，再等待对端 commit、执行 acquire
-和全 AIV 同步。随后 owner 执行 quiet，其他 AIV 同时 Unpermute。主机配置和设备分工统一排除物理 owner，
+及仅一个 AIC 的回退路径沿用原本地 Combine 分工；单AIC必须先完成自己的Combine才能进入完成式progress。
+QP=0的QP1始终由固定物理AIV1独占。最终host barrier后不再drain，直接提交唯一的Combine commit，
+再等待对端commit、执行acquire和全AIV同步。随后owner执行quiet，
+其他AIV同时Unpermute。主机配置和设备分工统一排除物理owner，
 例如56个 AIV 时由55个消费核完整分配输出行，owner 不再承担输出 token；不新增同步屏障。
 两端都必须先提交再等待；没有远端行也不能省略
-Dispatch/Combine commit。host barrier 关闭本机的生产者和旧 Dispatch 读取，双向 commit 继续保护跨轮复用。
-单次 Put 内部仍可能因队列回压等待，这些计数预算并非硬性时间上限。
+Dispatch/Combine commit。host barrier关闭本机的生产者和旧Dispatch读取，
+双向commit继续保护跨轮复用。QP=4/8和A8W8沿用原barrier后commit协议。
+单次Put内部仍可能因队列回压等待；完成式progress及commit等待都保留已有的停滞超时诊断。
 扫描在单次调用内缓存当前 token 的 pending mask，通过递增槽位推进，避免逐行除模；
 连续发送段在 Put 返回后按 token 清除对应位。扫描仍逐槽计数，保留洞、游标绕回、
-预算截断和相邻行合并。只要前后仍有相邻待发行，即使已就绪的片段超过4行，
+预算截断和相邻行合并。A8W8保留原有分批策略：只要前后仍有相邻待发行，即使已就绪的片段超过4行，
 同一起点也允许最多延后一次，继续扫描其他位置并返回计算；再次遇到该起点就允许发送，
 不等待邻行的生产者。完整连续区间、没有相邻待发行的孤立段立即发送。
 一次完整扫描没有提交时，仅跳过下一次前台 progress 调用，减少重复 flag DMA；
-部分扫描保持游标推进，不触发退避。A8W4/A8W8 共用此策略，最终 drain 关闭延期、退避和预算限制。
-这些规则不以 timer 结果决定调度。完成当次扫描或达到 Put 预算后返回，
+部分扫描保持游标推进，不触发退避。A8W4的QP=0完成式progress关闭延期和预算限制，
+但无进展的一整轮扫描后仍短暂退避，再重新读标志；其外层只产生一个progress计时区间。
+这些规则不以timer结果决定调度。A8W8完成当次扫描或达到Put预算后返回；QP=0 A8W4则等待全部应发行提交后返回。
 后续调用在全部行已提交时直接返回。提交完成不代表传输完成，后者仍由后续 quiet 保证。
 
 HNS1825 每轮显式 quiet 从4次减为1次，包含在 kernel 总计时内；不能将 quiet 的耗时简单乘以
 删除次数当作端到端收益。SDK 的队列回压回收仍保留，每个 WQE 继续产生 CQE。
-每轮 WQE 数最多为 `B * topK + 4`，是否触发内部回收取决于实际 SQ/CQ 深度和预留空间。
+QP=0 A8W4每轮Put调用数最多仍为`B * topK + 4`，底层WQE/分片数由SDK决定；
+是否触发内部回收取决于实际SQ/CQ深度和预留空间。
 网络 commit、Dispatch 本地就绪、host 握手及最终 Combine 行等待加入60秒停滞超时诊断；只有 QP owner
 能在等待期间稀疏检查已 ready 的 CQE，不等待尚未完成的 CQE，不允许接收 leader 并发消费 CQ。
 正常短等待不增加 CQ DMA，最终 quiet 负责统一完成检查和队列回收。硬件 `SyncAll` 本身没有新增

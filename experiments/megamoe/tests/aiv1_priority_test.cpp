@@ -25,11 +25,16 @@ int64_t GetSystemCycle()
 
 struct TilingData {
     bool hierarchicalRoce = true;
+    bool reduction = false;
     uint32_t pipelineFlags = 0U;
 };
 bool UseHierarchicalRoce(const TilingData* tiling)
 {
     return tiling->hierarchicalRoce;
+}
+bool UseHierarchicalCombineReduction(const TilingData* tiling)
+{
+    return tiling->hierarchicalRoce && tiling->reduction;
 }
 uint32_t HierarchicalSendJob()
 {
@@ -96,6 +101,7 @@ struct Fixture {
     uint32_t remoteCalls = 0;
     std::vector<bool> remoteForeground;
     uint32_t operationCount = 0;
+    uint32_t blockJobs = 2;
     int64_t clock = 0;
     std::vector<std::string> events;
     std::function<void(Fixture&, uint32_t)> afterCombine;
@@ -239,7 +245,7 @@ struct Fixture {
         assert(consumedShared == (sharedExpertNum_ == 0 ? 0 : sharedTiles));
         assert(timer_.clears == 1);
         assert(timer_.finalWave == AscendTimer::NO_WAVE);
-        assert(gmmExecutionConfig_.blockJob.totalJobs == 2);
+        assert(gmmExecutionConfig_.blockJob.totalJobs == blockJobs);
     }
     void Expect(std::initializer_list<std::string> expected) const
     {
@@ -388,6 +394,9 @@ void ReadyCombineCanOvertakeFutureDispatchWithoutStarvingIt()
     f.Run(0);
     f.Expect({"D0:0", "D1:0", "C0", "R:noop", "D2:1", "C1", "R:noop", "D3:1", "C2", "R:noop", "D4:2", "C3", "R:noop",
               "D5:2"});
+    // No activation remains, but early completion must still be gated while
+    // Dispatch needs this AIV (otherwise completion can wait on its own work).
+    assert(f.remoteForeground == std::vector<bool>(4U, true));
 }
 
 void UnreadyCombineDoesNotStopDispatch()
@@ -421,6 +430,16 @@ void EarlyCombineImmediatelyYieldsToNewActivation()
     f.Expect({"D0:0", "D1:0", "C0", "R:noop", "A0:0", "D2:1", "D3:1"});
 }
 
+void SingleCoreFinishesOwnCombineBeforeCompletion()
+{
+    Fixture f;
+    f.gmmExecutionConfig_.blockJob.totalJobs = f.blockJobs = 1U;
+    f.combineSlices = 3U;
+    f.ReadyAllCombines();
+    f.Run(0);
+    assert(f.remoteForeground == std::vector<bool>({true, true, false}));
+}
+
 int main()
 {
     CombineReleasesMultipleTilesAndSlices();
@@ -434,4 +453,5 @@ int main()
     ReadyCombineCanOvertakeFutureDispatchWithoutStarvingIt();
     UnreadyCombineDoesNotStopDispatch();
     EarlyCombineImmediatelyYieldsToNewActivation();
+    SingleCoreFinishesOwnCombineBeforeCompletion();
 }
