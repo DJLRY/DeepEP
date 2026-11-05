@@ -42,8 +42,9 @@ __aicore__ inline void InitializeHierarchicalReducedCombine(const MoeStageCommon
     progress.nextRow = first * common.topK;
 }
 
-// One complete token is a nonpreemptible task. Call only after this AIV has
-// finished ALL routed/shared activation and Dispatch, at a drained UB boundary.
+// One complete token is a nonpreemptible task. AIV1 owners must finish ALL
+// routed/shared activation and Dispatch; AIV0 owners must finish ALL routed
+// and shared prologues. Both enter at a drained UB/event boundary.
 // Preserve the original BF16 expert outputs and FP32 multiply/add ordering within
 // this host's top-k subset. Only the final source-rank output is cast to BF16.
 template <bool DoubleBuffered = false>
@@ -257,8 +258,10 @@ __aicore__ inline void TraceHierarchicalCombineBoundary(const MoeStageCommonConf
                         (static_cast<uint64_t>(lane + 1U) << 32) | phase, progress.expectedRows - progress.sentRows);
 }
 
-// Only the post-producer host barrier permits blocking drain. Each owner posts
-// its own independent commit even when this lane has no remote tokens.
+// AIV1 owners may block only after the producer host barrier. A dedicated
+// AIV0 owner may also drain after ALL its prologues: AIV1 producers make
+// progress independently and publish each row without waiting for this AIV0.
+// Commits still require the host barrier, including lanes with no remote rows.
 __aicore__ inline void DrainHierarchicalReducedCombine(const MoeStageCommonConfig& common, const Params& params,
                                                        HierarchicalCombineProgress& progress, uint32_t lane,
                                                        __ubuf__ uint8_t* roceScratch,

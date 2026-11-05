@@ -53,6 +53,12 @@ int main() {
         std::vector<unsigned> owners(bs, 0U);
         for (uint32_t p = 0; p < physical; ++p) {
             const uint32_t logical = UnpermuteJobIndex(&t, p);
+            const uint32_t ownerCount = qps == 0 ? 1U : qps;
+            const uint32_t ownerParity = qps == 8 ? 0U : 1U;
+            const bool expectedOwner = topology == TOPO_TYPE_MTE_ROCE &&
+                p % 2U == ownerParity && p / 2U < ownerCount;
+            assert(IsHierarchicalCombineOwner(&t, p) == expectedOwner);
+            if (expectedOwner) assert(HierarchicalCombineLane(&t, p) == p / 2U);
             if (IsHierarchicalCombineOwner(&t, p)) {
                 assert(logical >= jobs);
                 continue;

@@ -215,7 +215,10 @@ __aicore__ inline void CrossRankSyncInHierarchicalHost(const AivJobContext& job,
         auto* remoteFlag = reinterpret_cast<__gm__ int32_t*>(g_winRankAddr_[peer]) + common.rankId * INT_CACHELINE;
         WriteGmByPassDCache(remoteFlag, epoch);
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-        auto* scratch = job.jobIndex == HierarchicalSendJob() ? HierarchicalRoceScratch(params) : nullptr;
+        // Dispatch's QP1 access ended before the input barrier. Only the
+        // current Combine QP1 owner may progress its CQ here (AIV0 for QP=8).
+        auto* scratch =
+            HierarchicalCombineLane(params.tilingData, job.jobIndex) == 0U ? HierarchicalRoceScratch(params) : nullptr;
         RoceWaitFlagEquals(localFlags + peer * INT_CACHELINE, static_cast<uint32_t>(epoch),
                            HierarchicalGateway(common.rankId), scratch, RoceWaitKind::HostProducerBarrier);
 #else

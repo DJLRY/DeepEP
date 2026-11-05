@@ -288,8 +288,14 @@ FP8xFP4、实际B=1～256。QP数量在 buffer 创建时确定，需要集体销
 
 路由元数据和FP32权重在同一次Put中发送；BS32/K8时由1536 B增至2560 B。
 网关保留原BF16专家槽，在对应token的远端专家行全部就绪后，按top-k顺序做FP32乘权与求和，
-将每token的一个FP32部分和直接发送。物理AIV1、3、5、7各独占QP1～4；
+将每token的一个FP32部分和直接发送。QP=4时，g00～g03的AIV1各独占QP1～4；
 这些核先完成本核全部路由/共享激活与Dispatch，再参与归并，token归并后立即提交。
+QP=8时，改由g00～g07的AIV0各独占Combine QP1～8。每个owner等本核所有路由专家及可选
+共享专家的GMM1/GMM2 prologue返回、L1 credits和UB/events释放后，才开始归并和提交payload；
+不在wave或prologue之间推进归并，也不增加全核prologue屏障。此时AIV1仍独立搬运机内Combine，
+AIV0可等待自己负责的行就绪并持续归并，全部payload提交后才进入Export同步。
+启动Dispatch仍由g00 AIV1使用QP1；现有输入屏障完成QP1的阶段交接，之后host barrier内的
+QP1 CQ推进也归g00 AIV0，避免新旧owner并发访问同一队列。QP=0与QP=4保留原有分工。
 BS32 balanced路由下，每个4QP owner归并4个远端token；8QP时每个owner归并2个。
 每条QP仍在原host barrier之后发布独立commit，最终输出等待所有QP；不扣留token来携带完成标记。
 各QP的quiet与其他AIV的Unpermute重叠，发送区和sequence保持不变直到quiet完成。
@@ -299,6 +305,8 @@ BS32 balanced路由下，每个4QP owner归并4个远端token；8QP时每个owne
 `run.json`、`manifest.json`、`profiling.json`及性能汇总记录`combine_reduce_qps`。
 若需要流水诊断，先两端 `build --timer`，再执行 `trace --combine-reduce-qps 4`；
 新增`AIV_COMBINE_REDUCE`事件记录QP、token和专家掩码。性能比较使用不传timer的`perf`。
+上述QP=8 owner迁移随当前内核生效，无新增开关；两端需重新完整构建同一版本。
+已有`q8_double_buffer`等QP=8用例自动采用新分工，旧trace保留其采样时的AIV1 owner归属。
 
 #### BS32：计算流水与归并初始化独立实验
 
@@ -485,7 +493,8 @@ bash experiments/megamoe/scripts/run_bs32_pipeline.sh summary \
 - 两条路线均比较首次机内Dispatch到末次机内Combine的跨度，以及timer OFF全32 rank的`max_us`。
 - 检查GMM1 tile结束到对应激活开始、专家GMM2输出完成到机内Combine开始的间隔，
   同时看AIC等待Dispatch/激活与GMM2结束后的Combine积压；事件结束只作为就绪时刻的近似。
-- QP=8分别观察owner和其他AIV1的积压，避免把网关工作竞争与普通搬运耗时混为一谈。
+- QP=8检查每个AIV0 owner的首次归并晚于本核最后一次路由/共享prologue结束，
+  并观察归并/发包与AIV1机内Combine的重叠、后续commit/quiet拖尾。
 - 检查精度、行分配和缓冲区复用；重复交错运行基线与修改组，避免用启动抖动解释中间阶段的收益。
 
 `AIV_COMBINE_READY`是轮询观察到的pending/ready mask，不是硬件精确到达时刻；
@@ -830,9 +839,10 @@ python3 experiments/megamoe/scripts/trace_text.py restore part1.txt part2.txt \
 FP8 和内部量化的 BF16 输入均沿用原接口，容量可大于实际 B。B>32 及更多16卡主机暂不支持。
 A8W8 当前只运行路由专家，`num_shared_experts` 必须为0，不能传入 timer。
 
-两台机器的所有 rank 都固定由物理 AIV0 打包本地元数据，物理 AIV1 发送 RDMA。
-AIV1 在 Dispatch 和 Combine 全程独占 QP1，包括 Put、quiet 和 commit；AIV0 不推进 RDMA。
-此分工适用于 A8W4/A8W8；host_id 仍用于选择 rail 槽、gateway 和接收转发分工，
+两台机器的所有 rank 都固定由物理 AIV0 打包本地元数据，物理 AIV1 发送启动Dispatch RDMA。
+默认`combine_reduce_qps=0`时，AIV1在Dispatch和Combine全程独占QP1，包括Put、quiet和commit；
+AIV0不推进RDMA。此默认分工适用于A8W4/A8W8；A8W4的4/8QP归并分工见前述实验说明。
+host_id仍用于选择rail槽、gateway和接收转发分工，默认路径
 运行时恢复2个 QP（QP0 保留给 SDK、QP1 由算子独占），56个 AIV 中其余54个核负责 Relay。
 发送核等待 `LocalRailPacked` 后，严格按 `metadata Put → payload Put → payload commit` 的顺序提交。
 

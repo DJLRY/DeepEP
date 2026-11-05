@@ -110,12 +110,20 @@ HOST_DEVICE uint32_t HierarchicalCombineOwnerCount(const MegaMoeTilingData* t)
     return UseHierarchicalCombineReduction(t) ? t->combineReduceQps : 1U;
 }
 
-// Physical AIV1,3,... own QP1,2,...; all retain their activation/Dispatch jobs.
+HOST_DEVICE bool UseAiv0CombineOwners(const MegaMoeTilingData* t)
+{
+    return UseHierarchicalRoce(t) && t->combineReduceQps == 8U;
+}
+
+// QP=8 uses g0..g7 AIV0 only after all of each owner's prologues have drained.
+// QP=0/4 retain AIV1 owners. Dispatch still uses physical job 1; the existing
+// input barrier transfers QP1 to the Combine owner before any GMM can start.
 HOST_DEVICE uint32_t HierarchicalCombineLane(const MegaMoeTilingData* t, uint32_t physicalJob)
 {
     const uint32_t count = HierarchicalCombineOwnerCount(t);
     const uint32_t lane = physicalJob / 2U;
-    return (physicalJob & 1U) != 0U && lane < count ? lane : count;
+    const uint32_t subBlock = UseAiv0CombineOwners(t) ? 0U : 1U;
+    return (physicalJob & 1U) == subBlock && lane < count ? lane : count;
 }
 
 HOST_DEVICE bool IsHierarchicalCombineOwner(const MegaMoeTilingData* t, uint32_t physicalJob)
@@ -140,6 +148,8 @@ HOST_DEVICE uint32_t UnpermuteJobIndex(const MegaMoeTilingData* t, uint32_t phys
     if (IsHierarchicalCombineOwner(t, physicalJob)) {
         return UnpermuteJobCount(t);  // Invalid logical job: owns no output rows.
     }
+    // For a nonowner this counts preceding owners for either even or odd
+    // physical jobs; owner jobs themselves returned above.
     const uint32_t before = (physicalJob + 1U) / 2U;
     const uint32_t count = HierarchicalCombineOwnerCount(t);
     return physicalJob - (before < count ? before : count);

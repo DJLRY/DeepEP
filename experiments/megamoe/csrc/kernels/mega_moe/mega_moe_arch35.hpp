@@ -98,9 +98,11 @@ protected:
     {
         if constexpr (g_coreType == AIV) {
             if (UseHierarchicalCombineReduction(params_.tilingData)) {
-                // A whole token is nonpreemptible. Never start it while this
-                // worker still owes any activation or Dispatch work.
-                if (foregroundPending || !IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)) {
+                // QP=8 has a dedicated AIV0 tail after ALL routed/shared
+                // prologues. Never enter it from an inter-wave progress call.
+                // AIV1 reduction remains gated on all foreground work ending.
+                if (UseAiv0CombineOwners(params_.tilingData) || foregroundPending ||
+                    !IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)) {
                     return false;
                 }
                 return TryProgressHierarchicalReducedCombine(
@@ -1023,6 +1025,18 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         ProcessSharedExpertTail();
     }
     if constexpr (g_coreType == AIV) {
+        if (UseAiv0CombineOwners(params_.tilingData) &&
+            IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)) {
+            // All local routed/shared prologues have returned with their final
+            // L1 credits and UB/events released. No more matrix work depends
+            // on this AIV0. AIV1 producers continue independently, so this
+            // owner may drain ready rows before joining the export barrier.
+            // Do not move this into the per-wave loop or before the shared tail.
+            PipeBarrier<PIPE_ALL>();
+            DrainHierarchicalReducedCombine(commonConfig_, params_, hierarchicalCombine_,
+                                            HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex),
+                                            HierarchicalRoceScratch(params_), timer_.Enabled() ? &timer_ : nullptr);
+        }
         timer_.Start(AscendTimer::AIV_EXPORT_SYNC);
         ExportCompactExpertTokenCounts(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
         TryProgressRemoteCombine(false);
