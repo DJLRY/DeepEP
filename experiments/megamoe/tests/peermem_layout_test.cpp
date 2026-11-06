@@ -223,9 +223,17 @@ void check_packet_gateway_layout(uint8_t mode)
             const uint64_t rowBytes = qps == 8U ? (hidden * 2U + 507U) / 508U * 512U : hidden * 2U;
             const uint64_t rows = 64U * 8U;
             assert(UsePacketizedGatewayCombine(&t) == (qps == 8U));
-            for (uint32_t inputBuffers : {1U, 2U})
+            const uint64_t inputRowBytes = qps == 8U ? rowBytes : (hidden * 2U + 127U) / 128U * 128U;
+            const uint64_t sumBytes = (hidden * 4U + 255U) / 256U * 256U;
+            const uint64_t readyBytes = qps == 8U ? 8U * (rowBytes / 512U) * 32U + 32U : 0U;
+            assert(CalcGatewayCombineInputUbRowBytes(&t) == static_cast<int64_t>(inputRowBytes));
+            assert(CalcGatewayCombineSumUbBytes(&t) == static_cast<int64_t>(sumBytes));
+            assert(CalcGatewayCombineReadyUbBytes(&t) == static_cast<int64_t>(readyBytes));
+            for (uint32_t inputBuffers : {1U, 2U}) {
+                const uint64_t reduceBytes = inputRowBytes * inputBuffers + sumBytes + 32U;
                 assert(CalcGatewayCombineReduceUbBytes(&t, inputBuffers) ==
-                       static_cast<int64_t>(rowBytes * inputBuffers + hidden * 8U + 32U));
+                       static_cast<int64_t>(reduceBytes > readyBytes ? reduceBytes : readyBytes));
+            }
             if (qps == 8U) {
                 assert(info.gatewayCombineReadyPtr == nullptr);
                 assert(info.hierarchicalControlPtr == info.gatewayCombinePtr + rows * rowBytes);

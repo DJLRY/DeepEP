@@ -303,7 +303,7 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     const uint32_t reduce_input_buffers = (pipeline_flags & megamoe_config::REDUCE_DOUBLE_BUFFER) ? 2U : 1U;
     TORCH_CHECK(
         combine_reduce_qps == 0 || stage_ub >= MegaMoeImpl::CalcGatewayCombineReduceUbBytes(&t, reduce_input_buffers),
-        "Not enough UB for FP32 gateway reduction");
+        "Not enough UB for gateway readiness and FP32 reduction");
     t.roceScratchUbOffset = hierarchical ? stage_ub : 0U;
     t.sharedExpertNum = static_cast<uint32_t>(shared_experts);
     t.combineSyncSlotCountPerExpert = 0;

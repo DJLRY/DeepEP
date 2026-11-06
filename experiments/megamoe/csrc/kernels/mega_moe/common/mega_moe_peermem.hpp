@@ -263,11 +263,34 @@ HOST_DEVICE int64_t CalcGatewayCombineReadyBytes(int64_t tokens, int64_t topK, u
     return qps == 8U ? 0 : tokens * topK * HIERARCHICAL_FLAG_BYTES;
 }
 
+HOST_DEVICE int64_t CalcGatewayCombineInputUbRowBytes(const MegaMoeTilingData* t)
+{
+    // The VF loads 64 BF16 values at a time, including the masked final chunk.
+    return UsePacketizedGatewayCombine(t) ? CalcGatewayCombinePacketRowBytes(t->h)
+                                          : Ops::Base::CeilAlign(static_cast<int64_t>(t->h) * 2, int64_t{128});
+}
+
+HOST_DEVICE int64_t CalcGatewayCombineSumUbBytes(const MegaMoeTilingData* t)
+{
+    return Ops::Base::CeilAlign(static_cast<int64_t>(t->h) * 4, int64_t{256});
+}
+
+HOST_DEVICE int64_t CalcGatewayCombineReadyUbBytes(const MegaMoeTilingData* t)
+{
+    // Sparse snapshots keep the original top-k row positions. The last 32B
+    // hold one ready mask, read by Scalar only after the VF has finished.
+    return UsePacketizedGatewayCombine(t)
+               ? t->topK * (CalcGatewayCombinePacketRowBytes(t->h) / RAIL_PACKET_BYTES) * ALIGN_32 + ALIGN_32
+               : 0;
+}
+
 HOST_DEVICE int64_t CalcGatewayCombineReduceUbBytes(const MegaMoeTilingData* t, uint32_t inputBuffers)
 {
-    const int64_t inputRowBytes = UsePacketizedGatewayCombine(t) ? CalcGatewayCombinePacketRowBytes(t->h) : t->h * 2LL;
-    return inputRowBytes * inputBuffers + t->h * 8LL +
-           Ops::Base::CeilAlign(static_cast<int64_t>(t->topK) * 4, ALIGN_32);
+    const int64_t reduceBytes = CalcGatewayCombineInputUbRowBytes(t) * inputBuffers + CalcGatewayCombineSumUbBytes(t) +
+                                Ops::Base::CeilAlign(static_cast<int64_t>(t->topK) * 4, ALIGN_32);
+    const int64_t readyBytes = CalcGatewayCombineReadyUbBytes(t);
+    // Readiness and reduction run sequentially in the same drained main UB.
+    return reduceBytes > readyBytes ? reduceBytes : readyBytes;
 }
 
 HOST_DEVICE int32_t RailPacketMarker(const MegaMoeTilingData* tilingData, uint32_t epoch, uint32_t totalItems)

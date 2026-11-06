@@ -4,38 +4,53 @@
 
 #include "mega_moe_hierarchical_combine.hpp"
 #include "mega_moe_combine_packet.hpp"
+#include "mega_moe_combine_vf.hpp"
 
 namespace MegaMoeImpl {
 
-// Acquire EVERY packet, not just the last one: MTE has no cross-packet SO
-// guarantee. Gather eight 32B packet tails per DMA into the existing QP scratch.
-__aicore__ inline bool GatewayCombinePacketsReady(const Params& params, uint32_t row)
+// Acquire EVERY selected packet: MTE has no cross-packet SO guarantee. One
+// strided DMA per contiguous selected-row run gathers 32B packet tails. Queue
+// every run before a single MTE2_V / VF / V_S round trip for this token.
+// Main UB is free after the owner's foreground work; reduction may overwrite
+// it only after this function returns the ready mask in a scalar register.
+__aicore__ inline uint32_t GatewayCombinePacketReadyMask(const Params& params, uint32_t token, uint32_t mask)
 {
+    if (mask == 0U) return 0U;
     constexpr uint32_t blockBytes = 32U;
-    constexpr uint32_t batch = MEGAMOE_ROCE_SCRATCH_BYTES / blockBytes;
     const uint32_t rowBytes = CalcGatewayCombinePacketRowBytes(params.tilingData->h);
     const uint32_t packets = rowBytes / RAIL_PACKET_BYTES;
+    const uint32_t topK = params.tilingData->topK;
+    const uint32_t snapshotBytes = topK * packets * blockBytes;
     GlobalTensor<uint32_t> tails;
-    tails.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(
-        params.peermemInfo.gatewayCombinePtr + static_cast<uint64_t>(row) * rowBytes + RAIL_PACKET_BYTES - blockBytes));
-    LocalTensor<uint32_t> snapshot(TPosition::VECCALC, params.tilingData->roceScratchUbOffset,
-                                   MEGAMOE_ROCE_SCRATCH_BYTES / sizeof(uint32_t));
-    for (uint32_t first = 0U; first < packets; first += batch) {
-        const uint32_t count = packets - first < batch ? packets - first : batch;
-        SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
-        DataCopy(snapshot, tails[first * RAIL_PACKET_WORDS],
+    tails.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(params.peermemInfo.gatewayCombinePtr +
+                                                             static_cast<uint64_t>(token) * topK * rowBytes +
+                                                             RAIL_PACKET_BYTES - blockBytes));
+    LocalTensor<uint32_t> snapshot(TPosition::VECCALC, 0U, snapshotBytes / sizeof(uint32_t));
+    LocalTensor<uint32_t> result(TPosition::VECCALC, snapshotBytes, blockBytes / sizeof(uint32_t));
+    SyncFuncStatic<HardEvent::V_MTE2, MEGAMOE_ROCE_EVENT_ID>();
+    for (uint32_t topk = 0U; topk < topK;) {
+        if ((mask & (uint32_t{1} << topk)) == 0U) {
+            ++topk;
+            continue;
+        }
+        const uint32_t first = topk++;
+        while (topk < topK && (mask & (uint32_t{1} << topk)) != 0U) ++topk;
+        const uint32_t count = (topk - first) * packets;
+        // h <= 8192 and topK <= 32 bound count to 1056, within uint16_t.
+        DataCopy(snapshot[first * packets * (blockBytes / sizeof(uint32_t))],
+                 tails[first * packets * RAIL_PACKET_WORDS],
                  DataCopyParams{static_cast<uint16_t>(count), 1U,
                                 static_cast<uint16_t>(RAIL_PACKET_BYTES / blockBytes - 1U), 0U});
-        SyncFuncStatic<HardEvent::MTE2_S, MEGAMOE_ROCE_EVENT_ID>();
-        bool ready = true;
-        for (uint32_t i = 0U; i < count; ++i) {
-            ready = ready && snapshot.GetValue(i * (blockBytes / sizeof(uint32_t)) + 7U) ==
-                                 params.tilingData->hierarchicalSequence;
-        }
-        SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
-        if (!ready) return false;
     }
-    return true;
+    SyncFuncStatic<HardEvent::MTE2_V, MEGAMOE_ROCE_EVENT_ID>();
+    asc_vf_call<CheckGatewayCombinePacketsVF>(reinterpret_cast<__ubuf__ uint32_t*>(snapshot.GetPhyAddr()),
+                                              reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()), packets, topK,
+                                              mask, params.tilingData->hierarchicalSequence);
+    SyncFuncStatic<HardEvent::V_S, MEGAMOE_ROCE_EVENT_ID>();
+    const uint32_t ready = result.GetValue(0U);
+    // Reduction's MTE2 may reuse the status bytes as input immediately.
+    SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
+    return ready;
 }
 
 __aicore__ inline uint32_t CombineMaskCount(uint32_t mask)
@@ -87,13 +102,12 @@ __aicore__ inline void ReduceAndPostHierarchicalToken(const MoeStageCommonConfig
     const uint32_t hidden = common.tokenHiddenDim;
     constexpr uint32_t inputBuffers = DoubleBuffered ? 2U : 1U;
     const bool packetized = UsePacketizedGatewayCombine(params.tilingData);
-    const uint32_t inputStride = packetized ? CalcGatewayCombinePacketRowBytes(hidden) / sizeof(bfloat16_t) : hidden;
+    const uint32_t inputStride = CalcGatewayCombineInputUbRowBytes(params.tilingData) / sizeof(bfloat16_t);
     const uint32_t inputBytes = inputStride * inputBuffers * sizeof(bfloat16_t);
+    const uint32_t sumBytes = CalcGatewayCombineSumUbBytes(params.tilingData);
     LocalTensor<bfloat16_t> input(TPosition::VECCALC, 0U, inputStride * inputBuffers);
-    LocalTensor<float> value(TPosition::VECCALC, inputBytes, hidden);
-    LocalTensor<float> sum(TPosition::VECCALC, inputBytes + hidden * sizeof(float), hidden);
-    LocalTensor<float> weights(TPosition::VECCALC, inputBytes + hidden * 2U * sizeof(float),
-                               Ops::Base::CeilAlign(common.topK, 8U));
+    LocalTensor<float> sum(TPosition::VECCALC, inputBytes, sumBytes / sizeof(float));
+    LocalTensor<float> weights(TPosition::VECCALC, inputBytes + sumBytes, Ops::Base::CeilAlign(common.topK, 8U));
     GlobalTensor<float> weightGm, partialGm;
     const uint32_t sourceHost = HierarchicalHost(HierarchicalGateway(common.rankId));
     weightGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.peermemInfo.railTopkIdsRecvPtr +
@@ -106,7 +120,8 @@ __aicore__ inline void ReduceAndPostHierarchicalToken(const MoeStageCommonConfig
     {
         DataCopyPad(weights, weightGm[static_cast<uint64_t>(token) * common.topK], {1U, common.topK * 4U, 0U, 0U, 0U},
                     {false, 0U, 0U, 0U});
-        SyncFuncStatic<HardEvent::MTE2_S, EVENT_ID0>();
+        // The first row's MTE2_V also acquires these weights. No Scalar weight
+        // read or per-row S_V handoff is needed by the fused row VF.
         bool first = true;
         uint32_t consumed = 0U;
         if constexpr (DoubleBuffered) {
@@ -121,8 +136,8 @@ __aicore__ inline void ReduceAndPostHierarchicalToken(const MoeStageCommonConfig
             if ((mask & (uint32_t{1} << topk)) == 0U) {
                 continue;
             }
+            const uint32_t slot = DoubleBuffered ? consumed & 1U : 0U;
             if constexpr (DoubleBuffered) {
-                const uint32_t slot = consumed & 1U;
                 uint32_t next = topk + 1U;
                 while (next < common.topK && (mask & (uint32_t{1} << next)) == 0U) ++next;
                 if (next < common.topK) {
@@ -135,30 +150,27 @@ __aicore__ inline void ReduceAndPostHierarchicalToken(const MoeStageCommonConfig
                     SetFlag<HardEvent::MTE2_V>(static_cast<TEventID>(nextSlot));
                 }
                 WaitFlag<HardEvent::MTE2_V>(static_cast<TEventID>(slot));
-                Cast(value, input[slot * inputStride], RoundMode::CAST_NONE, hidden);
-                // Only Cast reads the BF16 input. Its completion permits reuse
-                // while the subsequent FP32 multiply/add works in other buffers.
-                SetFlag<HardEvent::V_MTE2>(static_cast<TEventID>(slot));
-                ++consumed;
             } else {
                 const uint64_t row = static_cast<uint64_t>(token) * common.topK + topk;
                 LoadGatewayCombineRow(input, rows, row, hidden, packetized);
                 SyncFuncStatic<HardEvent::MTE2_V, EVENT_ID0>();
-                Cast(value, input, RoundMode::CAST_NONE, hidden);
             }
-            PipeBarrier<PIPE_V>();
-            const float weight = weights.GetValue(topk);
-            SyncFuncStatic<HardEvent::S_V, EVENT_ID0>();
+            auto* rowUb = reinterpret_cast<__ubuf__ bfloat16_t*>(input[slot * inputStride].GetPhyAddr());
+            auto* sumUb = reinterpret_cast<__ubuf__ float*>(sum.GetPhyAddr());
+            auto* weightUb = reinterpret_cast<__ubuf__ float*>(weights.GetPhyAddr()) + topk;
             if (first) {
-                Muls(sum, value, weight, hidden);
+                asc_vf_call<AccumulateGatewayCombineRowVF<true>>(rowUb, sumUb, weightUb, hidden);
                 first = false;
             } else {
-                Muls(value, value, weight, hidden);
-                PipeBarrier<PIPE_V>();
-                Add(sum, sum, value, hidden);
+                asc_vf_call<AccumulateGatewayCombineRowVF<false>>(rowUb, sumUb, weightUb, hidden);
             }
+            // Order sum stores before the next VF's sum loads. Within the VF,
+            // conversion/product stay in registers instead of a temporary UB row.
             PipeBarrier<PIPE_V>();
-            if constexpr (!DoubleBuffered) {
+            if constexpr (DoubleBuffered) {
+                SetFlag<HardEvent::V_MTE2>(static_cast<TEventID>(slot));
+                ++consumed;
+            } else {
                 SyncFuncStatic<HardEvent::V_MTE2, EVENT_ID0>();
             }
         }
@@ -217,16 +229,19 @@ __aicore__ inline bool TryProgressHierarchicalReducedCombine(const MoeStageCommo
         bool ready = mask != 0U;
         uint32_t observed = 0U;
         const int64_t scanStart = diagnostic ? GetSystemCycle() : 0;
-        for (uint32_t topk = 0U; (ready || diagnostic) && topk < common.topK; ++topk) {
-            if ((mask & (uint32_t{1} << topk)) != 0U) {
-                const uint32_t row = token * common.topK + topk;
-                const bool rowReady =
-                    UsePacketizedGatewayCombine(params.tilingData)
-                        ? GatewayCombinePacketsReady(params, row)
-                        : snapshot.Ready(params, row, common.tokenNum * common.topK - row, common.topK);
-                ready = ready && rowReady;
-                observed |= rowReady ? uint32_t{1} << topk : 0U;
-                ++scannedRows;
+        if (UsePacketizedGatewayCombine(params.tilingData)) {
+            observed = GatewayCombinePacketReadyMask(params, token, mask);
+            ready = ready && observed == mask;
+            scannedRows += CombineMaskCount(mask);
+        } else {
+            for (uint32_t topk = 0U; (ready || diagnostic) && topk < common.topK; ++topk) {
+                if ((mask & (uint32_t{1} << topk)) != 0U) {
+                    const uint32_t row = token * common.topK + topk;
+                    const bool rowReady = snapshot.Ready(params, row, common.tokenNum * common.topK - row, common.topK);
+                    ready = ready && rowReady;
+                    observed |= rowReady ? uint32_t{1} << topk : 0U;
+                    ++scannedRows;
+                }
             }
         }
         if (diagnostic && mask != 0U && observed != progress.deferredTopkMasks[token]) {
@@ -279,13 +294,15 @@ __aicore__ inline void TraceHierarchicalCombineBoundary(const MoeStageCommonConf
         const int64_t start = GetSystemCycle();
         const uint32_t mask = progress.pendingTopkMasks[token];
         uint32_t observed = 0U;
-        for (uint32_t topk = 0U; topk < common.topK; ++topk) {
-            const uint32_t row = token * common.topK + topk;
-            if ((mask & (uint32_t{1} << topk)) != 0U &&
-                (UsePacketizedGatewayCombine(params.tilingData)
-                     ? GatewayCombinePacketsReady(params, row)
-                     : snapshot.Ready(params, row, common.tokenNum * common.topK - row, common.topK))) {
-                observed |= uint32_t{1} << topk;
+        if (UsePacketizedGatewayCombine(params.tilingData)) {
+            observed = GatewayCombinePacketReadyMask(params, token, mask);
+        } else {
+            for (uint32_t topk = 0U; topk < common.topK; ++topk) {
+                const uint32_t row = token * common.topK + topk;
+                if ((mask & (uint32_t{1} << topk)) != 0U &&
+                    snapshot.Ready(params, row, common.tokenNum * common.topK - row, common.topK)) {
+                    observed |= uint32_t{1} << topk;
+                }
             }
         }
         timer->RecordDetail(AscendTimer::AIV_COMBINE_READY, start, GetSystemCycle(),

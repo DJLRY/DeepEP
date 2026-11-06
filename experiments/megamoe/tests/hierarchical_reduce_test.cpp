@@ -75,6 +75,45 @@ inline std::array<bfloat16_t*, 8> releaseInputs{};
 inline std::map<bfloat16_t*, bool> busyInputs;
 inline bfloat16_t* lastCastInput = nullptr;
 inline uint32_t overlappedCasts = 0;
+inline uint32_t scalarReads = 0, scalarFloatReads = 0, flagDmas = 0, readyVfs = 0, rowVfs = 0;
+inline const uint32_t* readyResultAddress = nullptr;
+inline bool readyResultPending = false;
+struct FlagLoad {
+    uint8_t* destination;
+    std::vector<uint8_t> bytes;
+};
+inline std::vector<FlagLoad> queuedFlags;
+inline std::array<std::vector<FlagLoad>, 8> flagEvents;
+inline bool checkSnapshotReads = false;
+inline uint32_t snapshotMask = 0, snapshotPackets = 0;
+inline const uint8_t* snapshotBase = nullptr;
+inline const uint8_t* snapshotResult = nullptr;
+inline const uint8_t* flagSourceBegin = nullptr;
+inline size_t flagSourceBytes = 0;
+inline uint32_t flagSourceMask = 0, flagSourcePackets = 0;
+inline bool checkRowReads = false;
+inline size_t mainUbLimit = ub.size() - 512U;
+inline const uint8_t *rowBegin = nullptr, *sumBegin = nullptr, *weightBegin = nullptr;
+inline uint32_t rowReadBytes = 0, sumReadBytes = 0;
+inline void CheckUbAccess(const void* address, size_t bytes, bool write)
+{
+    const auto* ptr = static_cast<const uint8_t*>(address);
+    Check(ptr >= ub.data() && ptr + bytes <= ub.data() + mainUbLimit, "VF escaped declared main UB budget");
+    if (checkSnapshotReads && write)
+        Check(ptr == snapshotResult && bytes == 4U, "ready VF wrote outside its result word");
+    if (checkSnapshotReads && !write) {
+        const size_t offset = ptr - snapshotBase;
+        Check(bytes == 4U && offset % 32U == 28U && offset / (snapshotPackets * 32U) < 32U &&
+                  (snapshotMask & (uint32_t{1} << (offset / (snapshotPackets * 32U)))) != 0U,
+              "VF read an inactive row or a non-marker word");
+    }
+    if (checkRowReads) {
+        const bool input = ptr >= rowBegin && ptr + bytes <= rowBegin + rowReadBytes;
+        const bool sum = ptr >= sumBegin && ptr + bytes <= sumBegin + sumReadBytes;
+        const bool weight = ptr == weightBegin && bytes == sizeof(float);
+        Check(write ? sum : input || sum || weight, "row VF read/write escaped its padded slots");
+    }
+}
 struct Post {
     uint32_t qp;
     uint8_t* source;
@@ -93,7 +132,7 @@ inline void Deliver()
 namespace AscendC {
 using TEventID = uint32_t;
 enum class TPosition { VECCALC };
-enum class RoundMode { CAST_NONE, CAST_RINT };
+enum class RoundMode { CAST_NONE, CAST_RINT, UNKNOWN };
 enum class HardEvent { S_MTE2, MTE2_S, MTE2_V, V_MTE2, S_V, V_S, V_MTE3, MTE3_S, MTE3_V, MTE2_MTE3, MTE3_MTE2, S_MTE3 };
 enum class PaddingMode { Normal, Compact };
 template <typename T>
@@ -113,7 +152,15 @@ struct LocalTensor {
     }
     T GetValue(uint32_t index) const
     {
+        if (static_cast<const void*>(data + index) == ReduceTest::readyResultAddress)
+            ReduceTest::Check(!ReduceTest::readyResultPending, "Scalar read before V_S acquired ready result");
+        ++ReduceTest::scalarReads;
+        if constexpr (std::is_same_v<T, float>) ++ReduceTest::scalarFloatReads;
         return data[index];
+    }
+    T* GetPhyAddr() const
+    {
+        return data;
     }
     void SetValue(uint32_t index, T value)
     {
@@ -187,6 +234,27 @@ void DataCopy(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count)
 template <typename T>
 void DataCopy(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyParams p)
 {
+    if constexpr (std::is_same_v<T, uint32_t>) {
+        ReduceTest::Check(p.blockLen == 1U && p.srcStride == 15U && p.dstStride == 0U,
+                          "packet tails not gathered in 32B blocks");
+        ++ReduceTest::flagDmas;
+        std::vector<uint8_t> bytes(p.blockCount * 32U);
+        for (uint32_t i = 0; i < p.blockCount; ++i) {
+            auto* from = reinterpret_cast<uint8_t*>(src.data) + i * 512U;
+            if (ReduceTest::flagSourceBegin != nullptr) {
+                using namespace ReduceTest;
+                Check(from >= flagSourceBegin && from + 32U <= flagSourceBegin + flagSourceBytes,
+                      "flag DMA escaped owned token");
+                const size_t offset = from - flagSourceBegin;
+                Check(offset % 512U == 480U &&
+                          (flagSourceMask & (uint32_t{1} << (offset / (flagSourcePackets * 512U)))) != 0U,
+                      "flag DMA read an inactive row");
+            }
+            std::memcpy(bytes.data() + i * 32U, from, 32U);
+        }
+        ReduceTest::queuedFlags.push_back({reinterpret_cast<uint8_t*>(dst.data), std::move(bytes)});
+        return;
+    }
     for (uint32_t i = 0; i < p.blockCount; ++i) {
         std::memcpy(reinterpret_cast<uint8_t*>(dst.data) + i * (p.blockLen + p.dstStride) * 32U,
                     reinterpret_cast<uint8_t*>(src.data) + i * (p.blockLen + p.srcStride) * 32U, p.blockLen * 32U);
@@ -213,6 +281,13 @@ void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtParams p, D
             std::vector<bfloat16_t> values(result.size() / sizeof(bfloat16_t));
             std::memcpy(values.data(), result.data(), result.size());
             ReduceTest::queuedInputs.push_back({target, std::move(values)});
+            return;
+        }
+    }
+    if constexpr (std::is_same_v<T, float>) {
+        if (ReduceTest::deferInputs) {
+            // Weights must be acquired by the first input's MTE2_V too.
+            ReduceTest::queuedFlags.push_back({reinterpret_cast<uint8_t*>(dst.data), std::move(result)});
             return;
         }
     }
@@ -257,14 +332,20 @@ void SetFlag(TEventID id)
     auto& flag = ReduceTest::events[static_cast<size_t>(E)][id];
     ReduceTest::Check(flag == 0, "reusing a live event");
     flag = 1;
+    if constexpr (E == HardEvent::MTE2_V) {
+        ReduceTest::Check(ReduceTest::flagEvents[id].empty(), "flag event still owns DMA");
+        ReduceTest::flagEvents[id].swap(ReduceTest::queuedFlags);
+    }
     if (ReduceTest::deferInputs) {
         if constexpr (E == HardEvent::MTE2_V) {
             ReduceTest::Check(ReduceTest::inputEvents[id].empty(), "input event still owns a load");
             ReduceTest::inputEvents[id].swap(ReduceTest::queuedInputs);
         } else if constexpr (E == HardEvent::V_MTE2) {
-            ReduceTest::Check(ReduceTest::lastCastInput != nullptr, "release before Cast");
-            ReduceTest::releaseInputs[id] = ReduceTest::lastCastInput;
-            ReduceTest::lastCastInput = nullptr;
+            if (id != 7U) {
+                ReduceTest::Check(ReduceTest::lastCastInput != nullptr, "release before vector input read");
+                ReduceTest::releaseInputs[id] = ReduceTest::lastCastInput;
+                ReduceTest::lastCastInput = nullptr;
+            }
         }
     }
 }
@@ -274,15 +355,25 @@ void WaitFlag(TEventID id)
     auto& flag = ReduceTest::events[static_cast<size_t>(E)][id];
     ReduceTest::Check(flag == 1, "waiting on an unpublished event");
     flag = 0;
+    if constexpr (E == HardEvent::V_S) {
+        if (id == 7U) ReduceTest::readyResultPending = false;
+    }
+    if constexpr (E == HardEvent::MTE2_V) {
+        for (const auto& load : ReduceTest::flagEvents[id])
+            std::copy(load.bytes.begin(), load.bytes.end(), load.destination);
+        ReduceTest::flagEvents[id].clear();
+    }
     if (ReduceTest::deferInputs) {
         if constexpr (E == HardEvent::MTE2_V) {
             for (const auto& load : ReduceTest::inputEvents[id])
                 std::copy(load.values.begin(), load.values.end(), load.destination);
             ReduceTest::inputEvents[id].clear();
         } else if constexpr (E == HardEvent::V_MTE2) {
-            ReduceTest::Check(ReduceTest::releaseInputs[id] != nullptr, "missing input release");
-            ReduceTest::busyInputs[ReduceTest::releaseInputs[id]] = false;
-            ReduceTest::releaseInputs[id] = nullptr;
+            if (id != 7U) {
+                ReduceTest::Check(ReduceTest::releaseInputs[id] != nullptr, "missing input release");
+                ReduceTest::busyInputs[ReduceTest::releaseInputs[id]] = false;
+                ReduceTest::releaseInputs[id] = nullptr;
+            }
         }
     }
 }
@@ -295,6 +386,52 @@ inline int64_t GetSystemCycle()
     return ++ReduceTest::cycle;
 }
 }  // namespace AscendC
+
+template <auto Function>
+void asc_vf_call(uint32_t* tails, uint32_t* result, uint32_t packets, uint32_t topk, uint32_t mask, uint32_t sequence)
+{
+    using namespace ReduceTest;
+    Check(queuedFlags.empty(), "VF before flag DMA submitted");
+    for (const auto& loads : flagEvents) Check(loads.empty(), "VF before flag DMA completed");
+    checkSnapshotReads = true;
+    snapshotBase = reinterpret_cast<uint8_t*>(tails);
+    snapshotResult = reinterpret_cast<uint8_t*>(result);
+    snapshotMask = mask;
+    snapshotPackets = packets;
+    ++readyVfs;
+    Function(tails, result, packets, topk, mask, sequence);
+    readyResultAddress = result;
+    readyResultPending = true;
+    checkSnapshotReads = false;
+}
+
+template <auto Function>
+void asc_vf_call(bfloat16_t* input, float* sum, float* weight, uint32_t hidden)
+{
+    using namespace ReduceTest;
+    Check(queuedFlags.empty(), "row VF before weight DMA submitted");
+    for (const auto& loads : flagEvents) Check(loads.empty(), "row VF before weight DMA completed");
+    if (deferInputs) {
+        Check(queuedInputs.empty(), "input load lacks a completion event");
+        bool prefetched = false;
+        for (const auto& loads : inputEvents)
+            for (const auto& load : loads) {
+                Check(load.destination != input, "row VF before input DMA completed");
+                prefetched = true;
+            }
+        overlappedCasts += prefetched;
+        lastCastInput = input;
+    }
+    checkRowReads = true;
+    rowBegin = reinterpret_cast<uint8_t*>(input);
+    sumBegin = reinterpret_cast<uint8_t*>(sum);
+    weightBegin = reinterpret_cast<uint8_t*>(weight);
+    rowReadBytes = (hidden + 63U) / 64U * 128U;
+    sumReadBytes = (hidden + 63U) / 64U * 256U;
+    ++rowVfs;
+    Function(input, sum, weight, hidden);
+    checkRowReads = false;
+}
 
 #include "../csrc/kernels/mega_moe/common/mega_moe_peermem.hpp"
 #include "../csrc/kernels/mega_moe/common/ascend_timer_v2.hpp"
@@ -382,6 +519,8 @@ inline void RocePutBytes(uint8_t* dst, uint8_t* src, uint32_t bytes, uint32_t pe
     using namespace ReduceTest;
     Check(!commit && qp == activeLane + 1U && peer == expectedPeer, "foreign QP owner/destination");
     Check(queuedInputs.empty(), "input DMA not submitted before POST");
+    Check(queuedFlags.empty(), "flag DMA not submitted before POST");
+    for (const auto& loads : flagEvents) Check(loads.empty(), "flag DMA still pending before POST");
     for (const auto& loads : inputEvents) Check(loads.empty(), "input DMA still pending before POST");
     for (const auto& input : busyInputs) Check(!input.second, "input buffer not released before POST");
     for (const auto& type : events)
@@ -428,6 +567,8 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     busyInputs.clear();
     lastCastInput = nullptr;
     overlappedCasts = 0;
+    scalarFloatReads = 0;
+    rowVfs = 0;
     MegaMoeTilingData t{};
     t.bs = bs;
     t.numMaxTokensPerRank = capacity;
@@ -445,6 +586,7 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     t.roceScratchUbOffset = 256U * 1024U - 512U;
     t.hierarchicalSequence = sequence;
     t.sharedExpertNum = shared ? 1U : 0U;
+    mainUbLimit = CalcGatewayCombineReduceUbBytes(&t, doubleBuffer ? 2U : 1U);
     const PeermemSizeParams sizes{capacity,           topk, hidden, 12U, 32U, 2U, 1U, false, false,
                                   TOPO_TYPE_MTE_ROCE, true, 16U,    qps};
     heapBytes = CalcPeermemLeastSize(sizes);
@@ -580,13 +722,14 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
             for (uint32_t p = 0; p < packetCount; ++p) words[p * 128U + 127U] = sequence;
             const uint32_t missing = packetCount / 2U;
             words[missing * 128U + 127U] = sequence - 1U;
-            Check(!GatewayCombinePacketsReady(params, row), "partial packet row released");
+            Check(GatewayCombinePacketReadyMask(params, token, uint32_t{1} << k) == 0U, "partial packet row released");
             const size_t before = posts.size();
             for (activeLane = 0; activeLane < qps; ++activeLane)
                 TryProgressHierarchicalReducedCombine(gwCommon, params, state[activeLane], activeLane, scratch, &timer);
             Check(posts.size() == before, "partial packet row reduced or posted");
             words[missing * 128U + 127U] = sequence;
-            Check(GatewayCombinePacketsReady(params, row), "complete packet row not ready");
+            Check(GatewayCombinePacketReadyMask(params, token, uint32_t{1} << k) == (uint32_t{1} << k),
+                  "complete packet row not ready");
         } else {
             ready[row * 128U] = sequence;
         }
@@ -623,6 +766,10 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     for (const auto mask : masks)
         if (doubleBuffer && mask != 0U) expectedOverlap += CombineMaskCount(mask) - 1U;
     Check(overlappedCasts == expectedOverlap, "next expert load did not overlap current Cast");
+    uint32_t expectedRowVfs = 0U;
+    for (const auto mask : masks) expectedRowVfs += CombineMaskCount(mask);
+    Check(rowVfs == expectedRowVfs && scalarFloatReads == 0U, "row fusion skipped a row or read a Scalar weight");
+    mainUbLimit = ub.size() - 512U;
     deferInputs = false;
     Check(timer.reduced == posts.size(), "missing reduction timing record");
     // UB can be reused while the NIC owns immutable symmetric GM sources.
@@ -666,9 +813,124 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
         Check(output[i].bits == expectedOutput[i].bits, "final output differs / remote weighted twice");
 }
 
+void CheckBatchSnapshots()
+{
+    using namespace ReduceTest;
+    for (uint32_t hidden : {1024U, 1056U, 3584U, 8128U, 8192U}) {
+        for (uint32_t topk : {1U, 7U, 8U, 32U}) {
+            MegaMoeTilingData t{};
+            t.h = hidden;
+            t.topK = topk;
+            t.epWorldSize = 32U;
+            t.dispatchRanksPerNode = 16U;
+            t.topoType = TOPO_TYPE_MTE_ROCE;
+            t.combineReduceQps = 8U;
+            const uint32_t packets = (hidden * 2U + 507U) / 508U;
+            const size_t tokenBytes = topk * packets * 512U;
+            std::vector<uint32_t> heap(3U * tokenBytes / 4U, 0xDEADBEEFU);
+            Params params{&t, {}};
+            params.peermemInfo.gatewayCombinePtr = reinterpret_cast<uint8_t*>(heap.data());
+            const uint32_t full = topk == 32U ? 0xffffffffU : (uint32_t{1} << topk) - 1U;
+            for (uint32_t sequence : {1U, 129U, 0x80000101U, 0xffffffffU}) {
+                t.hierarchicalSequence = sequence;
+                for (uint32_t mask : {0U, full, 0x55555555U & full, 0x80000001U & full, 0x1BU & full}) {
+                    auto* words = heap.data() + tokenBytes / 4U;
+                    for (uint32_t k = 0; k < topk; ++k)
+                        for (uint32_t p = 0; p < packets; ++p)
+                            words[(k * packets + p) * 128U + 127U] =
+                                (mask & (uint32_t{1} << k)) != 0U ? sequence : sequence ^ 0x80000080U;
+                    flagSourceBegin = reinterpret_cast<uint8_t*>(words);
+                    flagSourceBytes = tokenBytes;
+                    flagSourceMask = mask;
+                    flagSourcePackets = packets;
+                    const uint32_t expectedDmas = CombineMaskCount(mask & ~(mask << 1U));
+                    auto check = [&](uint32_t expected) {
+                        ub.fill(0xA5);
+                        flagDmas = scalarReads = readyVfs = 0U;
+                        Check(GatewayCombinePacketReadyMask(params, 1U, mask) == expected,
+                              "batch ready mask differs / stale packet accepted");
+                        Check(flagDmas == expectedDmas && scalarReads == static_cast<uint32_t>(mask != 0U) &&
+                                  readyVfs == static_cast<uint32_t>(mask != 0U),
+                              "batch fragmented DMA or repeated Scalar/VF handoff");
+                        const size_t snapshotBytes = topk * packets * 32U;
+                        // Only the first result word may be written; later UB
+                        // belongs to other stages and the reserved QP scratch.
+                        for (size_t i = snapshotBytes + 4U; i < snapshotBytes + 64U; ++i)
+                            Check(ub[i] == 0xA5, "batch readiness escaped its UB budget");
+                        for (size_t i = ub.size() - 512U; i < ub.size(); ++i)
+                            Check(ub[i] == 0xA5, "batch readiness overwrote QP scratch");
+                        for (const auto& type : events)
+                            for (int live : type) Check(live == 0, "batch leaked an event");
+                    };
+                    check(mask);
+                    for (uint32_t k = 0; k < topk; ++k) {
+                        const uint32_t bit = uint32_t{1} << k;
+                        if ((mask & bit) == 0U) continue;
+                        for (uint32_t p : {0U, packets / 2U, packets - 1U}) {
+                            auto& marker = words[(k * packets + p) * 128U + 127U];
+                            marker = sequence ^ (p == 0U ? 1U : p == packets - 1U ? 0x80000000U : 0x80U);
+                            check(mask & ~bit);
+                            marker = sequence;
+                        }
+                    }
+                    check(mask);  // A retry must refresh GM after a failed snapshot.
+                }
+            }
+        }
+    }
+    flagSourceBegin = nullptr;
+}
+
+void CheckFusedRowNumerics()
+{
+    using namespace ReduceTest;
+    for (uint32_t hidden : {32U, 64U, 96U, 1024U, 1056U, 3584U, 8128U, 8192U}) {
+        ub.fill(0xA5);
+        auto* input = reinterpret_cast<bfloat16_t*>(ub.data());
+        auto* sum = reinterpret_cast<float*>(ub.data() + 32U * 1024U);
+        auto* weight = reinterpret_cast<float*>(ub.data() + 96U * 1024U);
+        std::vector<float> reference(hidden);
+        auto verify = [&] {
+            Check(std::memcmp(sum, reference.data(), hidden * 4U) == 0, "fused row changed FP32 rounding/order");
+            const auto* end = reinterpret_cast<uint8_t*>(sum) + hidden * 4U;
+            for (size_t i = 0; i < 256U; ++i) Check(end[i] == 0xA5, "masked VF store overwrote sum tail");
+        };
+        std::fill_n(input, hidden, bfloat16_t(-0.0f));
+        weight[0] = 1.0f;
+        asc_vf_call<AccumulateGatewayCombineRowVF<true>>(input, sum, weight, hidden);
+        std::fill(reference.begin(), reference.end(), -0.0f);
+        verify();  // First product must not be added to +0.
+
+        std::fill_n(input, hidden, bfloat16_t(-1.5f));
+        asc_vf_call<AccumulateGatewayCombineRowVF<true>>(input, sum, weight, hidden);
+        std::fill(reference.begin(), reference.end(), -1.5f);
+        verify();
+        std::fill_n(input, hidden, bfloat16_t(1.5f));
+        weight[0] = std::nextafter(1.0f, 2.0f);
+        volatile float product = 1.5f * weight[0];
+        for (auto& value : reference) value += product;
+        Check(reference[0] != std::fma(1.5f, weight[0], -1.5f), "FMA negative control not sensitive");
+        asc_vf_call<AccumulateGatewayCombineRowVF<false>>(input, sum, weight, hidden);
+        verify();
+        std::mt19937 random(hidden);
+        for (uint32_t row = 0U; row < 32U; ++row) {
+            weight[0] = static_cast<int>(random() % 2001U) / 997.0f - 1.0f;
+            for (uint32_t h = 0; h < hidden; ++h) {
+                input[h] = bfloat16_t((static_cast<int>(random() % 8193U) - 4096) / 31.0f);
+                volatile float term = static_cast<float>(input[h]) * weight[0];
+                reference[h] += term;
+            }
+            asc_vf_call<AccumulateGatewayCombineRowVF<false>>(input, sum, weight, hidden);
+            verify();
+        }
+    }
+}
+
 int main()
 {
     try {
+        CheckBatchSnapshots();
+        CheckFusedRowNumerics();
         for (bool doubleBuffer : {false, true}) {
             for (bool laneInit : {false, true}) {
                 for (uint32_t qps : {4U, 8U})
@@ -686,6 +948,7 @@ int main()
                 CheckCase(8U, 16U, 37U, 64U, 7U, 1024U, 2U, 3U, false, laneInit, false, doubleBuffer);
                 CheckCase(8U, 0U, 3U, 8U, 7U, 8128U, 2U, 129U, false, laneInit, false, doubleBuffer);
                 CheckCase(8U, 16U, 3U, 8U, 7U, 1056U, 2U, 257U, true, laneInit, false, doubleBuffer);
+                CheckCase(4U, 16U, 3U, 8U, 7U, 1056U, 2U, 257U, true, laneInit, false, doubleBuffer);
             }
             CheckCase(8U, 0U, 32U, 64U, 8U, 3584U, 2U, 0x80000101U, false, true, true, doubleBuffer);
             CheckCase(4U, 16U, 7U, 32U, 32U, 1024U, 2U, 0xffffffffU, true, false, true, doubleBuffer);
