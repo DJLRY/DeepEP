@@ -24,6 +24,7 @@ def hierarchical_progress_binary(tmp_path_factory):
     command = [
         compiler,
         "-std=c++17",
+        "-O2",
         "-Wall",
         "-Wextra",
         "-Werror",
@@ -58,6 +59,7 @@ def hierarchical_progress_binary(tmp_path_factory):
         "retry-spacing",
         "single-sweep",
         "completion",
+        "route-runs",
     ],
 )
 @pytest.mark.parametrize("sparse_scan", [False, True], ids=["baseline", "sparse"])

@@ -578,8 +578,9 @@ private:
     int index_;
 };
 
-// Construct after initialization, which has its own fixed timing. Progress then
-// covers scan/post work; drain surrounds child progress calls and backoff. Scan
+// Bounded progress constructs after its separately timed initialization. Fused
+// route-run completion includes route discovery in this scope. Progress covers
+// scan/post work; drain surrounds child progress calls and backoff. Scan
 // segments exclude RocePutBytes and paused backoff. Each segment includes the
 // call-boundary and timestamp overhead between its StartScan and StopScan cycle
 // reads; bookkeeping after the StopScan read and work while paused are excluded.

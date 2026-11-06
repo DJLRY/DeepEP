@@ -423,14 +423,17 @@ QP=0单行Combine仍可单独实验，但不加入默认基线。下一阶段的
 最后一行完成才推进专家/wave游标。BS>256沿用原整段路径；多一次prefix恢复、通知和调度可能抵消收益。
 
 QP=0的A8W4路径现在只在g00 AIV1全部路由/共享SwiGLU及Dispatch完成后进入一次远端progress。
-它持续扫描并POST，直到全部应发行都已提交；每轮重新读取ready标志，空转时退避并保留停滞超时。
-就绪片段直接发送，不做defer、不受原2/8个POST预算限制。全部应发行提交后返回，
+它将路由发现和发送合在一次调用中：元数据只读取一遍，按路由洞划分最大连续段，发现一段即检查整段ready。
+整段就绪后只POST一次；未就绪段保留，继续处理后续段，不因一行晚到切碎或阻塞其他段。
+复用原有两个私有位图保存完整待发段及当前sequence已确认ready的行，不增加UB或最坏情况段数组。
+后续仅重试未完成段的未知ready位，空转时退避并保留停滞超时；不受原2/8个POST预算限制。全部应发行提交后返回，
 后续调度及Export处直接返回，删除原host barrier后的QP=0 drain调用。
 仅一个AIC的回退还必须先完成本核机内Combine，避免等待自己的生产任务。
 原host barrier保留，之后仍只发送一个4字节Combine commit（零远端行也必须发送），
 同时确认结果就绪及本机所有生产者、旧Dispatch读取均已结束；不新增完成信号或等待。
 收到对端commit并完成本卡同步后，owner执行quiet，与其他AIV的Unpermute重叠。
-trace只记录一个完整`AIV_COMBINE_PROGRESS`区间（内部可多轮扫描），不再有该路径的`AIV_COMBINE_DRAIN`。
+trace只记录一个完整`AIV_COMBINE_PROGRESS`区间（包含路由发现、ready检查及POST），
+不再有该路径独立的`AIV_COMBINE_INIT`和`AIV_COMBINE_DRAIN`。零路由也记录一次路由发现区间。
 QP=4/8和A8W8保留原协议。所有QP=0 A8W4用例自动生效，无新增开关。
 两台同步本次源码并完整重建wheel，复用现有机器配置、Golden与SHMEM SDK；不需要重建SHMEM SDK。
 Dispatch开关使用现有pipelineFlags中的位，Python/native接口协议保持10；通信内存布局、控制槽位及
@@ -720,17 +723,19 @@ BS32/K8 的256个 top-k 条目需要3个包，UB 配置为512个槽（有效容�
 
 | 事件 | 测量范围 |
 | --- | --- |
-| `AIV_COMBINE_INIT` | 首次构建私有 pending masks 的元数据 DMA 和标量处理；每次算子只记录一次 |
-| `AIV_COMBINE_PROGRESS` | 初始化后的一次推进调用；QP=0 A8W4可包含多轮扫描直至全部应发行提交，记录进入/退出待发行数、POST数、累计扫描槽位及扫描/控制周期 |
+| `AIV_COMBINE_INIT` | 分批路径首次构建私有 pending masks 的元数据 DMA 和标量处理；QP=0 A8W4融合路径没有独立INIT区间 |
+| `AIV_COMBINE_PROGRESS` | 一次推进调用；QP=0 A8W4从路由发现直到全部连续段提交，记录待发行数、POST数、ready检查计数及扫描/控制周期 |
 | `AIV_HOST_COMBINE_BARRIER_WAIT` | 已有16卡机内完成屏障的完整调用，包含发布、轮询及本卡同步 |
 | `AIV_COMBINE_DRAIN` | 屏障后最终 drain 的父区间，包含子 progress 和退避；记录进入/退出时待发行数 |
 | `AIV_COMBINE_RUN` | `/COMBINE_RUN` 轨道记录每个连续段的起点、行数、发送或延后决策、终止原因以及是否曾延后 |
 
 `scan_control_us` 包含游标扫描、ready flag 检查和私有 pending 状态维护，排除初始化、
 `RocePutBytes` 调用和 drain 退避；它仍包含测量边界的开销，不能当作纯 GM 访存耗时。
-QP=0 A8W4完成式progress的总区间包含重试退避；`scan_control_us`排除退避。
-其累计`scanned_rows`使用原16位字段，在65535饱和（达到该值表示至少扫描这么多位置）。
-progress/drain 的父区间不能与内部 RDMA 或子 progress 相加。初始化是独立区间，
+QP=0 A8W4融合路径的`scan_control_us`还包含元数据DMA、路由段发现和ready正结果缓存维护，
+排除POST及重试退避；其总区间包含退避。`scanned_rows`在此路径表示实际查询ready快照的未知行次数，
+不含路由解析、已缓存ready位或跳过的路由洞，不能与旧版逻辑槽位扫描计数直接比较。
+该计数仍使用原16位字段，在65535饱和。`pending_before`为发现的全部应发行数，发现期间可提前POST。
+progress/drain 的父区间不能与内部 RDMA 或子 progress 相加。分批路径初始化仍是独立区间，
 已全部发送的 progress 快返不产生扫描记录；零待发的最终 drain 仍记录0行，便于确认完成。
 这些观测不新增流水排空、跨核同步或通信，不以计时结果决定调度。
 
@@ -904,10 +909,12 @@ AIV1 随后用一次带 stride 的 DMA 获取本卡16个槽的首32 B，共512 B
 稀疏路由也等待全部网关，可能等到并不需要的慢来源；当前优化重点是 EP32、BS32 场景。
 
 A8W4 的QP=0跨机 Combine 由g00 AIV1在本核全部路由/共享activation及Dispatch结束后进入一次完成式progress，
-此前不初始化pending masks、不扫描ready flags。每个就绪连续段直接发送，不延后片段、不限制POST数量；
-未就绪行在同一次调用中重新扫描，全部应发行提交后才返回。唯一的commit仍在host barrier之后发送。
+此前不初始化pending masks、不扫描ready flags。该调用边读取路由边发现最大连续段，整段ready后才发送，
+段边界不依赖生产者的到达顺序；部分ready的段保留到后续轮询，其他已就绪段照常发送。
+原两个每token位图分别表示待发路由和本次调用内已确认ready的行，完整段提交后按token清除，
+不增加描述符数组、UB、通信窗口或控制信号。全部应发行提交后才返回。唯一commit仍在host barrier之后发送。
 若调度循环尚未进入该调用，输出Export阶段补做一次；已完成则直接返回。
-游标和已发送槽位跨内部扫描保留，避免重发；ready快照每轮重读。固定物理 AIV1 保留 activation、dispatch 和远端推进，
+未完成段跨内部重试保留，避免重发；只重查未确认的ready位，负结果不缓存。固定物理 AIV1 保留 activation、dispatch 和远端推进，
 本地 Combine 搬运交给其余 AIV1：28个 AIC 时由剩余27个 AIV1 均衡分配完整行，
 在27个 consumer 的空间内按 Combine wave 和全局行前缀轮换，确保每行只搬运一次。
 GMM2 仍使用原28个生产核及其实际完成计数，不能用27个搬运核代替生产核数。
@@ -923,14 +930,16 @@ QP=0的QP1始终由固定物理AIV1独占。最终host barrier后不再drain，�
 Dispatch/Combine commit。host barrier关闭本机的生产者和旧Dispatch读取，
 双向commit继续保护跨轮复用。QP=4/8和A8W8沿用原barrier后commit协议。
 单次Put内部仍可能因队列回压等待；完成式progress及commit等待都保留已有的停滞超时诊断。
-扫描在单次调用内缓存当前 token 的 pending mask，通过递增槽位推进，避免逐行除模；
+分批路径扫描在单次调用内缓存当前 token 的 pending mask，通过递增槽位推进，避免逐行除模；
 连续发送段在 Put 返回后按 token 清除对应位。扫描仍逐槽计数，保留洞、游标绕回、
 预算截断和相邻行合并。A8W8保留原有分批策略：只要前后仍有相邻待发行，即使已就绪的片段超过4行，
 同一起点也允许最多延后一次，继续扫描其他位置并返回计算；再次遇到该起点就允许发送，
 不等待邻行的生产者。完整连续区间、没有相邻待发行的孤立段立即发送。
 一次完整扫描没有提交时，仅跳过下一次前台 progress 调用，减少重复 flag DMA；
-部分扫描保持游标推进，不触发退避。A8W4的QP=0完成式progress关闭延期和预算限制，
-但无进展的一整轮扫描后仍短暂退避，再重新读标志；其外层只产生一个progress计时区间。
+部分扫描保持游标推进，不触发退避。A8W4的QP=0融合路径不采用片段延期或POST预算，
+而是始终等待每个完整路由段就绪；无进展的一轮重试后短暂退避，再检查未知ready位。
+本次BS32/K8均衡路由每rank有8个16行段，无论行按何顺序就绪，都只提交8个Combine payload POST。
+段可以跨token、256 B元数据DMA和512 B元数据packet边界，但不能跨路由洞；整段等待的延迟收益需实测。
 这些规则不以timer结果决定调度。A8W8完成当次扫描或达到Put预算后返回；QP=0 A8W4则等待全部应发行提交后返回。
 后续调用在全部行已提交时直接返回。提交完成不代表传输完成，后者仍由后续 quiet 保证。
 
@@ -949,7 +958,8 @@ ready 探测通过一次跨步 DMA，将最多8个512 B flag 槽的首32 B收集
 并完成 scalar→MTE2 顺序保障，再允许 Put 复用 scratch。普通 Put 的后端在返回前完成其 UB 搬运，
 因此下一批快照可以复用同一空间；这里不使用需要保留 workspace 的 aggregate Put。
 预取可以包含洞和已发送槽位，但实际发送仍受 pending mask 约束；每批不越过物理行末尾或剩余扫描预算。
-位图只在当前 progress 调用内有效，晚于快照发布的行在后续扫描重新读取，不缓存跨调用的未就绪结果。
+ready结果只在当前progress调用内有效；融合路径保留已匹配当前sequence的正结果，未匹配的行继续重查。
+元数据DMA先转为两个标量32位路由片段，完成scalar读取后才允许ready/POST复用scratch，避免覆盖尚未解析的ID。
 静态全待发场景下64行由8次 DMA读取，逻辑扫描计数仍为64；这不是设备耗时的八倍加速承诺。
 
 Combine 路由首次初始化使用 owner 专用256 B UB 分块 DMA 读取已接收的 rail 元数据；

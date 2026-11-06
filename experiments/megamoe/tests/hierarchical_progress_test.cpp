@@ -144,6 +144,7 @@ struct State {
     std::vector<uint32_t> probes;
     std::vector<uint32_t> probeOrder;
     std::vector<Post> posts;
+    std::vector<uint32_t> copiesAtPost;
     std::vector<Copy> copies;
     const int32_t* pairedRail = nullptr;
     uint32_t railSlotWords = 0U;
@@ -455,6 +456,7 @@ inline void RocePutBytes(uint8_t* destination, uint8_t* source, uint32_t bytes, 
         Check(s.sent[row]++ == 0U, "row submitted more than once");
     }
     s.posts.push_back({first, count, source, destination});
+    s.copiesAtPost.push_back(static_cast<uint32_t>(s.copies.size()));
     // Submission deliberately leaves the destination untouched. The SDK may
     // overwrite its scratch immediately; cached pending masks must survive it.
     s.ub.fill(0xD7U);
@@ -1342,13 +1344,14 @@ void CompletionProgress()
             const bool made = TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer,
                                                              {1U, 1U, true, true}, true);
             Check(made == (mode != 0U) && f.progress.sentRows == f.Expected(), "completion returned with unsent rows");
-            Check(timer.initializations == 1U && timer.records.size() == (mode == 0U ? 0U : 1U),
-                  "completion must produce one progress envelope, without a tail drain");
+            Check(timer.initializations == 0U && timer.records.size() == 1U,
+                  "completion must fuse routing and progress into one envelope, without a separate init/drain");
             if (mode != 0U) {
                 const auto& record = timer.records.front();
                 Check(record.type == AscendTimer::AIV_COMBINE_PROGRESS && record.before == 256U && record.after == 0U,
                       "completion did not report its full pending lifetime");
                 Check(record.posts == f.s.posts.size(), "completion lost retry POST counts");
+                Check(record.posts == 1U, "partial readiness fragmented a contiguous routed tensor");
                 if (mode == 1U) Check(record.scanned == 0xffffU, "long retry scan count did not saturate");
             }
             for (auto mask : f.progress.deferredTopkMasks) Check(mask == 0U, "completion deferred a ready run");
@@ -1375,6 +1378,128 @@ void CompletionProgress()
             failed = true;
         }
         Check(failed && f.s.posts.empty(), "stalled completion lost timeout diagnostics");
+    }
+}
+
+// Independent routing oracle: maximal consecutive expected coordinates, without
+// using production masks, cursors, ready snapshots, or run discovery helpers.
+void CheckWholeRouteRuns(const Fixture& f)
+{
+    std::vector<std::pair<uint32_t, uint32_t>> expected;
+    for (uint32_t row = 0U; row < f.s.rows;) {
+        if (!f.s.expected[row]) {
+            ++row;
+            continue;
+        }
+        const uint32_t first = row;
+        while (row < f.s.rows && f.s.expected[row]) ++row;
+        expected.emplace_back(first, row - first);
+    }
+    std::vector<std::pair<uint32_t, uint32_t>> actual;
+    for (const auto& post : f.s.posts) actual.emplace_back(post.firstRow, post.rowCount);
+    std::sort(actual.begin(), actual.end());
+    Check(actual == expected, "POSTs differ from maximal contiguous route runs");
+}
+
+void CompletionRouteRuns()
+{
+    for (uint32_t rank : {0U, 30U}) {
+        // The measured BS32/K8 shape: eight 16-row segments. The first run is
+        // missing one row; all seven later runs must post before it becomes ready.
+        Fixture f(32U, 8U, rank);
+        std::vector<uint32_t> routed;
+        for (uint32_t row = 0U; row < f.s.rows; ++row)
+            if (row % 32U < 16U) routed.push_back(row);
+        f.RouteRows(routed);
+        ReleaseAll();
+        f.Publish(0U, f.s.sequence - 1U);
+        f.s.releaseAtCycle = 1000U;
+        AscendTimerDevice timer;
+        Check(TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {}, true),
+              "completion did not submit route runs");
+        Check(f.s.posts.size() == 8U && f.s.posts.front().firstRow == 32U && f.s.posts.back().firstRow == 0U,
+              "a late first run blocked ready later runs or caused fragmentation");
+        Check(f.s.copiesAtPost.front() < f.s.copies.size(), "discovery waited for all metadata before its first POST");
+        Check(f.s.probes[8U] == 1U && f.s.probes[0U] > 1U, "retry did not preserve positive ready observations");
+        CheckWholeRouteRuns(f);
+        f.CheckPayload();
+        const auto copies = f.s.copies.size();
+        const auto reads = f.s.flagReads;
+        Check(!TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), &timer, {}, true),
+              "completed invocation posted twice");
+        Check(f.s.copies.size() == copies && f.s.flagReads == reads && timer.records.size() == 1U,
+              "completed invocation repeated discovery, flags, or timing");
+    }
+    for (uint32_t topk : {1U, 3U, 8U, 31U, 32U}) {
+        for (uint32_t tokens : {1U, 32U, 128U, 256U}) {
+            for (const char* pattern : {"all", "mixed", "holes", "last", "duplicate"}) {
+                Fixture f(tokens, topk, tokens % 32U);
+                f.Routes(pattern);
+                ReleaseAll();
+                TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {}, true);
+                CheckWholeRouteRuns(f);
+                f.CheckPayload();
+                // Each 127-ID packet contributes one/two DMA blocks; the final
+                // partial packet must not read its marker or unused IDs.
+                uint32_t copies = 0U;
+                for (uint32_t row = 0U; row < f.s.rows; row += 127U) {
+                    copies += std::min(127U, f.s.rows - row) > 64U ? 2U : 1U;
+                }
+                Check(f.s.copies.size() == copies && f.s.metadataScalarReads == 0U,
+                      "completion reread route metadata or used scalar GM loads");
+            }
+        }
+    }
+    {
+        Fixture f(36U, 8U);
+        std::vector<uint32_t> routed;
+        for (uint32_t row = 60U; row < 140U; ++row) routed.push_back(row);
+        for (uint32_t row = 190U; row < 260U; ++row) routed.push_back(row);
+        f.RouteRows(routed);
+        ReleaseAll();
+        TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {}, true);
+        CheckWholeRouteRuns(f);
+        Check(f.s.posts.size() == 2U, "scratch/token/packet boundaries split a routed segment");
+        f.CheckPayload();
+    }
+    {
+        Fixture f(256U, 32U, 30U);
+        std::vector<uint32_t> routed;
+        for (uint32_t row = 0U; row < f.s.rows; row += 2U) routed.push_back(row);
+        f.RouteRows(routed);
+        ReleaseAll();
+        TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {}, true);
+        Check(f.s.posts.size() == 4096U, "worst-case disjoint routing exceeded pending run storage");
+        CheckWholeRouteRuns(f);
+        f.CheckPayload();
+    }
+    {
+        Fixture f(2U, 32U);
+        f.Routes("all");
+        ReleaseAll();
+        f.Publish(31U, f.s.sequence + 1U);
+        f.Publish(63U, f.s.sequence - 1U);
+        f.s.releaseAtCycle = 1000U;
+        TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {}, true);
+        Check(f.s.posts.size() == 1U && f.s.waitChecks != 0U, "completion accepted a stale or future epoch");
+        // A gather of missing row31 also physically fetches rows32..38. Check
+        // confirmed prefixes outside that unavoidable eight-row gather window.
+        Check(f.s.probes[0U] == 1U && f.s.probes[40U] == 1U, "ready prefixes were polled again on retry");
+        CheckWholeRouteRuns(f);
+        f.CheckPayload();
+    }
+    {
+        Fixture f(2U, 8U);
+        f.Routes("all");
+        f.Publish(0U, f.s.sequence);
+        f.Init();
+        f.progress.deferredTopkMasks[0] = 0xffU;
+        f.progress.deferredTopkMasks[1] = 0xffU;
+        f.s.releaseAtCycle = 1000U;
+        TryProgressHierarchicalCombine(f.common, f.params, f.progress, f.s.ub.data(), nullptr, {}, true);
+        Check(f.s.waitChecks != 0U, "legacy deferred bits were reused as positive ready observations");
+        CheckWholeRouteRuns(f);
+        f.CheckPayload();
     }
 }
 }  // namespace ProgressTest
@@ -1426,6 +1551,8 @@ int main(int argc, char** argv)
         SingleSweepThenDrain();
     else if (std::strcmp(scenario, "completion") == 0)
         CompletionProgress();
+    else if (std::strcmp(scenario, "route-runs") == 0)
+        CompletionRouteRuns();
     else
         Check(false, "unknown test scenario");
     return 0;
