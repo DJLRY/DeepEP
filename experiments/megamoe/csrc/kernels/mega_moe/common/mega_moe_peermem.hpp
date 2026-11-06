@@ -239,6 +239,37 @@ constexpr uint32_t RAIL_PACKET_BYTES = 512U;
 constexpr uint32_t RAIL_PACKET_WORDS = RAIL_PACKET_BYTES / sizeof(int32_t);
 constexpr uint32_t RAIL_PACKET_DATA_WORDS = RAIL_PACKET_WORDS - 1U;
 
+// QP8 gateway input carries an invocation marker in every aligned 512B packet.
+// QP0/4 keep their compact BF16 rows and separate ready lines.
+HOST_DEVICE bool UsePacketizedGatewayCombine(const MegaMoeTilingData* t)
+{
+    return UseHierarchicalRoce(t) && t->combineReduceQps == 8U;
+}
+
+HOST_DEVICE int64_t CalcGatewayCombinePacketRowBytes(int64_t hidden)
+{
+    return Ops::Base::CeilDiv(hidden * 2, static_cast<int64_t>(RAIL_PACKET_DATA_WORDS * sizeof(uint32_t))) *
+           RAIL_PACKET_BYTES;
+}
+
+HOST_DEVICE int64_t CalcGatewayCombineBytes(int64_t tokens, int64_t topK, int64_t hidden, uint32_t qps)
+{
+    return qps == 8U ? tokens * topK * CalcGatewayCombinePacketRowBytes(hidden)
+                     : Ops::Base::CeilAlign(tokens * topK * hidden * 2, ALIGN_512);
+}
+
+HOST_DEVICE int64_t CalcGatewayCombineReadyBytes(int64_t tokens, int64_t topK, uint32_t qps)
+{
+    return qps == 8U ? 0 : tokens * topK * HIERARCHICAL_FLAG_BYTES;
+}
+
+HOST_DEVICE int64_t CalcGatewayCombineReduceUbBytes(const MegaMoeTilingData* t, uint32_t inputBuffers)
+{
+    const int64_t inputRowBytes = UsePacketizedGatewayCombine(t) ? CalcGatewayCombinePacketRowBytes(t->h) : t->h * 2LL;
+    return inputRowBytes * inputBuffers + t->h * 8LL +
+           Ops::Base::CeilAlign(static_cast<int64_t>(t->topK) * 4, ALIGN_32);
+}
+
 HOST_DEVICE int32_t RailPacketMarker(const MegaMoeTilingData* tilingData, uint32_t epoch, uint32_t totalItems)
 {
     return static_cast<int32_t>(UseHierarchicalRoce(tilingData) ? tilingData->hierarchicalSequence
@@ -397,8 +428,9 @@ HOST_DEVICE int64_t CalcPeermemLeastSize(const PeermemSizeParams& params)
     int64_t bytes =
         PEERMEM_DATA_OFFSET + routeRecvSize + expertCountRecvSize + railBytes + quantTokenScaleSize + combineSendSize;
     if (params.topoType == TOPO_TYPE_MTE_ROCE) {
-        bytes += quantTokenScaleSize + combineSendSize;
-        bytes += params.numMaxTokensPerRank * params.topK * HIERARCHICAL_FLAG_BYTES;
+        bytes += quantTokenScaleSize +
+                 CalcGatewayCombineBytes(params.numMaxTokensPerRank, params.topK, params.h, params.combineReduceQps);
+        bytes += CalcGatewayCombineReadyBytes(params.numMaxTokensPerRank, params.topK, params.combineReduceQps);
         bytes += static_cast<int64_t>(HierarchicalSignal::Count) * HIERARCHICAL_FLAG_BYTES;
         bytes += HIERARCHICAL_RANKS_PER_HOST * HIERARCHICAL_FLAG_BYTES;
         if (params.combineReduceQps != 0U) {
@@ -481,10 +513,13 @@ struct PeermemInfo {
             offset += Ops::Base::CeilAlign(static_cast<int64_t>(tilingData->numMaxTokensPerRank) * tokenScaleBytes,
                                            ALIGN_512);
             gatewayCombinePtr = base + offset;
-            offset += combineBytes;
-            gatewayCombineReadyPtr = base + offset;
-            offset +=
-                static_cast<int64_t>(tilingData->numMaxTokensPerRank) * tilingData->topK * HIERARCHICAL_FLAG_BYTES;
+            offset += CalcGatewayCombineBytes(tilingData->numMaxTokensPerRank, tilingData->topK, tilingData->h,
+                                              tilingData->combineReduceQps);
+            if (!UsePacketizedGatewayCombine(tilingData)) {
+                gatewayCombineReadyPtr = base + offset;
+            }
+            offset += CalcGatewayCombineReadyBytes(tilingData->numMaxTokensPerRank, tilingData->topK,
+                                                   tilingData->combineReduceQps);
             hierarchicalControlPtr = base + offset;
             offset += static_cast<int64_t>(HierarchicalSignal::Count) * HIERARCHICAL_FLAG_BYTES;
             // One persistent, single-writer line per gateway on this host.

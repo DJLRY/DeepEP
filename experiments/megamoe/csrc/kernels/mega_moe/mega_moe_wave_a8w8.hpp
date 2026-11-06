@@ -377,8 +377,8 @@ template <TemplateMegaMoeA8W8WaveTypeClass>
 __aicore__ inline typename MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::CombineBufferConfig
 MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::InitCombineBuffers()
 {
-    return InitWaveCombineBuffers<CombineQuantMode, false, WAVE_COMBINE_STEADY_ROW_BUFFER_COUNT>(commonConfig_,
-                                                                                                 waveCombineScratch_);
+    return InitWaveCombineBuffers<CombineQuantMode, false, WAVE_COMBINE_STEADY_ROW_BUFFER_COUNT>(
+        commonConfig_, waveCombineScratch_, UsePacketizedGatewayCombine(params_.tilingData));
 }
 
 // ======================================================================================
@@ -714,7 +714,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::SendHie
         GetTokenCombineReadyCounter(params_, state.expertIdx, rowStart),
         static_cast<int32_t>(GetTokenCombineProducerCount(commonConfig_, waveCombineJob_, rowCount)));
     SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
-    const auto buffers = InitWaveCombineBuffers<COMBINE_NO_QUANT>(commonConfig_, waveCombineScratch_);
+    const auto buffers = InitWaveCombineBuffers<COMBINE_NO_QUANT>(commonConfig_, waveCombineScratch_,
+                                                                  UsePacketizedGatewayCombine(params_.tilingData));
     // GM_ADDR is a pointer macro: qualify the pointer, not the pointed-to data.
     GM_ADDR const output =
         params_.workspaceInfo.gmm2MmadResPtr + globalRowStart * commonConfig_.tokenHiddenDim * sizeof(bfloat16_t);
@@ -850,8 +851,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         if (allCoreCombineExpertIndex < expertBegin || allCoreCombineExpertIndex >= expertEnd) {
             return;
         }
-        CombineBufferConfig activeBufferConfig =
-            PrepareFinalWaveCombineBuffers<CombineQuantMode>(commonConfig_, bufferConfig, waveCombineScratch_);
+        CombineBufferConfig activeBufferConfig = PrepareFinalWaveCombineBuffers<CombineQuantMode>(
+            commonConfig_, bufferConfig, waveCombineScratch_, UsePacketizedGatewayCombine(params_.tilingData));
         UpdateMoeExpertCombineGlobalBuffer(params_.workspaceInfo, combineAddrInfo, allCoreCombineExpertState);
         uint32_t rowSequence = 0U;
         RunWaveCombineStage<CombineQuantMode, true>(commonConfig_, waveCombineJob_, activeBufferConfig,
@@ -873,8 +874,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         bool useAllAivCores = expertIdx == allCoreCombineExpertIndex;
         UpdateMoeExpertCombineGlobalBuffer(params_.workspaceInfo, combineAddrInfo, combineState);
         if (useAllAivCores) {
-            activeBufferConfig =
-                PrepareFinalWaveCombineBuffers<CombineQuantMode>(commonConfig_, bufferConfig, waveCombineScratch_);
+            activeBufferConfig = PrepareFinalWaveCombineBuffers<CombineQuantMode>(
+                commonConfig_, bufferConfig, waveCombineScratch_, UsePacketizedGatewayCombine(params_.tilingData));
             RunWaveCombineStage<CombineQuantMode, true>(commonConfig_, waveCombineJob_, activeBufferConfig,
                                                         waveCombineScratch_, params_, combineAddrInfo, combineState,
                                                         combineState.expertIdx, rowSequence);

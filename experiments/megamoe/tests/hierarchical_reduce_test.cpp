@@ -94,7 +94,8 @@ namespace AscendC {
 using TEventID = uint32_t;
 enum class TPosition { VECCALC };
 enum class RoundMode { CAST_NONE, CAST_RINT };
-enum class HardEvent { S_MTE2, MTE2_S, MTE2_V, V_MTE2, S_V, V_S, V_MTE3, MTE3_S, MTE3_V, MTE2_MTE3, MTE3_MTE2 };
+enum class HardEvent { S_MTE2, MTE2_S, MTE2_V, V_MTE2, S_V, V_S, V_MTE3, MTE3_S, MTE3_V, MTE2_MTE3, MTE3_MTE2, S_MTE3 };
+enum class PaddingMode { Normal, Compact };
 template <typename T>
 struct LocalTensor {
     T* data = nullptr;
@@ -114,6 +115,10 @@ struct LocalTensor {
     {
         return data[index];
     }
+    void SetValue(uint32_t index, T value)
+    {
+        data[index] = value;
+    }
     template <typename U>
     LocalTensor<U> ReinterpretCast() const
     {
@@ -126,6 +131,10 @@ struct GlobalTensor {
     void SetGlobalBuffer(T* address)
     {
         data = address;
+    }
+    T* GetPhyAddr() const
+    {
+        return data;
     }
     GlobalTensor operator[](uint64_t offset) const
     {
@@ -179,11 +188,31 @@ void DataCopy(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyParams p)
                     reinterpret_cast<uint8_t*>(src.data) + i * (p.blockLen + p.srcStride) * 32U, p.blockLen * 32U);
     }
 }
-template <typename T>
-void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtParams p, DataCopyPadExtParams<T>)
+template <typename T, PaddingMode Mode = PaddingMode::Normal>
+void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtParams p, DataCopyPadExtParams<T> pad)
 {
-    ReduceTest::Check(p.blockCount == 1, "unexpected packed DMA");
-    std::memcpy(dst.data, src.data, p.blockLen);
+    const uint32_t blockBytes = Mode == PaddingMode::Compact ? p.blockLen : (p.blockLen + 31U) / 32U * 32U;
+    std::vector<uint8_t> result((p.blockCount * blockBytes + 31U) / 32U * 32U, 0xA5);
+    for (uint32_t i = 0; i < p.blockCount; ++i) {
+        std::memcpy(result.data() + i * blockBytes,
+                    reinterpret_cast<uint8_t*>(src.data) + i * (p.blockLen + p.srcStride), p.blockLen);
+        if (pad.pad) {
+            for (uint32_t offset = p.blockLen; offset < blockBytes; offset += sizeof(T))
+                std::memcpy(result.data() + i * blockBytes + offset, &pad.value, sizeof(T));
+        }
+    }
+    if constexpr (Mode == PaddingMode::Compact) {
+        auto* target = reinterpret_cast<bfloat16_t*>(dst.data);
+        if (ReduceTest::deferInputs) {
+            ReduceTest::Check(!ReduceTest::busyInputs[target], "packed input reused before vector release");
+            ReduceTest::busyInputs[target] = true;
+            std::vector<bfloat16_t> values(result.size() / sizeof(bfloat16_t));
+            std::memcpy(values.data(), result.data(), result.size());
+            ReduceTest::queuedInputs.push_back({target, std::move(values)});
+            return;
+        }
+    }
+    std::memcpy(dst.data, result.data(), result.size());
 }
 template <typename T>
 void DataCopyPad(GlobalTensor<T> dst, LocalTensor<T> src, DataCopyExtParams p)
@@ -433,11 +462,12 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     std::vector<uint32_t> masks(bs, 0U);
     const uint32_t sourceHost = HierarchicalHost(sourceRank);
     auto* originalLocal = reinterpret_cast<bfloat16_t*>(source.combineSendPtr);
-    auto* originalRemote = reinterpret_cast<bfloat16_t*>(gateway.gatewayCombinePtr);
+    const bool packets = qps == 8U;
+    const uint32_t gatewayRowBytes = packets ? (hidden * 2U + 507U) / 508U * 512U : hidden * 2U;
+    const uint32_t packetCount = gatewayRowBytes / 512U;
     auto* ready = reinterpret_cast<uint32_t*>(gateway.gatewayCombineReadyPtr);
     const bfloat16_t poison(std::nanf(""));
     std::fill_n(originalLocal, capacity * topk * hidden, poison);
-    std::fill_n(originalRemote, capacity * topk * hidden, poison);
     for (uint32_t token = 0; token < bs; ++token) {
         for (uint32_t k = 0; k < topk; ++k) {
             const bool remote = pattern == 1 || (pattern == 2 && (token + k) % 3 == 0) ||
@@ -449,9 +479,22 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
                 const size_t index = (static_cast<size_t>(token) * topk + k) * hidden + h;
                 expertRows[index] =
                     bfloat16_t(static_cast<float>(static_cast<int>((token * 31U + k * 13U + h) % 61U) - 30) / 23.0f);
-                (remote ? originalRemote : originalLocal)[index] = expertRows[index];
+                if (remote) {
+                    const uint32_t byte = h * 2U;
+                    const uint64_t offset = static_cast<uint64_t>(token * topk + k) * gatewayRowBytes +
+                                            (packets ? byte / 508U * 512U + byte % 508U : byte);
+                    std::memcpy(gateway.gatewayCombinePtr + offset, &expertRows[index], 2U);
+                } else {
+                    originalLocal[index] = expertRows[index];
+                }
             }
-            ready[(token * topk + k) * 128U] = sequence - 1U;
+            if (packets) {
+                auto* row = reinterpret_cast<uint32_t*>(gateway.gatewayCombinePtr +
+                                                        static_cast<uint64_t>(token * topk + k) * gatewayRowBytes);
+                for (uint32_t p = 0; p < packetCount; ++p) row[p * 128U + 127U] = sequence - 1U;
+            } else {
+                ready[(token * topk + k) * 128U] = sequence - 1U;
+            }
         }
         for (uint32_t h = 0; h < hidden; ++h) {
             float remoteSum = 0.0f, localSum = 0.0f;
@@ -526,7 +569,23 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     for (uint32_t row = bs * topk; row-- > 0;) {
         const uint32_t token = row / topk, k = row % topk;
         if ((masks[token] & (uint32_t{1} << k)) == 0) continue;
-        ready[row * 128U] = sequence;
+        if (packets) {
+            auto* words =
+                reinterpret_cast<uint32_t*>(gateway.gatewayCombinePtr + static_cast<uint64_t>(row) * gatewayRowBytes);
+            // A last-packet marker cannot release an earlier missing packet.
+            for (uint32_t p = 0; p < packetCount; ++p) words[p * 128U + 127U] = sequence;
+            const uint32_t missing = packetCount / 2U;
+            words[missing * 128U + 127U] = sequence - 1U;
+            Check(!GatewayCombinePacketsReady(params, row), "partial packet row released");
+            const size_t before = posts.size();
+            for (activeLane = 0; activeLane < qps; ++activeLane)
+                TryProgressHierarchicalReducedCombine(gwCommon, params, state[activeLane], activeLane, scratch, &timer);
+            Check(posts.size() == before, "partial packet row reduced or posted");
+            words[missing * 128U + 127U] = sequence;
+            Check(GatewayCombinePacketsReady(params, row), "complete packet row not ready");
+        } else {
+            ready[row * 128U] = sequence;
+        }
         published[token] |= uint32_t{1} << k;
         const size_t before = posts.size();
         for (activeLane = 0; activeLane < qps; ++activeLane)
@@ -621,6 +680,8 @@ int main()
                 CheckCase(4U, 0U, 256U, 256U, 32U, 1024U, 2U, 257U, true, laneInit, false, doubleBuffer);
                 CheckCase(8U, 0U, 3U, 8U, 7U, 1024U, 2U, 3U, false, laneInit, false, doubleBuffer);
                 CheckCase(8U, 16U, 37U, 64U, 7U, 1024U, 2U, 3U, false, laneInit, false, doubleBuffer);
+                CheckCase(8U, 0U, 3U, 8U, 7U, 8128U, 2U, 129U, false, laneInit, false, doubleBuffer);
+                CheckCase(8U, 16U, 3U, 8U, 7U, 1056U, 2U, 257U, true, laneInit, false, doubleBuffer);
             }
             CheckCase(8U, 0U, 32U, 64U, 8U, 3584U, 2U, 0x80000101U, false, true, true, doubleBuffer);
             CheckCase(4U, 16U, 7U, 32U, 32U, 1024U, 2U, 0xffffffffU, true, false, true, doubleBuffer);

@@ -843,8 +843,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::RunGmm2CombineForExpert
                 SyncFuncStatic<HardEvent::MTE3_MTE2, SYNC_EVENT_ID0>();
             }
         }
-        combineBufferConfig =
-            PrepareFinalWaveCombineBuffers<CombineQuantMode>(commonConfig_, combineBufferConfig, waveCombineScratch_);
+        combineBufferConfig = PrepareFinalWaveCombineBuffers<CombineQuantMode>(
+            commonConfig_, combineBufferConfig, waveCombineScratch_, UsePacketizedGatewayCombine(params_.tilingData));
         if constexpr (g_coreType == AIV) {
             if (GetSubBlockIdx() == 1U) {
                 timer_.StartSpan(AscendTimer::AIV_COMBINE);

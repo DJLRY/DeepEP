@@ -21,8 +21,19 @@ static_assert(offsetof(MegaMoeTilingData, pipelineFlags) == 236);
 
 PeermemSizeParams parameters(const MegaMoeTilingData& t)
 {
-    return {t.numMaxTokensPerRank,      t.topK, t.h,        t.moeExpertPerRank,       t.epWorldSize,         2, 1,
-            t.topkWeightsPrefetch != 0, false,  t.topoType, UseDecodeRailRouting(&t), t.dispatchRanksPerNode};
+    return {t.numMaxTokensPerRank,
+            t.topK,
+            t.h,
+            t.moeExpertPerRank,
+            t.epWorldSize,
+            2,
+            1,
+            t.topkWeightsPrefetch != 0,
+            false,
+            t.topoType,
+            UseDecodeRailRouting(&t),
+            t.dispatchRanksPerNode,
+            t.combineReduceQps};
 }
 
 MegaMoeTilingData make_tiling(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch,
@@ -196,6 +207,48 @@ void check_workspace_ready_region(uint8_t mode)
     }
 }
 
+void check_packet_gateway_layout(uint8_t mode)
+{
+    auto largest = make_tiling(64U, 8192U, 8U, false, mode);
+    largest.combineReduceQps = 8U;
+    std::vector<uint8_t> heap(CalcPeermemLeastSize(parameters(largest)) + 511U, 0xA5);
+    auto* base = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(heap.data()) + 511U) & ~uintptr_t{511});
+    for (uint32_t hidden = 1024U; hidden <= 8192U; hidden += 32U) {
+        for (uint32_t qps : {0U, 4U, 8U}) {
+            auto t = make_tiling(64U, hidden, 8U, false, mode);
+            t.combineReduceQps = qps;
+            const auto bytes = CalcPeermemLeastSize(parameters(t));
+            assert(base + bytes <= heap.data() + heap.size());
+            PeermemInfo info(base, &t);
+            const uint64_t rowBytes = qps == 8U ? (hidden * 2U + 507U) / 508U * 512U : hidden * 2U;
+            const uint64_t rows = 64U * 8U;
+            assert(UsePacketizedGatewayCombine(&t) == (qps == 8U));
+            for (uint32_t inputBuffers : {1U, 2U})
+                assert(CalcGatewayCombineReduceUbBytes(&t, inputBuffers) ==
+                       static_cast<int64_t>(rowBytes * inputBuffers + hidden * 8U + 32U));
+            if (qps == 8U) {
+                assert(info.gatewayCombineReadyPtr == nullptr);
+                assert(info.hierarchicalControlPtr == info.gatewayCombinePtr + rows * rowBytes);
+                for (uint64_t row = 0; row < rows; ++row)
+                    assert(reinterpret_cast<uintptr_t>(info.gatewayCombinePtr + row * rowBytes) % 512U == 0U);
+            } else {
+                assert(info.gatewayCombineReadyPtr == info.gatewayCombinePtr + rows * rowBytes);
+                assert(info.hierarchicalControlPtr == info.gatewayCombineReadyPtr + rows * 512U);
+            }
+            auto* end = qps == 0U ? info.gatewayPayloadReadyPtr + 16U * 512U : info.combineReduceCommitPtr + qps * 512U;
+            assert(end == base + bytes);
+            for (uint32_t bs : {1U, 32U, 64U}) {
+                t.bs = bs;
+                PeermemInfo next(base, &t);
+                assert(CalcPeermemLeastSize(parameters(t)) == bytes);
+                assert(next.gatewayCombinePtr == info.gatewayCombinePtr);
+                assert(next.hierarchicalControlPtr == info.hierarchicalControlPtr);
+                assert(next.combineReduceCommitPtr == info.combineReduceCommitPtr);
+            }
+        }
+    }
+}
+
 int main(int argc, char** argv)
 {
     assert(argc == 2);
@@ -216,6 +269,7 @@ int main(int argc, char** argv)
     check_hybrid(144, 5120, 6, false, mode);
     check_hybrid(144, 1024, 32, true, mode);
     check_workspace_ready_region(mode);
+    check_packet_gateway_layout(mode);
     auto legacy = make_tiling(31, 1024, 6, true, mode);
     legacy.topoType = TOPO_TYPE_MTE;
     legacy.dispatchRanksPerNode = 8;

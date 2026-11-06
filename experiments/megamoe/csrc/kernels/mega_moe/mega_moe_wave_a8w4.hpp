@@ -523,7 +523,8 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     }
     WaveCombineBufferConfig combineBufferConfig{};
     if constexpr (CombineQuantMode != COMBINE_NO_QUANT) {
-        combineBufferConfig = InitWaveCombineBuffers<CombineQuantMode>(commonConfig_, waveCombineScratch_);
+        combineBufferConfig = InitWaveCombineBuffers<CombineQuantMode>(commonConfig_, waveCombineScratch_,
+                                                                       UsePacketizedGatewayCombine(params_.tilingData));
     }
     uint32_t combineRowSequence = 0U;
 

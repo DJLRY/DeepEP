@@ -300,9 +300,10 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     TORCH_CHECK(!hierarchical || p.ub > MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES,
                 "Not enough UB for MegaMoE RoCE scratch");
     const uint32_t stage_ub = hierarchical ? p.ub - MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES : p.ub;
-    const uint32_t reduce_bytes_per_element = (pipeline_flags & megamoe_config::REDUCE_DOUBLE_BUFFER) ? 12U : 10U;
-    TORCH_CHECK(combine_reduce_qps == 0 || stage_ub >= t.h * reduce_bytes_per_element + AlignUp(t.topK * 4U, 32U),
-                "Not enough UB for FP32 gateway reduction");
+    const uint32_t reduce_input_buffers = (pipeline_flags & megamoe_config::REDUCE_DOUBLE_BUFFER) ? 2U : 1U;
+    TORCH_CHECK(
+        combine_reduce_qps == 0 || stage_ub >= MegaMoeImpl::CalcGatewayCombineReduceUbBytes(&t, reduce_input_buffers),
+        "Not enough UB for FP32 gateway reduction");
     t.roceScratchUbOffset = hierarchical ? stage_ub : 0U;
     t.sharedExpertNum = static_cast<uint32_t>(shared_experts);
     t.combineSyncSlotCountPerExpert = 0;
