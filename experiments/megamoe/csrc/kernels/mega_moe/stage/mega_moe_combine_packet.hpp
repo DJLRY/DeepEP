@@ -50,7 +50,8 @@ __aicore__ inline void LoadGatewayCombineRow(LocalTensor<bfloat16_t> input, Glob
     }
     const uint32_t rowBytes = CalcGatewayCombinePacketRowBytes(hidden);
     GlobalTensor<uint32_t> source;
-    source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(rows.GetPhyAddr()) + row * (rowBytes / sizeof(uint32_t)));
+    source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(rows.GetPhyAddr(0U)) +
+                           row * (rowBytes / sizeof(uint32_t)));
     DataCopyPad<uint32_t, PaddingMode::Compact>(input.template ReinterpretCast<uint32_t>(), source,
                                                 {static_cast<uint16_t>(rowBytes / RAIL_PACKET_BYTES),
                                                  RAIL_PACKET_DATA_WORDS * sizeof(uint32_t), sizeof(uint32_t), 0U, 0U},

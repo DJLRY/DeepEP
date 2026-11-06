@@ -488,7 +488,7 @@ __aicore__ inline void SendWaveCombineToken(const MoeStageCommonConfig& common,
             const auto route = CombineImpl::LoadCombineTokenRoute(tokenMetaInfo, 0U);
             if (HierarchicalHost(route.dstRankId) != HierarchicalHost(common.rankId)) {
                 GlobalTensor<uint32_t> source, target;
-                source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(gmm2OutGm.GetPhyAddr()) +
+                source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(gmm2OutGm.GetPhyAddr(0U)) +
                                        static_cast<uint64_t>(tokenLocal) * (bufferConfig.rowBytes / sizeof(uint32_t)));
                 auto packed = rowUb.template ReinterpretCast<uint32_t>();
                 PackGatewayCombineRow(packed, source, bufferConfig.rowBytes, params.tilingData->hierarchicalSequence,

@@ -132,9 +132,13 @@ struct GlobalTensor {
     {
         data = address;
     }
-    T* GetPhyAddr() const
+    const T* GetPhyAddr() const
     {
         return data;
+    }
+    T* GetPhyAddr(uint64_t offset) const
+    {
+        return data + offset;
     }
     GlobalTensor operator[](uint64_t offset) const
     {
