@@ -140,7 +140,15 @@ def test_startup_details_and_combine_decisions_round_trip(raw_file, tmp_path):
             ("AIV_RELAY_STEP", [((0 << 32) | 31, (168 << 32) | 12), ((5 << 32) | 31, (168 << 32) | 12)]),
             ("AIV_COMBINE_RUN", [((7 << 32) | 1, 0x302), ((7 << 32) | 16, 0x401)]),
             ("AIV_COMBINE_REDUCE", [((4 << 32) | 31, (0x85 << 32) | 3584)]),
-            ("AIV_COMBINE_ASYNC", [((4 << 32) | 17, 1)]),
+            (
+                "AIV_COMBINE_ASYNC",
+                [
+                    ((4 << 32) | 17, 1),
+                    ((7 << 32) | 3, (1 << 32) | 1),
+                    ((7 << 32) | 3, (1 << 32) | 2),
+                    ((7 << 32) | 3, (1 << 32) | 3),
+                ],
+            ),
             ("AIV_COMBINE_READY", [((4 << 32) | 31, (0x85 << 32) | 0x81), ((4 << 32) | 31, (0x85 << 32) | 0x85)]),
             ("AIV_COMBINE_SYNC", [((4 << 32) | 1, 3), ((4 << 32) | 4, 0)]),
         ):
@@ -172,6 +180,12 @@ def test_startup_details_and_combine_decisions_round_trip(raw_file, tmp_path):
     async_row = next(e["args"] for e in visible if e["args"].get("granularity") == "combine_async")
     assert (async_row["expert_id"], async_row["row_start"], async_row["scope"]) == (3, 17, "row_lifetime")
     assert next(e["tid"] for e in visible if e["args"].get("granularity") == "combine_async").endswith("/COMBINE_ASYNC")
+    phases = [e for e in visible if e["args"].get("granularity") == "combine_async" and "buffer_slot" in e["args"]]
+    assert [e["args"]["scope"] for e in phases] == ["row_lifetime", "issue", "reuse_wait"]
+    assert phases[0]["args"]["observation"] == "software_retirement"
+    assert phases[0]["tid"].endswith("/COMBINE_ASYNC/slot0")
+    assert phases[1]["tid"].endswith("/COMBINE_ISSUE")
+    assert phases[2]["tid"].endswith("/COMBINE_REUSE_WAIT")
     readiness = [e["args"] for e in visible if e["args"].get("granularity") == "combine_ready"]
     assert [e["token_ready"] for e in readiness] == [False, True]
     sync = [e["args"] for e in visible if e["args"].get("granularity") == "combine_sync"]

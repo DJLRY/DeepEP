@@ -226,11 +226,14 @@ def trace_events(
             )
             wave_metadata["display_index_semantics"] = "per_core_combine_run"
         if granularity == "combine_async":
-            # A DMA row can remain in flight while this AIV executes activation.
-            # Keep row lifetime on its own track, not nested as AIV compute work.
-            lane += "/COMBINE_ASYNC"
-            category = "combine_row_lifetime"
-            display_name = f"COMBINE_ASYNC_expert{task['expert_id']}_row{task['row_start']}"
+            # Lifetime includes delayed software retirement; it is not exact
+            # hardware DMA duration. Separate slots make overlap readable.
+            phase = {"row_lifetime": "ASYNC", "issue": "ISSUE", "reuse_wait": "REUSE_WAIT"}[task["scope"]]
+            lane += f"/COMBINE_{phase}"
+            if phase == "ASYNC" and "buffer_slot" in task:
+                lane += f"/slot{task['buffer_slot']}"
+            category = f"combine_{task['scope']}"
+            display_name = f"COMBINE_{phase}_expert{task['expert_id']}_row{task['row_start']}"
         if granularity == "combine_ready":
             lane += "/COMBINE_READY"
             category = "combine_ready_snapshot"

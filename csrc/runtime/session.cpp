@@ -37,13 +37,9 @@ bool Session::busy()
 }
 
 Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool udma,
-                 bool megamoe, bool mpi, bool combine_only, bool roce, unsigned roce_app_qps)
+                 bool megamoe, bool mpi, bool combine_only, bool roce)
 {
     if (combine_only && (!udma || megamoe)) throw std::invalid_argument("Combine-only requires UDMA");
-    if ((roce_app_qps != 1U && (roce_app_qps == 0U || !megamoe_config::ValidReduceQps(roce_app_qps))) ||
-        (!roce && roce_app_qps != 1U)) {
-        throw std::invalid_argument("RoCE application QPs must be 1, 4 or 8 and require a RoCE runtime");
-    }
     if (roce && (!megamoe || udma || mpi || combine_only || size != 32)) {
         throw std::invalid_argument("RoCE requires the two-host EP32 MegaMoE runtime");
     }
@@ -111,7 +107,8 @@ Session::Session(int rank, int size, uint64_t bytes, const std::string& endpoint
     occupied = true;
     if (roce) {
         // QP0 belongs to SDK operations; each application QP has one fixed AIV owner.
-        check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, 1U + roce_app_qps), "aclshmemx_set_qp_num (RoCE)");
+        check(aclshmemx_set_qp_num(ACLSHMEM_DATA_OP_ROCE, 1U + megamoe_config::COMBINE_QPS),
+              "aclshmemx_set_qp_num (RoCE)");
     }
     if (udma) {
         // Combine owns pairs 0..15; peer-table Dispatch uses pairs 0..7.

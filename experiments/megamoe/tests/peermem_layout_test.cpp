@@ -11,29 +11,15 @@
 
 using namespace MegaMoeImpl;
 
-static_assert(sizeof(MegaMoeTilingData) == 240);
+static_assert(sizeof(MegaMoeTilingData) == 232);
 static_assert(offsetof(MegaMoeTilingData, dispatchRanksPerNode) == 216);
 static_assert(offsetof(MegaMoeTilingData, roceScratchUbOffset) == 220);
 static_assert(offsetof(MegaMoeTilingData, hierarchicalSequence) == 224);
-static_assert(offsetof(MegaMoeTilingData, combineReduceQps) == 228);
-static_assert(offsetof(MegaMoeTilingData, dispatchWorkers) == 232);
-static_assert(offsetof(MegaMoeTilingData, pipelineFlags) == 236);
 
 PeermemSizeParams parameters(const MegaMoeTilingData& t)
 {
-    return {t.numMaxTokensPerRank,
-            t.topK,
-            t.h,
-            t.moeExpertPerRank,
-            t.epWorldSize,
-            2,
-            1,
-            t.topkWeightsPrefetch != 0,
-            false,
-            t.topoType,
-            UseDecodeRailRouting(&t),
-            t.dispatchRanksPerNode,
-            t.combineReduceQps};
+    return {t.numMaxTokensPerRank,      t.topK, t.h,        t.moeExpertPerRank,       t.epWorldSize,         2, 1,
+            t.topkWeightsPrefetch != 0, false,  t.topoType, UseDecodeRailRouting(&t), t.dispatchRanksPerNode};
 }
 
 MegaMoeTilingData make_tiling(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch,
@@ -62,16 +48,20 @@ void check_hybrid(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch, u
     std::vector<uint8_t> allocation(size + 511);
     auto* base = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(allocation.data()) + 511) & ~uintptr_t{511});
     PeermemInfo hybrid(base, &t);
-    const std::array<uint8_t*, 11> boundaries = {hybrid.maskRecvPtr,
+    const auto prefix = HierarchicalMetadataPrefixBytes(&t);
+    const auto routeBase = hybrid.railTopkIdsRecvPtr - prefix;
+    const std::array<uint8_t*, 13> boundaries = {hybrid.maskRecvPtr,
                                                  hybrid.expertCountRecvPtr,
-                                                 hybrid.railTopkIdsRecvPtr,
+                                                 routeBase,
                                                  hybrid.quantTokenScalePtr,
                                                  hybrid.combineSendPtr,
                                                  hybrid.relayPayloadPtr,
                                                  hybrid.gatewayCombinePtr,
-                                                 hybrid.gatewayCombineReadyPtr,
                                                  hybrid.hierarchicalControlPtr,
                                                  hybrid.gatewayPayloadReadyPtr,
+                                                 hybrid.combinePartialSendPtr,
+                                                 hybrid.combinePartialRecvPtr,
+                                                 hybrid.combineReduceCommitPtr,
                                                  base + size};
     assert(hybrid.rankSyncInWorldPtr == base);
     assert(boundaries.front() == base + PEERMEM_DATA_OFFSET);
@@ -80,87 +70,59 @@ void check_hybrid(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch, u
         assert(boundaries[i] >= base && boundaries[i] <= base + size);
         if (i) assert(boundaries[i - 1] < boundaries[i]);
     }
-    assert(hybrid.relayPayloadPtr - hybrid.combineSendPtr == hybrid.gatewayCombineReadyPtr - hybrid.gatewayCombinePtr);
+    const int64_t packetRow = (static_cast<int64_t>(h) * 2 + 507) / 508 * 512;
+    assert(hybrid.hierarchicalControlPtr - hybrid.gatewayCombinePtr == capacity * topk * packetRow);
     assert(hybrid.gatewayCombinePtr - hybrid.relayPayloadPtr == hybrid.combineSendPtr - hybrid.quantTokenScalePtr);
-    assert(hybrid.hierarchicalControlPtr - hybrid.gatewayCombineReadyPtr ==
-           static_cast<int64_t>(capacity) * topk * HIERARCHICAL_FLAG_BYTES);
     assert(hybrid.gatewayPayloadReadyPtr - hybrid.hierarchicalControlPtr ==
-           static_cast<int64_t>(HierarchicalSignal::Count) * HIERARCHICAL_FLAG_BYTES);
-    assert(base + size - hybrid.gatewayPayloadReadyPtr == 16 * 512);
-    assert(hybrid.quantTokenScalePtr - hybrid.railTopkIdsRecvPtr == 2 * CalcRailTopkIdsSlotBytes(&t));
-    // Raw counts retain every source rank, even though rail metadata has two slots.
-    assert(hybrid.railTopkIdsRecvPtr - hybrid.expertCountRecvPtr == CalcMteExpertCountRecvSize(t.moeExpertPerRank, 32));
+           static_cast<int64_t>(HierarchicalSignal::Count) * 512);
+    assert(hybrid.combinePartialSendPtr - hybrid.gatewayPayloadReadyPtr == 16 * 512);
+    assert(base + size - hybrid.combineReduceCommitPtr == 8 * 512);
+    assert(hybrid.quantTokenScalePtr - routeBase == 2 * CalcRailTopkIdsSlotBytes(&t));
+    assert(routeBase - hybrid.expertCountRecvPtr == CalcMteExpertCountRecvSize(t.moeExpertPerRank, 32));
     assert(CalcSendMaskExpertCapacity(&t, 46) >= 16 * t.moeExpertPerRank);
 
-    // Switching actual BS must leave persistent regions at identical addresses.
     for (uint32_t bs : {1U, 7U, 17U, 31U, 32U, 33U, 138U, 144U, 255U, 256U, 1U, 32U}) {
         if (bs > capacity) continue;
         t.bs = bs;
-        assert(UseDecodeRailRouting(&t));
         PeermemInfo next(base, &t);
         assert(CalcPeermemLeastSize(parameters(t)) == size);
-        assert(next.railTopkIdsRecvPtr == hybrid.railTopkIdsRecvPtr);
+        assert(next.railTopkIdsRecvPtr - HierarchicalMetadataPrefixBytes(&t) == routeBase);
         assert(next.quantTokenScalePtr == hybrid.quantTokenScalePtr);
         assert(next.combineSendPtr == hybrid.combineSendPtr);
         assert(next.relayPayloadPtr == hybrid.relayPayloadPtr);
-        assert(next.gatewayCombineReadyPtr == hybrid.gatewayCombineReadyPtr);
         assert(next.hierarchicalControlPtr == hybrid.hierarchicalControlPtr);
-        assert(next.gatewayPayloadReadyPtr == hybrid.gatewayPayloadReadyPtr);
-        // Dispatch sends actual rows, while the persistent window reserves the
-        // declared capacity. Both the GM source and relay destination must fit.
+        assert(next.combinePartialSendPtr == hybrid.combinePartialSendPtr);
+        assert(next.combinePartialRecvPtr == hybrid.combinePartialRecvPtr);
+        assert(next.combineReduceCommitPtr == hybrid.combineReduceCommitPtr);
         const auto payloadBytes = static_cast<int64_t>(bs) * CalcQuantTokenScaleBytes(h, 1, topk, false);
         assert(next.quantTokenScalePtr + payloadBytes <= next.combineSendPtr);
         assert(next.relayPayloadPtr + payloadBytes <= next.gatewayCombinePtr);
     }
-
     if (capacity == 32 && topk == 32) {
-        // 1024 IDs require nine packets, including the final eight IDs. The
-        // final BF16 result and its 512B flag line must fit without aliasing.
-        assert(CalcRailTopkIdsSlotBytes(&t) == 9 * 512);
-        assert(hybrid.quantTokenScalePtr - hybrid.railTopkIdsRecvPtr == 18 * 512);
-        assert(hybrid.gatewayCombineReadyPtr - hybrid.gatewayCombinePtr == 1024LL * h * 2);
-        assert(hybrid.hierarchicalControlPtr - hybrid.gatewayCombineReadyPtr == 1024 * 512);
-        const auto rowBytes = CalcQuantTokenScaleBytes(h, 1, topk, prefetch);
-        assert(hybrid.relayPayloadPtr + 32 * rowBytes <= hybrid.gatewayCombinePtr);
+        assert(CalcRailTopkIdsSlotBytes(&t) == (9 + 8) * 512);
+        assert(hybrid.quantTokenScalePtr - routeBase == 34 * 512);
+        assert(hybrid.hierarchicalControlPtr - hybrid.gatewayCombinePtr == 1024 * packetRow);
     }
 
-    // A hybrid mode change must not move persistent peer-memory regions. Both
-    // modes dispatch the same FP8 records and combine full BF16 output rows.
-    t.groupedMatmulMode = mode == GROUPED_MATMUL_MODE_A8W4 ? GROUPED_MATMUL_MODE_GENERAL : GROUPED_MATMUL_MODE_A8W4;
-    PeermemInfo otherMode(base, &t);
-    assert(UseDecodeRailRouting(&t));
-    assert(CalcPeermemLeastSize(parameters(t)) == size);
-    assert(otherMode.expertCountRecvPtr == hybrid.expertCountRecvPtr);
-    assert(otherMode.railTopkIdsRecvPtr == hybrid.railTopkIdsRecvPtr);
-    assert(otherMode.quantTokenScalePtr == hybrid.quantTokenScalePtr);
-    assert(otherMode.combineSendPtr == hybrid.combineSendPtr);
-    assert(otherMode.relayPayloadPtr == hybrid.relayPayloadPtr);
-    assert(otherMode.gatewayCombinePtr == hybrid.gatewayCombinePtr);
-    assert(otherMode.gatewayCombineReadyPtr == hybrid.gatewayCombineReadyPtr);
-    assert(otherMode.hierarchicalControlPtr == hybrid.hierarchicalControlPtr);
-    assert(otherMode.gatewayPayloadReadyPtr == hybrid.gatewayPayloadReadyPtr);
-
-    // Legacy MTE retains its original selection: A8W4 uses rail metadata at
-    // these decode sizes; A8W8 must keep its direct-routing layout.
-    t.groupedMatmulMode = mode;
+    // MTE-only remains independent of the fixed two-host weighted layout.
     t.topoType = TOPO_TYPE_MTE;
     PeermemInfo local(base, &t);
     assert(UseDecodeRailRouting(&t) == (mode == GROUPED_MATMUL_MODE_A8W4));
     assert(local.maskRecvPtr == hybrid.maskRecvPtr);
     assert(local.expertCountRecvPtr == hybrid.expertCountRecvPtr);
     if (UseDecodeRailRouting(&t)) {
-        assert(local.railTopkIdsRecvPtr == hybrid.railTopkIdsRecvPtr);
-        assert(local.quantTokenScalePtr == hybrid.quantTokenScalePtr);
-        assert(local.combineSendPtr == hybrid.combineSendPtr);
-        assert(base + CalcPeermemLeastSize(parameters(t)) == hybrid.relayPayloadPtr);
+        const auto weightBytes = 2 * CalcCombineWeightsBytes(capacity, topk);
+        assert(local.railTopkIdsRecvPtr == routeBase);
+        assert(local.quantTokenScalePtr + weightBytes == hybrid.quantTokenScalePtr);
+        assert(local.combineSendPtr + weightBytes == hybrid.combineSendPtr);
+        assert(base + CalcPeermemLeastSize(parameters(t)) + weightBytes == hybrid.relayPayloadPtr);
     } else {
         assert(local.railTopkIdsRecvPtr == nullptr);
         assert(local.quantTokenScalePtr - local.expertCountRecvPtr == CalcExpertCountRecvSize(t.moeExpertPerRank, 32));
         assert(local.quantTokenScalePtr < hybrid.quantTokenScalePtr);
     }
-    assert(local.gatewayPayloadReadyPtr == nullptr);
+    assert(local.gatewayPayloadReadyPtr == nullptr && local.hierarchicalControlPtr == nullptr);
     assert(local.relayPayloadPtr == nullptr && local.gatewayCombinePtr == nullptr);
-    assert(local.gatewayCombineReadyPtr == nullptr && local.hierarchicalControlPtr == nullptr);
 }
 
 void check_workspace_ready_region(uint8_t mode)
@@ -210,40 +172,34 @@ void check_workspace_ready_region(uint8_t mode)
 void check_packet_gateway_layout(uint8_t mode)
 {
     auto largest = make_tiling(64U, 8192U, 8U, false, mode);
-    largest.combineReduceQps = 8U;
     std::vector<uint8_t> heap(CalcPeermemLeastSize(parameters(largest)) + 511U, 0xA5);
     auto* base = reinterpret_cast<uint8_t*>((reinterpret_cast<uintptr_t>(heap.data()) + 511U) & ~uintptr_t{511});
     for (uint32_t hidden = 1024U; hidden <= 8192U; hidden += 32U) {
-        for (uint32_t qps : {0U, 4U, 8U}) {
+        {
             auto t = make_tiling(64U, hidden, 8U, false, mode);
-            t.combineReduceQps = qps;
             const auto bytes = CalcPeermemLeastSize(parameters(t));
             assert(base + bytes <= heap.data() + heap.size());
             PeermemInfo info(base, &t);
-            const uint64_t rowBytes = qps == 8U ? (hidden * 2U + 507U) / 508U * 512U : hidden * 2U;
+            const uint64_t rowBytes = (hidden * 2U + 507U) / 508U * 512U;
             const uint64_t rows = 64U * 8U;
-            assert(UsePacketizedGatewayCombine(&t) == (qps == 8U));
-            const uint64_t inputRowBytes = qps == 8U ? rowBytes : (hidden * 2U + 127U) / 128U * 128U;
+            assert(UsePacketizedGatewayCombine(&t));
+            const uint64_t inputRowBytes = rowBytes;
             const uint64_t sumBytes = (hidden * 4U + 255U) / 256U * 256U;
-            const uint64_t readyBytes = qps == 8U ? 8U * (rowBytes / 512U) * 32U + 32U : 0U;
+            const uint64_t readyBytes = 8U * (rowBytes / 512U) * 32U + 32U;
             assert(CalcGatewayCombineInputUbRowBytes(&t) == static_cast<int64_t>(inputRowBytes));
             assert(CalcGatewayCombineSumUbBytes(&t) == static_cast<int64_t>(sumBytes));
             assert(CalcGatewayCombineReadyUbBytes(&t) == static_cast<int64_t>(readyBytes));
-            for (uint32_t inputBuffers : {1U, 2U}) {
+            for (uint32_t inputBuffers : {2U}) {
                 const uint64_t reduceBytes = inputRowBytes * inputBuffers + sumBytes + 32U;
-                assert(CalcGatewayCombineReduceUbBytes(&t, inputBuffers) ==
+                assert(CalcGatewayCombineReduceUbBytes(&t) ==
                        static_cast<int64_t>(reduceBytes > readyBytes ? reduceBytes : readyBytes));
             }
-            if (qps == 8U) {
-                assert(info.gatewayCombineReadyPtr == nullptr);
-                assert(info.hierarchicalControlPtr == info.gatewayCombinePtr + rows * rowBytes);
-                for (uint64_t row = 0; row < rows; ++row)
-                    assert(reinterpret_cast<uintptr_t>(info.gatewayCombinePtr + row * rowBytes) % 512U == 0U);
-            } else {
-                assert(info.gatewayCombineReadyPtr == info.gatewayCombinePtr + rows * rowBytes);
-                assert(info.hierarchicalControlPtr == info.gatewayCombineReadyPtr + rows * 512U);
-            }
-            auto* end = qps == 0U ? info.gatewayPayloadReadyPtr + 16U * 512U : info.combineReduceCommitPtr + qps * 512U;
+
+            assert(info.hierarchicalControlPtr == info.gatewayCombinePtr + rows * rowBytes);
+            for (uint64_t row = 0; row < rows; ++row)
+                assert(reinterpret_cast<uintptr_t>(info.gatewayCombinePtr + row * rowBytes) % 512U == 0U);
+
+            auto* end = info.combineReduceCommitPtr + 8U * 512U;
             assert(end == base + bytes);
             for (uint32_t bs : {1U, 32U, 64U}) {
                 t.bs = bs;

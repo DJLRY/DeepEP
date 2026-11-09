@@ -274,6 +274,34 @@ public:
         }
     }
 
+    // Independent row handles retain the originating wave across expert/wave
+    // boundaries. Lifetime ends when software observes retirement, not at a
+    // hardware-exact DMA timestamp. No timer-only synchronization is added.
+    __aicore__ inline int BeginCombineRow(uint32_t expert, uint32_t row, uint32_t slot,
+                                          AscendTimer::CombineRowPhase phase)
+    {
+        return BeginCombineRowAtWave(expert, row, slot, phase, waveId_);
+    }
+
+    __aicore__ inline int64_t CurrentWave() const
+    {
+        return waveId_;
+    }
+
+    __aicore__ inline int BeginCombineRowAtWave(uint32_t expert, uint32_t row, uint32_t slot,
+                                                AscendTimer::CombineRowPhase phase, int64_t wave)
+    {
+        return BeginIndependent(AscendTimer::AIV_COMBINE_ASYNC, (static_cast<uint64_t>(expert + 1U) << 32) | row,
+                                (static_cast<uint64_t>(slot + 1U) << 32) | static_cast<uint32_t>(phase), wave);
+    }
+
+    __aicore__ inline void EndCombineRow(int index)
+    {
+        if (Enabled() && index >= 0) {
+            EndRaw(AscendTimer::AIV_COMBINE_ASYNC, index, AscendC::GetSystemCycle());
+        }
+    }
+
     // Progress can surround RDMA calls while a compute tile/span or wait is
     // active. Capture the scheduler's wave without changing any active handle.
     __aicore__ inline int BeginCombineProgress(AscendTimer::DynamicTimingType type)

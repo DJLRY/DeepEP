@@ -553,11 +553,11 @@ namespace MegaMoeImpl {
 }
 using namespace MegaMoeImpl;
 
-void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity, uint32_t topk, uint32_t hidden,
-               uint32_t pattern, uint32_t sequence, bool shared, bool laneInit = false, bool diagnostic = false,
-               bool doubleBuffer = false)
+void CheckCase(uint32_t sourceRank, uint32_t bs, uint32_t capacity, uint32_t topk, uint32_t hidden, uint32_t pattern,
+               uint32_t sequence, bool shared)
 {
     using namespace ReduceTest;
+    constexpr uint32_t qps = 8U;
     ub.fill(0);
     events = {};
     posts.clear();
@@ -581,14 +581,12 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     t.aicNum = 28U;
     t.topoType = TOPO_TYPE_MTE_ROCE;
     t.groupedMatmulMode = GROUPED_MATMUL_MODE_A8W4;
-    t.combineReduceQps = qps;
-    t.pipelineFlags = (laneInit ? 2U : 0U) | (diagnostic ? 64U : 0U) | (doubleBuffer ? 256U : 0U);
     t.roceScratchUbOffset = 256U * 1024U - 512U;
     t.hierarchicalSequence = sequence;
     t.sharedExpertNum = shared ? 1U : 0U;
-    mainUbLimit = CalcGatewayCombineReduceUbBytes(&t, doubleBuffer ? 2U : 1U);
+    mainUbLimit = CalcGatewayCombineReduceUbBytes(&t);
     const PeermemSizeParams sizes{capacity,           topk, hidden, 12U, 32U, 2U, 1U, false, false,
-                                  TOPO_TYPE_MTE_ROCE, true, 16U,    qps};
+                                  TOPO_TYPE_MTE_ROCE, true, 16U};
     heapBytes = CalcPeermemLeastSize(sizes);
     std::vector<uint8_t> sourceHeap(heapBytes, 0xA5), gatewayHeap(heapBytes, 0xA5);
     PeermemInfo source(sourceHeap.data(), &t), gateway(gatewayHeap.data(), &t);
@@ -608,10 +606,8 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     std::vector<uint32_t> masks(bs, 0U);
     const uint32_t sourceHost = HierarchicalHost(sourceRank);
     auto* originalLocal = reinterpret_cast<bfloat16_t*>(source.combineSendPtr);
-    const bool packets = qps == 8U;
-    const uint32_t gatewayRowBytes = packets ? (hidden * 2U + 507U) / 508U * 512U : hidden * 2U;
+    const uint32_t gatewayRowBytes = (hidden * 2U + 507U) / 508U * 512U;
     const uint32_t packetCount = gatewayRowBytes / 512U;
-    auto* ready = reinterpret_cast<uint32_t*>(gateway.gatewayCombineReadyPtr);
     const bfloat16_t poison(std::nanf(""));
     std::fill_n(originalLocal, capacity * topk * hidden, poison);
     for (uint32_t token = 0; token < bs; ++token) {
@@ -627,20 +623,17 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
                     bfloat16_t(static_cast<float>(static_cast<int>((token * 31U + k * 13U + h) % 61U) - 30) / 23.0f);
                 if (remote) {
                     const uint32_t byte = h * 2U;
-                    const uint64_t offset = static_cast<uint64_t>(token * topk + k) * gatewayRowBytes +
-                                            (packets ? byte / 508U * 512U + byte % 508U : byte);
+                    const uint64_t offset =
+                        static_cast<uint64_t>(token * topk + k) * gatewayRowBytes + (byte / 508U * 512U + byte % 508U);
                     std::memcpy(gateway.gatewayCombinePtr + offset, &expertRows[index], 2U);
                 } else {
                     originalLocal[index] = expertRows[index];
                 }
             }
-            if (packets) {
-                auto* row = reinterpret_cast<uint32_t*>(gateway.gatewayCombinePtr +
-                                                        static_cast<uint64_t>(token * topk + k) * gatewayRowBytes);
-                for (uint32_t p = 0; p < packetCount; ++p) row[p * 128U + 127U] = sequence - 1U;
-            } else {
-                ready[(token * topk + k) * 128U] = sequence - 1U;
-            }
+
+            auto* row = reinterpret_cast<uint32_t*>(gateway.gatewayCombinePtr +
+                                                    static_cast<uint64_t>(token * topk + k) * gatewayRowBytes);
+            for (uint32_t p = 0; p < packetCount; ++p) row[p * 128U + 127U] = sequence - 1U;
         }
         for (uint32_t h = 0; h < hidden; ++h) {
             float remoteSum = 0.0f, localSum = 0.0f;
@@ -694,7 +687,7 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
         }
         Check(state[activeLane].expectedRows == expectedRows, "wrong lane row count");
         std::set<uint32_t> expectedChunks, actualChunks;
-        for (uint32_t row = laneInit ? first * topk : 0U; row < (laneInit ? end * topk : bs * topk); ++row)
+        for (uint32_t row = first * topk; row < end * topk; ++row)
             expectedChunks.insert(row / RAIL_PACKET_DATA_WORDS * RAIL_PACKET_WORDS +
                                   (row % RAIL_PACKET_DATA_WORDS) / 64U * 64U);
         const auto* routes = reinterpret_cast<int32_t*>(gateway.railTopkIdsRecvPtr + slot);
@@ -715,24 +708,22 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
     for (uint32_t row = bs * topk; row-- > 0;) {
         const uint32_t token = row / topk, k = row % topk;
         if ((masks[token] & (uint32_t{1} << k)) == 0) continue;
-        if (packets) {
-            auto* words =
-                reinterpret_cast<uint32_t*>(gateway.gatewayCombinePtr + static_cast<uint64_t>(row) * gatewayRowBytes);
-            // A last-packet marker cannot release an earlier missing packet.
-            for (uint32_t p = 0; p < packetCount; ++p) words[p * 128U + 127U] = sequence;
-            const uint32_t missing = packetCount / 2U;
-            words[missing * 128U + 127U] = sequence - 1U;
-            Check(GatewayCombinePacketReadyMask(params, token, uint32_t{1} << k) == 0U, "partial packet row released");
-            const size_t before = posts.size();
-            for (activeLane = 0; activeLane < qps; ++activeLane)
-                TryProgressHierarchicalReducedCombine(gwCommon, params, state[activeLane], activeLane, scratch, &timer);
-            Check(posts.size() == before, "partial packet row reduced or posted");
-            words[missing * 128U + 127U] = sequence;
-            Check(GatewayCombinePacketReadyMask(params, token, uint32_t{1} << k) == (uint32_t{1} << k),
-                  "complete packet row not ready");
-        } else {
-            ready[row * 128U] = sequence;
-        }
+
+        auto* words =
+            reinterpret_cast<uint32_t*>(gateway.gatewayCombinePtr + static_cast<uint64_t>(row) * gatewayRowBytes);
+        // A last-packet marker cannot release an earlier missing packet.
+        for (uint32_t p = 0; p < packetCount; ++p) words[p * 128U + 127U] = sequence;
+        const uint32_t missing = packetCount / 2U;
+        words[missing * 128U + 127U] = sequence - 1U;
+        Check(GatewayCombinePacketReadyMask(params, token, uint32_t{1} << k) == 0U, "partial packet row released");
+        const size_t beforeIncomplete = posts.size();
+        for (activeLane = 0; activeLane < qps; ++activeLane)
+            TryProgressHierarchicalReducedCombine(gwCommon, params, state[activeLane], activeLane, scratch, &timer);
+        Check(posts.size() == beforeIncomplete, "partial packet row reduced or posted");
+        words[missing * 128U + 127U] = sequence;
+        Check(GatewayCombinePacketReadyMask(params, token, uint32_t{1} << k) == (uint32_t{1} << k),
+              "complete packet row not ready");
+
         published[token] |= uint32_t{1} << k;
         const size_t before = posts.size();
         for (activeLane = 0; activeLane < qps; ++activeLane)
@@ -748,9 +739,8 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
         TraceHierarchicalCombineBoundary(gwCommon, params, state[activeLane], activeLane, &timer, 3U);
         TraceHierarchicalCombineBoundary(gwCommon, params, state[activeLane], activeLane, &timer, 4U);
     }
-    Check(timer.syncRecords == (diagnostic ? qps * 4U : 0U), "missing synchronization diagnostics");
-    Check(diagnostic ? timer.readyRecords >= bs * 4U : timer.readyRecords == 0U,
-          "missing/unsolicited ready diagnostics");
+    Check(timer.syncRecords == (qps * 4U), "missing synchronization diagnostics");
+    Check(timer.readyRecords >= bs * 4U, "missing/unsolicited ready diagnostics");
     std::vector<uint32_t> sent(bs, 0U);
     for (const auto& post : posts) {
         const uint32_t token = static_cast<uint32_t>((post.source - gateway.combinePartialSendPtr) / (hidden * 4U));
@@ -764,7 +754,7 @@ void CheckCase(uint32_t qps, uint32_t sourceRank, uint32_t bs, uint32_t capacity
         Check(sent[token] == static_cast<uint32_t>(masks[token] != 0), "missing or duplicate token");
     uint32_t expectedOverlap = 0;
     for (const auto mask : masks)
-        if (doubleBuffer && mask != 0U) expectedOverlap += CombineMaskCount(mask) - 1U;
+        if (mask != 0U) expectedOverlap += CombineMaskCount(mask) - 1U;
     Check(overlappedCasts == expectedOverlap, "next expert load did not overlap current Cast");
     uint32_t expectedRowVfs = 0U;
     for (const auto mask : masks) expectedRowVfs += CombineMaskCount(mask);
@@ -824,7 +814,6 @@ void CheckBatchSnapshots()
             t.epWorldSize = 32U;
             t.dispatchRanksPerNode = 16U;
             t.topoType = TOPO_TYPE_MTE_ROCE;
-            t.combineReduceQps = 8U;
             const uint32_t packets = (hidden * 2U + 507U) / 508U;
             const size_t tokenBytes = topk * packets * 512U;
             std::vector<uint32_t> heap(3U * tokenBytes / 4U, 0xDEADBEEFU);
@@ -931,28 +920,17 @@ int main()
     try {
         CheckBatchSnapshots();
         CheckFusedRowNumerics();
-        for (bool doubleBuffer : {false, true}) {
-            for (bool laneInit : {false, true}) {
-                for (uint32_t qps : {4U, 8U})
-                    for (uint32_t rank : {0U, 21U})
-                        for (uint32_t pattern = 0; pattern < 5; ++pattern) {
-                            CheckCase(qps, rank, 32U, 64U, 8U, 3584U, pattern, 0x80000101U, false, laneInit, false,
-                                      doubleBuffer);
-                            CheckCase(qps, rank, 7U, 32U, 1U, 1024U, pattern, 0xffffffffU, true, laneInit, false,
-                                      doubleBuffer);
-                            CheckCase(qps, rank, 1U, 8U, 32U, 8192U, pattern, 129U, false, laneInit, false,
-                                      doubleBuffer);
-                        }
-                CheckCase(4U, 0U, 256U, 256U, 32U, 1024U, 2U, 257U, true, laneInit, false, doubleBuffer);
-                CheckCase(8U, 0U, 3U, 8U, 7U, 1024U, 2U, 3U, false, laneInit, false, doubleBuffer);
-                CheckCase(8U, 16U, 37U, 64U, 7U, 1024U, 2U, 3U, false, laneInit, false, doubleBuffer);
-                CheckCase(8U, 0U, 3U, 8U, 7U, 8128U, 2U, 129U, false, laneInit, false, doubleBuffer);
-                CheckCase(8U, 16U, 3U, 8U, 7U, 1056U, 2U, 257U, true, laneInit, false, doubleBuffer);
-                CheckCase(4U, 16U, 3U, 8U, 7U, 1056U, 2U, 257U, true, laneInit, false, doubleBuffer);
+        for (uint32_t rank : {0U, 21U})
+            for (uint32_t pattern = 0; pattern < 5; ++pattern) {
+                CheckCase(rank, 32U, 64U, 8U, 3584U, pattern, 0x80000101U, false);
+                CheckCase(rank, 7U, 32U, 1U, 1024U, pattern, 0xffffffffU, true);
+                CheckCase(rank, 1U, 8U, 32U, 8192U, pattern, 129U, false);
             }
-            CheckCase(8U, 0U, 32U, 64U, 8U, 3584U, 2U, 0x80000101U, false, true, true, doubleBuffer);
-            CheckCase(4U, 16U, 7U, 32U, 32U, 1024U, 2U, 0xffffffffU, true, false, true, doubleBuffer);
-        }
+        CheckCase(0U, 256U, 256U, 32U, 1024U, 2U, 257U, true);
+        CheckCase(0U, 3U, 8U, 7U, 1024U, 2U, 3U, false);
+        CheckCase(16U, 37U, 64U, 7U, 1024U, 2U, 3U, false);
+        CheckCase(0U, 3U, 8U, 7U, 8128U, 2U, 129U, false);
+        CheckCase(16U, 3U, 8U, 7U, 1056U, 2U, 257U, true);
     } catch (const std::exception& error) {
         std::cerr << error.what() << '\n';
         return 1;

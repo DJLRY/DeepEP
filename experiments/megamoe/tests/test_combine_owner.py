@@ -29,7 +29,6 @@ def combine_owner_source():
     fixture = (DIRECTORY / "combine_owner_test.cpp").read_text(encoding="utf-8")
     for marker, source, name in [
         ("READY_COMBINE", wave, "::TryRunReadyCombine("),
-        ("SCHEDULER", wave, "::ProcessAiv1PriorityStages("),
         ("OWNED_RANGE", combine, "WorkRange GetWaveCombineOwnedRange("),
         ("PRODUCER_COUNT", combine, "uint32_t GetTokenCombineProducerCount("),
         ("BALANCED_RANGE", utils, "WorkRange GetBalancedTokenRange("),
@@ -77,7 +76,7 @@ def combine_owner_binary(tmp_path_factory):
     return binary
 
 
-@pytest.mark.parametrize("scenario", ["coverage", "readiness", "scheduler", "dispatch"])
+@pytest.mark.parametrize("scenario", ["coverage", "readiness", "dispatch"])
 def test_combine_owner_contract(combine_owner_binary, scenario):
     result = subprocess.run([str(combine_owner_binary), scenario], capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stderr

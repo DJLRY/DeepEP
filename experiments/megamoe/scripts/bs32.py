@@ -244,7 +244,7 @@ import torch, torch_npu, deep_ep
 from deep_ep._native import require_native
 import deep_ep_experimental.megamoe._C as megamoe
 require_native('BS32 preflight')
-if getattr(megamoe, 'api_protocol', None) != 10:
+if getattr(megamoe, 'api_protocol', None) != 11:
     raise RuntimeError('Installed MegaMoE protocol is outdated; run run_bs32.sh build on both hosts first')
 info = json.loads(files('deep_ep').joinpath('_build_info.json').read_text())
 if Path(deep_ep.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()):
@@ -281,16 +281,6 @@ def test_commands(
     mode="accuracy",
     timer_ranks=None,
     perf_method="legacy",
-    combine_reduce_qps=0,
-    dispatch_workers=0,
-    reduce_lane_init=False,
-    combine_sparse_scan=False,
-    reduce_double_buffer=False,
-    combine_single_row=False,
-    combine_ready_trace=False,
-    dispatch_skip_empty=False,
-    dispatch_lookahead=False,
-    dispatch_single_row=False,
 ):
     python = [config["python"], "-I", "-m"]
     golden_dir = str(Path(config["case_dir"]) / "golden")
@@ -347,26 +337,6 @@ def test_commands(
         benchmark.extend(["--timer", "--timer-ranks", ",".join(map(str, timer_ranks))])
     if mode in ("perf", "trace"):
         benchmark.extend(["--perf-method", perf_method])
-    if combine_reduce_qps:
-        benchmark.extend(["--combine-reduce-qps", str(combine_reduce_qps)])
-    if dispatch_workers:
-        benchmark.extend(["--dispatch-workers", str(dispatch_workers)])
-    if reduce_lane_init:
-        benchmark.append("--reduce-lane-init")
-    if combine_sparse_scan:
-        benchmark.append("--combine-sparse-scan")
-    if reduce_double_buffer:
-        benchmark.append("--reduce-double-buffer")
-    if combine_single_row:
-        benchmark.append("--combine-single-row")
-    if combine_ready_trace:
-        benchmark.append("--combine-ready-trace")
-    if dispatch_skip_empty:
-        benchmark.append("--dispatch-skip-empty")
-    if dispatch_lookahead:
-        benchmark.append("--dispatch-lookahead")
-    if dispatch_single_row:
-        benchmark.append("--dispatch-single-row")
     return golden, benchmark
 
 
@@ -402,16 +372,7 @@ def performance_summary(config, run_dir, bs_values=(32,)):
         lines = [
             f"[PERF SUMMARY] EP32 BS{bs}; FP8 input / FP4 weights; balanced routing",
             f"Performance method: {report.get('perf_method', 'legacy')}",
-            f"Combine reduction QPs: {report.get('combine_reduce_qps', 0)} (0 = original BF16 forwarding)",
-            f"Pipeline: dispatch_workers={report.get('dispatch_workers', 0)}, "
-            f"reduce_lane_init={report.get('reduce_lane_init', False)}, "
-            f"combine_sparse_scan={report.get('combine_sparse_scan', False)}, "
-            f"reduce_double_buffer={report.get('reduce_double_buffer', False)}, "
-            f"combine_single_row={report.get('combine_single_row', False)}, "
-            f"combine_ready_trace={report.get('combine_ready_trace', False)}, "
-            f"dispatch_skip_empty={report.get('dispatch_skip_empty', False)}, "
-            f"dispatch_lookahead={report.get('dispatch_lookahead', False)}, "
-            f"dispatch_single_row={report.get('dispatch_single_row', False)}",
+            f"Implementation: {report['implementation']} (QP8 / Dispatch14 / cross-expert ring)",
             f"All-rank kernel Duration; {report['rounds']}/{report['recorded_rounds']} rounds (tail half)",
             f"Mean of per-round minimum rank: {report['mean_us']:.3f} us",
             f"Mean of per-round maximum rank: {report['rank_max_mean_us']:.3f} us",
@@ -424,16 +385,7 @@ def performance_summary(config, run_dir, bs_values=(32,)):
             dict(
                 bs=bs,
                 perf_method=report.get("perf_method", "legacy"),
-                combine_reduce_qps=report.get("combine_reduce_qps", 0),
-                dispatch_workers=report.get("dispatch_workers", 0),
-                reduce_lane_init=report.get("reduce_lane_init", False),
-                combine_sparse_scan=report.get("combine_sparse_scan", False),
-                reduce_double_buffer=report.get("reduce_double_buffer", False),
-                combine_single_row=report.get("combine_single_row", False),
-                combine_ready_trace=report.get("combine_ready_trace", False),
-                dispatch_skip_empty=report.get("dispatch_skip_empty", False),
-                dispatch_lookahead=report.get("dispatch_lookahead", False),
-                dispatch_single_row=report.get("dispatch_single_row", False),
+                implementation=report["implementation"],
                 rounds=report["rounds"],
                 recorded_rounds=report["recorded_rounds"],
                 mean_us=report["mean_us"],
@@ -467,13 +419,13 @@ def trace_summary(run_dir, case, local_timer_ranks):
     print(summary, end="", flush=True)
 
 
-def print_trace_parts(source, config, *, pipeline=False, env=None):
+def print_trace_parts(source, config, *, env=None):
     execute(
         [
             config["python"],
             "-I",
             str(ROOT / "experiments/megamoe/scripts/trace_text.py"),
-            "export-pipeline" if pipeline else "export",
+            "export",
             str(source),
             "--max-bytes",
             "65535",
@@ -497,48 +449,10 @@ def dispatch(
     include_wait=False,
     perf_method="legacy",
     extra_bs=False,
-    combine_reduce_qps=0,
-    dispatch_workers=0,
-    reduce_lane_init=False,
-    combine_sparse_scan=False,
-    reduce_double_buffer=False,
-    combine_single_row=False,
-    combine_ready_trace=False,
-    dispatch_skip_empty=False,
-    dispatch_lookahead=False,
-    dispatch_single_row=False,
     print_text=True,
 ):
     if extra_bs and action != "perf":
         raise ValueError("--extra-bs requires perf")
-    if combine_reduce_qps not in (0, 4, 8) or (combine_reduce_qps and action not in ("run", "perf", "trace")):
-        raise ValueError("--combine-reduce-qps requires run/perf/trace and a value of 0, 4 or 8")
-    if (
-        dispatch_workers
-        or reduce_lane_init
-        or combine_sparse_scan
-        or reduce_double_buffer
-        or combine_single_row
-        or combine_ready_trace
-        or dispatch_skip_empty
-        or dispatch_lookahead
-        or dispatch_single_row
-    ) and action not in (
-        "run",
-        "perf",
-        "trace",
-    ):
-        raise ValueError("Pipeline experiments require run/perf/trace")
-    if dispatch_workers not in (0, 8, 14, 28):
-        raise ValueError("--dispatch-workers requires a value of 0, 8, 14 or 28")
-    if reduce_lane_init and not combine_reduce_qps:
-        raise ValueError("--reduce-lane-init requires --combine-reduce-qps 4 or 8")
-    if combine_sparse_scan and combine_reduce_qps:
-        raise ValueError("--combine-sparse-scan requires --combine-reduce-qps 0")
-    if (reduce_double_buffer or combine_ready_trace) and not combine_reduce_qps:
-        raise ValueError("reduce-double-buffer and ready-trace require q=4 or 8")
-    if combine_single_row and combine_reduce_qps:
-        raise ValueError("--combine-single-row requires q=0")
     if platform.system() != "Linux":
         raise RuntimeError("Build/run require Linux; configure/show-config can run without devices")
     env = environment(config)
@@ -592,16 +506,7 @@ def dispatch(
                 include_wait=include_wait,
                 perf_method=perf_method,
                 extra_bs=extra_bs,
-                combine_reduce_qps=combine_reduce_qps,
-                dispatch_workers=dispatch_workers,
-                reduce_lane_init=reduce_lane_init,
-                combine_sparse_scan=combine_sparse_scan,
-                reduce_double_buffer=reduce_double_buffer,
-                combine_single_row=combine_single_row,
-                combine_ready_trace=combine_ready_trace,
-                dispatch_skip_empty=dispatch_skip_empty,
-                dispatch_lookahead=dispatch_lookahead,
-                dispatch_single_row=dispatch_single_row,
+                implementation="qp8_cross_expert",
                 bs_values=case["bs_values"],
             ),
             indent=2,
@@ -623,16 +528,6 @@ def dispatch(
                 case_dir,
                 mode="perf",
                 perf_method=perf_method,
-                combine_reduce_qps=combine_reduce_qps,
-                dispatch_workers=dispatch_workers,
-                reduce_lane_init=reduce_lane_init,
-                combine_sparse_scan=combine_sparse_scan,
-                reduce_double_buffer=reduce_double_buffer,
-                combine_single_row=combine_single_row,
-                combine_ready_trace=combine_ready_trace,
-                dispatch_skip_empty=dispatch_skip_empty,
-                dispatch_lookahead=dispatch_lookahead,
-                dispatch_single_row=dispatch_single_row,
             )
             print(f"[PERF] EP32 BS={bs} output={case_dir}", flush=True)
             execute(benchmark, env, case_dir / "console.log")
@@ -645,16 +540,6 @@ def dispatch(
         mode=action if sampling else "accuracy",
         timer_ranks=selected,
         perf_method=perf_method,
-        combine_reduce_qps=combine_reduce_qps,
-        dispatch_workers=dispatch_workers,
-        reduce_lane_init=reduce_lane_init,
-        combine_sparse_scan=combine_sparse_scan,
-        reduce_double_buffer=reduce_double_buffer,
-        combine_single_row=combine_single_row,
-        combine_ready_trace=combine_ready_trace,
-        dispatch_skip_empty=dispatch_skip_empty,
-        dispatch_lookahead=dispatch_lookahead,
-        dispatch_single_row=dispatch_single_row,
     )
     if not sampling:
         execute(golden, env, run_dir / "golden.log")
@@ -708,55 +593,7 @@ def main(argv=None, *, print_text=True):
         help="perf only: after BS32, also measure BS1,4,8,16,256 with identical performance options",
     )
     parser.add_argument("--timer", action="store_true", help="build only: enable device timer support for trace")
-    parser.add_argument(
-        "--combine-reduce-qps",
-        type=int,
-        choices=(0, 4, 8),
-        default=None,
-        help="run/perf/trace: 4/8 enable FP32 gateway reduction; 0 keeps original forwarding",
-    )
     waits = parser.add_mutually_exclusive_group()
-    parser.add_argument(
-        "--dispatch-workers",
-        type=int,
-        choices=(0, 8, 14, 28),
-        default=None,
-        help="run/perf/trace: Dispatch participants per expert; 0 uses all workers",
-    )
-    parser.add_argument(
-        "--reduce-lane-init", action="store_true", help="q=4/8 run/perf/trace: parse only lane-owned routes"
-    )
-    parser.add_argument(
-        "--reduce-double-buffer", action="store_true", help="q=4/8: overlap expert row loads with FP32 reduction"
-    )
-    parser.add_argument(
-        "--combine-single-row",
-        action="store_true",
-        help="q=0: use a synchronous lightweight path for single-row Combine tasks",
-    )
-    parser.add_argument(
-        "--dispatch-skip-empty",
-        action="store_true",
-        help="Skip prefix reload on Dispatch workers with no assigned rows",
-    )
-    parser.add_argument(
-        "--dispatch-lookahead",
-        action="store_true",
-        help="Let one ready completed-wave Combine precede future-wave Dispatch",
-    )
-    parser.add_argument(
-        "--dispatch-single-row", action="store_true", help="Yield after each assigned Dispatch row for BS <= 256"
-    )
-    parser.add_argument(
-        "--combine-ready-trace",
-        action="store_true",
-        help="q=4/8: record readiness snapshots and synchronization boundaries (timer builds)",
-    )
-    parser.add_argument(
-        "--combine-sparse-scan",
-        action="store_true",
-        help="q=0 run/perf/trace: skip empty pending tokens and stop on completion",
-    )
     waits.add_argument(
         "--include-wait",
         dest="include_wait",
@@ -800,32 +637,6 @@ def main(argv=None, *, print_text=True):
         parser.error("--errors-only requires build")
     if args.extra_bs and args.action != "perf":
         parser.error("--extra-bs requires perf")
-    if args.combine_reduce_qps is not None and args.action not in ("run", "perf", "trace"):
-        parser.error("--combine-reduce-qps requires run, perf or trace")
-    if (
-        args.dispatch_workers is not None
-        or args.reduce_lane_init
-        or args.combine_sparse_scan
-        or args.reduce_double_buffer
-        or args.combine_single_row
-        or args.combine_ready_trace
-        or args.dispatch_skip_empty
-        or args.dispatch_lookahead
-        or args.dispatch_single_row
-    ) and args.action not in (
-        "run",
-        "perf",
-        "trace",
-    ):
-        parser.error("Pipeline experiments require run, perf or trace")
-    if args.reduce_lane_init and not args.combine_reduce_qps:
-        parser.error("--reduce-lane-init requires --combine-reduce-qps 4 or 8")
-    if args.combine_sparse_scan and args.combine_reduce_qps:
-        parser.error("--combine-sparse-scan requires --combine-reduce-qps 0")
-    if (args.reduce_double_buffer or args.combine_ready_trace) and not args.combine_reduce_qps:
-        parser.error("reduce-double-buffer and ready-trace require --combine-reduce-qps 4 or 8")
-    if args.combine_single_row and args.combine_reduce_qps:
-        parser.error("--combine-single-row requires --combine-reduce-qps 0")
     if args.timer and args.action != "build":
         parser.error("--timer requires build; use the trace action for collection")
     if args.timer_ranks is not None and args.action != "trace":
@@ -854,26 +665,6 @@ def main(argv=None, *, print_text=True):
         print(json.dumps(config, indent=2, ensure_ascii=False))
         return
     options = dict(rebuild_shmem=args.rebuild_shmem, errors_only=args.errors_only)
-    if args.combine_reduce_qps is not None:
-        options["combine_reduce_qps"] = args.combine_reduce_qps
-    if args.dispatch_workers is not None:
-        options["dispatch_workers"] = args.dispatch_workers
-    if args.reduce_lane_init:
-        options["reduce_lane_init"] = True
-    if args.combine_sparse_scan:
-        options["combine_sparse_scan"] = True
-    if args.reduce_double_buffer:
-        options["reduce_double_buffer"] = True
-    if args.combine_single_row:
-        options["combine_single_row"] = True
-    if args.combine_ready_trace:
-        options["combine_ready_trace"] = True
-    if args.dispatch_skip_empty:
-        options["dispatch_skip_empty"] = True
-    if args.dispatch_lookahead:
-        options["dispatch_lookahead"] = True
-    if args.dispatch_single_row:
-        options["dispatch_single_row"] = True
     if args.extra_bs:
         options["extra_bs"] = True
     if args.timer:

@@ -28,7 +28,7 @@ def aiv1_priority_source(production_source=None):
     return fixture.replace("/* PRODUCTION_SCHEDULER_BODY */", production_source[opening:end])
 
 
-def test_aiv1_prioritizes_ready_work_without_losing_remote_progress(tmp_path):
+def test_aiv1_preserves_activation_priority_and_cross_expert_ring_lifetime(tmp_path):
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         pytest.skip("AIV1 scheduler compilation requires g++ or clang++")

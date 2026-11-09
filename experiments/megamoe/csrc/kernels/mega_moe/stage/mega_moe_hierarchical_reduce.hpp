@@ -70,38 +70,23 @@ __aicore__ inline void InitializeHierarchicalReducedCombine(const MoeStageCommon
     if (progress.initialized) {
         return;
     }
-    const uint32_t owners = params.tilingData->combineReduceQps;
+    const uint32_t owners = HIERARCHICAL_COMBINE_QPS;
     const uint32_t first = common.tokenNum * lane / owners;
     const uint32_t end = common.tokenNum * (lane + 1U) / owners;
-    if ((params.tilingData->pipelineFlags & 2U) != 0U) {
-        InitializeHierarchicalCombineProgressRange(common, params, progress, first, end, timer);
-        progress.nextRow = first * common.topK;
-        return;
-    }
-    InitializeHierarchicalCombineProgress(common, params, progress, timer);
-    progress.expectedRows = 0U;
-    for (uint32_t token = 0U; token < common.tokenNum; ++token) {
-        if (token < first || token >= end) {
-            progress.pendingTopkMasks[token] = 0U;
-        }
-        progress.expectedRows += CombineMaskCount(progress.pendingTopkMasks[token]);
-    }
+    InitializeHierarchicalCombineProgressRange(common, params, progress, first, end, timer);
     progress.nextRow = first * common.topK;
 }
 
-// One complete token is a nonpreemptible task. AIV1 owners must finish ALL
-// routed/shared activation and Dispatch; AIV0 owners must finish ALL routed
-// and shared prologues. Both enter at a drained UB/event boundary.
+// One complete token is a nonpreemptible task. AIV0 owners finish all routed
+// and shared prologues before entering at a drained UB/event boundary.
 // Preserve the original BF16 expert outputs and FP32 multiply/add ordering within
 // this host's top-k subset. Only the final source-rank output is cast to BF16.
-template <bool DoubleBuffered = false>
 __aicore__ inline void ReduceAndPostHierarchicalToken(const MoeStageCommonConfig& common, const Params& params,
                                                       uint32_t token, uint32_t mask, uint32_t lane,
                                                       __ubuf__ uint8_t* roceScratch, AscendTimerDevice* timer)
 {
     const uint32_t hidden = common.tokenHiddenDim;
-    constexpr uint32_t inputBuffers = DoubleBuffered ? 2U : 1U;
-    const bool packetized = UsePacketizedGatewayCombine(params.tilingData);
+    constexpr uint32_t inputBuffers = 2U;
     const uint32_t inputStride = CalcGatewayCombineInputUbRowBytes(params.tilingData) / sizeof(bfloat16_t);
     const uint32_t inputBytes = inputStride * inputBuffers * sizeof(bfloat16_t);
     const uint32_t sumBytes = CalcGatewayCombineSumUbBytes(params.tilingData);
@@ -124,37 +109,33 @@ __aicore__ inline void ReduceAndPostHierarchicalToken(const MoeStageCommonConfig
         // read or per-row S_V handoff is needed by the fused row VF.
         bool first = true;
         uint32_t consumed = 0U;
-        if constexpr (DoubleBuffered) {
-            // The caller supplies a nonempty ready mask. Seed one load, then
-            // prefetch only the next selected expert in the original top-k order.
-            uint32_t topk = 0U;
-            while ((mask & (uint32_t{1} << topk)) == 0U) ++topk;
-            LoadGatewayCombineRow(input, rows, static_cast<uint64_t>(token) * common.topK + topk, hidden, packetized);
-            SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
-        }
+
+        // The caller supplies a nonempty ready mask. Seed one load, then
+        // prefetch only the next selected expert in the original top-k order.
+        uint32_t topk = 0U;
+        while ((mask & (uint32_t{1} << topk)) == 0U) ++topk;
+        LoadGatewayCombineRow(input, rows, static_cast<uint64_t>(token) * common.topK + topk, hidden);
+        SetFlag<HardEvent::MTE2_V>(EVENT_ID0);
+
         for (uint32_t topk = 0U; topk < common.topK; ++topk) {
             if ((mask & (uint32_t{1} << topk)) == 0U) {
                 continue;
             }
-            const uint32_t slot = DoubleBuffered ? consumed & 1U : 0U;
-            if constexpr (DoubleBuffered) {
-                uint32_t next = topk + 1U;
-                while (next < common.topK && (mask & (uint32_t{1} << next)) == 0U) ++next;
-                if (next < common.topK) {
-                    const uint32_t nextSlot = slot ^ 1U;
-                    if (consumed != 0U) {
-                        WaitFlag<HardEvent::V_MTE2>(static_cast<TEventID>(nextSlot));
-                    }
-                    LoadGatewayCombineRow(input[nextSlot * inputStride], rows,
-                                          static_cast<uint64_t>(token) * common.topK + next, hidden, packetized);
-                    SetFlag<HardEvent::MTE2_V>(static_cast<TEventID>(nextSlot));
+            const uint32_t slot = consumed & 1U;
+
+            uint32_t next = topk + 1U;
+            while (next < common.topK && (mask & (uint32_t{1} << next)) == 0U) ++next;
+            if (next < common.topK) {
+                const uint32_t nextSlot = slot ^ 1U;
+                if (consumed != 0U) {
+                    WaitFlag<HardEvent::V_MTE2>(static_cast<TEventID>(nextSlot));
                 }
-                WaitFlag<HardEvent::MTE2_V>(static_cast<TEventID>(slot));
-            } else {
-                const uint64_t row = static_cast<uint64_t>(token) * common.topK + topk;
-                LoadGatewayCombineRow(input, rows, row, hidden, packetized);
-                SyncFuncStatic<HardEvent::MTE2_V, EVENT_ID0>();
+                LoadGatewayCombineRow(input[nextSlot * inputStride], rows,
+                                      static_cast<uint64_t>(token) * common.topK + next, hidden);
+                SetFlag<HardEvent::MTE2_V>(static_cast<TEventID>(nextSlot));
             }
+            WaitFlag<HardEvent::MTE2_V>(static_cast<TEventID>(slot));
+
             auto* rowUb = reinterpret_cast<__ubuf__ bfloat16_t*>(input[slot * inputStride].GetPhyAddr());
             auto* sumUb = reinterpret_cast<__ubuf__ float*>(sum.GetPhyAddr());
             auto* weightUb = reinterpret_cast<__ubuf__ float*>(weights.GetPhyAddr()) + topk;
@@ -167,19 +148,16 @@ __aicore__ inline void ReduceAndPostHierarchicalToken(const MoeStageCommonConfig
             // Order sum stores before the next VF's sum loads. Within the VF,
             // conversion/product stay in registers instead of a temporary UB row.
             PipeBarrier<PIPE_V>();
-            if constexpr (DoubleBuffered) {
-                SetFlag<HardEvent::V_MTE2>(static_cast<TEventID>(slot));
-                ++consumed;
-            } else {
-                SyncFuncStatic<HardEvent::V_MTE2, EVENT_ID0>();
-            }
+
+            SetFlag<HardEvent::V_MTE2>(static_cast<TEventID>(slot));
+            ++consumed;
         }
-        if constexpr (DoubleBuffered) {
-            // Consume the last release event of each used slot before returning
-            // to a caller that may reuse UB for ready scans or local Combine.
-            WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
-            if (consumed > 1U) WaitFlag<HardEvent::V_MTE2>(static_cast<TEventID>(1U));
-        }
+
+        // Consume the last release event of each used slot before returning
+        // to a caller that may reuse UB for ready scans or local Combine.
+        WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+        if (consumed > 1U) WaitFlag<HardEvent::V_MTE2>(static_cast<TEventID>(1U));
+
         SyncFuncStatic<HardEvent::V_MTE3, EVENT_ID0>();
         DataCopy(partialGm[static_cast<uint64_t>(token) * hidden], sum, hidden);
         SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
@@ -205,45 +183,33 @@ __aicore__ inline bool TryProgressHierarchicalReducedCombine(const MoeStageCommo
     if constexpr (g_coreType == AIC) {
         return false;
     }
-    if (!UseHierarchicalCombineReduction(params.tilingData) || lane >= params.tilingData->combineReduceQps ||
-        maxPosts == 0U) {
+    if (!UseHierarchicalCombineReduction(params.tilingData) || lane >= HIERARCHICAL_COMBINE_QPS || maxPosts == 0U) {
         return false;
     }
     InitializeHierarchicalReducedCombine(common, params, progress, lane, timer);
     if (progress.sentRows == progress.expectedRows) {
         return false;
     }
-    const bool diagnostic = timer != nullptr && timer->Enabled() && (params.tilingData->pipelineFlags & 64U) != 0U;
+    const bool diagnostic = timer != nullptr && timer->Enabled();
     AscendTimerCombineProgressScope timing(diagnostic ? timer : nullptr, AscendTimer::AIV_COMBINE_PROGRESS);
     const uint32_t pendingBefore = progress.expectedRows - progress.sentRows;
     uint32_t scannedRows = 0U;
     timing.StartScan();
-    const uint32_t owners = params.tilingData->combineReduceQps;
+    const uint32_t owners = HIERARCHICAL_COMBINE_QPS;
     const uint32_t first = common.tokenNum * lane / owners;
     const uint32_t end = common.tokenNum * (lane + 1U) / owners;
     uint32_t token = progress.nextRow / common.topK;
     uint32_t posts = 0U;
-    HierarchicalCombineReadySnapshot snapshot;
     for (uint32_t checked = 0U; checked < end - first && posts < maxPosts; ++checked) {
         const uint32_t mask = progress.pendingTopkMasks[token];
         bool ready = mask != 0U;
         uint32_t observed = 0U;
         const int64_t scanStart = diagnostic ? GetSystemCycle() : 0;
-        if (UsePacketizedGatewayCombine(params.tilingData)) {
-            observed = GatewayCombinePacketReadyMask(params, token, mask);
-            ready = ready && observed == mask;
-            scannedRows += CombineMaskCount(mask);
-        } else {
-            for (uint32_t topk = 0U; (ready || diagnostic) && topk < common.topK; ++topk) {
-                if ((mask & (uint32_t{1} << topk)) != 0U) {
-                    const uint32_t row = token * common.topK + topk;
-                    const bool rowReady = snapshot.Ready(params, row, common.tokenNum * common.topK - row, common.topK);
-                    ready = ready && rowReady;
-                    observed |= rowReady ? uint32_t{1} << topk : 0U;
-                    ++scannedRows;
-                }
-            }
-        }
+
+        observed = GatewayCombinePacketReadyMask(params, token, mask);
+        ready = ready && observed == mask;
+        scannedRows += CombineMaskCount(mask);
+
         if (diagnostic && mask != 0U && observed != progress.deferredTopkMasks[token]) {
             timer->RecordDetail(AscendTimer::AIV_COMBINE_READY, scanStart, GetSystemCycle(),
                                 (static_cast<uint64_t>(lane + 1U) << 32) | token,
@@ -252,18 +218,13 @@ __aicore__ inline bool TryProgressHierarchicalReducedCombine(const MoeStageCommo
         }
         if (ready) {
             timing.StopScan();
-            if ((params.tilingData->pipelineFlags & 256U) != 0U) {
-                ReduceAndPostHierarchicalToken<true>(common, params, token, mask, lane, roceScratch, timer);
-            } else {
-                ReduceAndPostHierarchicalToken<false>(common, params, token, mask, lane, roceScratch, timer);
-            }
+
+            ReduceAndPostHierarchicalToken(common, params, token, mask, lane, roceScratch, timer);
+
             timing.StartScan();
             progress.pendingTopkMasks[token] = 0U;
             progress.sentRows += CombineMaskCount(mask);
             ++posts;
-            // The vector task overwrote the UB used for flag snapshots. Scalar
-            // positive bits remain valid, but use a fresh snapshot for each token.
-            snapshot = {};
         }
         if (++token == end) {
             token = first;
@@ -282,29 +243,20 @@ __aicore__ inline void TraceHierarchicalCombineBoundary(const MoeStageCommonConf
                                                         HierarchicalCombineProgress& progress, uint32_t lane,
                                                         AscendTimerDevice* timer, uint32_t phase)
 {
-    if (timer == nullptr || !timer->Enabled() || (params.tilingData->pipelineFlags & 64U) == 0U) {
+    if (timer == nullptr || !timer->Enabled()) {
         return;
     }
     InitializeHierarchicalReducedCombine(common, params, progress, lane, timer);
-    const uint32_t owners = params.tilingData->combineReduceQps;
+    const uint32_t owners = HIERARCHICAL_COMBINE_QPS;
     const uint32_t first = common.tokenNum * lane / owners;
     const uint32_t end = common.tokenNum * (lane + 1U) / owners;
-    HierarchicalCombineReadySnapshot snapshot;
     for (uint32_t token = first; token < end; ++token) {
         const int64_t start = GetSystemCycle();
         const uint32_t mask = progress.pendingTopkMasks[token];
         uint32_t observed = 0U;
-        if (UsePacketizedGatewayCombine(params.tilingData)) {
-            observed = GatewayCombinePacketReadyMask(params, token, mask);
-        } else {
-            for (uint32_t topk = 0U; topk < common.topK; ++topk) {
-                const uint32_t row = token * common.topK + topk;
-                if ((mask & (uint32_t{1} << topk)) != 0U &&
-                    snapshot.Ready(params, row, common.tokenNum * common.topK - row, common.topK)) {
-                    observed |= uint32_t{1} << topk;
-                }
-            }
-        }
+
+        observed = GatewayCombinePacketReadyMask(params, token, mask);
+
         timer->RecordDetail(AscendTimer::AIV_COMBINE_READY, start, GetSystemCycle(),
                             (static_cast<uint64_t>(lane + 1U) << 32) | token,
                             (static_cast<uint64_t>(mask) << 32) | observed);
@@ -315,8 +267,7 @@ __aicore__ inline void TraceHierarchicalCombineBoundary(const MoeStageCommonConf
                         (static_cast<uint64_t>(lane + 1U) << 32) | phase, progress.expectedRows - progress.sentRows);
 }
 
-// AIV1 owners may block only after the producer host barrier. A dedicated
-// AIV0 owner may also drain after ALL its prologues: AIV1 producers make
+// Each AIV0 owner may drain after ALL its prologues: AIV1 producers make
 // progress independently and publish each row without waiting for this AIV0.
 // Commits still require the host barrier, including lanes with no remote rows.
 __aicore__ inline void DrainHierarchicalReducedCombine(const MoeStageCommonConfig& common, const Params& params,

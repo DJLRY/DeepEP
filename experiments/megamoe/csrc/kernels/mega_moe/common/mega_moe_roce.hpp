@@ -12,7 +12,7 @@
 namespace MegaMoeImpl {
 
 // QP0 belongs to SHMEM's default collectives. Physical AIV1 owns Dispatch QP1.
-// Combine QP=0/4 retains AIV1 owners; QP=8 transfers QP1..8 to g0..g7 AIV0
+// Combine transfers QP1..8 to g0..g7 AIV0
 // after the input barrier, with reduction deferred until their prologues end.
 // Explicit qpIndex arguments refer to the caller's exclusive owner in this phase.
 constexpr uint32_t MEGAMOE_ROCE_QP_INDEX = 1U;

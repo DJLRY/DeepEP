@@ -35,6 +35,7 @@
 #include "stage/mega_moe_token_dispatch.hpp"
 #include "stage/mega_moe_gmm1_activation.hpp"
 #include "stage/mega_moe_gmm2_combine.hpp"
+#include "stage/mega_moe_combine_pipeline.hpp"
 #include "stage/mega_moe_hierarchical_combine.hpp"
 #include "stage/mega_moe_hierarchical_reduce.hpp"
 #include "stage/mega_moe_unpermute.hpp"
@@ -94,40 +95,7 @@ protected:
     __aicore__ inline void InitQuantTokenBufferConfig();
     __aicore__ inline UnpermuteBufferConfig InitTokenUnpermuteBuffers();
     __aicore__ inline void ProcessInputPreparationStage();
-    __aicore__ inline bool TryProgressRemoteCombine(bool foregroundPending = true)
-    {
-        if constexpr (g_coreType == AIV) {
-            if (UseHierarchicalCombineReduction(params_.tilingData)) {
-                // QP=8 has a dedicated AIV0 tail after ALL routed/shared
-                // prologues. Never enter it from an inter-wave progress call.
-                // AIV1 reduction remains gated on all foreground work ending.
-                if (UseAiv0CombineOwners(params_.tilingData) || foregroundPending ||
-                    !IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)) {
-                    return false;
-                }
-                return TryProgressHierarchicalReducedCombine(
-                    commonConfig_, params_, hierarchicalCombine_,
-                    HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex), HierarchicalRoceScratch(params_),
-                    timer_.Enabled() ? &timer_ : nullptr);
-            }
-            if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
-                // QP=0: enter once after all owner-side producers have finished.
-                // Other AIV1s own the local Combine rows, so this owner can wait
-                // for late rows without blocking their production. A one-core
-                // fallback must finish its own local Combine before this call.
-                if (foregroundPending || hierarchicalCombine_.initialized) {
-                    return false;
-                }
-                auto* scratch = HierarchicalRoceScratch(params_);
-                auto* rdmaTimer = timer_.Enabled() ? &timer_ : nullptr;
-                // Only payloads are posted here. The single terminal commit
-                // remains after the host barrier to close all reader lifetimes.
-                return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch, rdmaTimer,
-                                                      {}, true);
-            }
-        }
-        return false;
-    }
+
     template <bool SourceGmm1Fused>
     __aicore__ inline void RunGmm2CombineForExpert(ExpertLoopState& state, GMMAddrInfo& gmmAddrInfo,
                                                    uint32_t& startBlockIdx, uint32_t tokenStartIndexInExpert,
@@ -148,7 +116,8 @@ protected:
         bool gmm1Ready = false;
         bool done = false;
     };
-    __aicore__ inline bool TryRunSharedExpertActivation(SharedActivationCursor& cursor);
+    __aicore__ inline bool TryRunSharedExpertActivation(SharedActivationCursor& cursor,
+                                                        CrossExpertCombinePipeline* combinePipeline = nullptr);
     template <typename Derived>
     __aicore__ inline void ProcessWave(Derived& derived);
 
@@ -616,7 +585,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertActi
 }
 
 template <TemplateMegaMoeTypeClass>
-__aicore__ inline bool MegaMoe<TemplateMegaMoeTypeFunc>::TryRunSharedExpertActivation(SharedActivationCursor& cursor)
+__aicore__ inline bool MegaMoe<TemplateMegaMoeTypeFunc>::TryRunSharedExpertActivation(
+    SharedActivationCursor& cursor, CrossExpertCombinePipeline* combinePipeline)
 {
     if (cursor.done) {
         return false;
@@ -635,6 +605,8 @@ __aicore__ inline bool MegaMoe<TemplateMegaMoeTypeFunc>::TryRunSharedExpertActiv
             Ops::Base::CeilDiv(commonConfig_.tokenNum, GMM1_TILE_M) *
             Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF, static_cast<uint32_t>(L1_TILE_N));
     }
+    // Failed readiness probes above leave consecutive Combine rows in flight.
+    if (combinePipeline != nullptr) combinePipeline->Drain(timer_);
     if (cursor.nextTile < cursor.tileCount) {
         // AIV1 did not enter shared GMM1. Rebind its separate epilogue and shared GM views;
         // UB is reused sequentially by Dispatch, routed/shared activation and Combine.
@@ -1043,7 +1015,6 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         }
         timer_.Start(AscendTimer::AIV_EXPORT_SYNC);
         ExportCompactExpertTokenCounts(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
-        TryProgressRemoteCombine(false);
         const bool reduceOwner = UseHierarchicalCombineReduction(params_.tilingData) &&
                                  IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex);
         if (reduceOwner) {
@@ -1077,8 +1048,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
             {
                 AscendTimerFixedScope barrier(timer_.Enabled() ? &timer_ : nullptr,
                                               AscendTimer::AIV_HOST_COMBINE_BARRIER_WAIT);
-                const bool reduction = UseHierarchicalCombineReduction(params_.tilingData);
-                const bool owner = reduction && IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex);
+                const bool owner = IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex);
                 const uint32_t lane = HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex);
                 if (owner) {
                     TraceHierarchicalCombineBoundary(commonConfig_, params_, hierarchicalCombine_, lane,
@@ -1094,16 +1064,10 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                 auto* scratch = HierarchicalRoceScratch(params_);
                 auto* rdmaTimer = timer_.Enabled() ? &timer_ : nullptr;
                 const uint32_t lane = HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex);
-                auto* commit = HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::CombineCommit);
-                if (UseHierarchicalCombineReduction(params_.tilingData)) {
-                    DrainHierarchicalReducedCombine(commonConfig_, params_, hierarchicalCombine_, lane, scratch,
-                                                    rdmaTimer);
-                    commit = reinterpret_cast<__gm__ int32_t*>(params_.peermemInfo.combineReduceCommitPtr +
-                                                               lane * HIERARCHICAL_FLAG_BYTES);
-                }
-                // QP=0 already submitted every payload in completion progress;
-                // no final drain is needed. All modes keep one commit per QP,
-                // after the host barrier, including calls with no remote rows.
+                DrainHierarchicalReducedCombine(commonConfig_, params_, hierarchicalCombine_, lane, scratch, rdmaTimer);
+                auto* commit = reinterpret_cast<__gm__ int32_t*>(params_.peermemInfo.combineReduceCommitPtr +
+                                                                 lane * HIERARCHICAL_FLAG_BYTES);
+                // Every lane commits after the host barrier, including empty lanes.
                 RocePublishCommit(reinterpret_cast<GM_ADDR>(commit),
                                   reinterpret_cast<GM_ADDR>(
                                       HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::Sequence)),
@@ -1126,9 +1090,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
             RoceFinishOutstanding(HierarchicalGateway(rankId_), HierarchicalRoceScratch(params_),
                                   timer_.Enabled() ? &timer_ : nullptr, AscendTimer::RdmaPhase::Combine,
                                   HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex) + 1U);
-            if (!UseHierarchicalCombineReduction(params_.tilingData)) {
-                PublishHierarchicalLocalSignal(params_, HierarchicalSignal::TxDone);
-            }
+
         } else {
             MegaMoeUnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();
             timer_.Start(AscendTimer::AIV_UNPERMUTE);

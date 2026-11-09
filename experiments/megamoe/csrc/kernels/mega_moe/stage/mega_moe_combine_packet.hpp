@@ -42,12 +42,8 @@ __aicore__ inline void PackGatewayCombineRow(LocalTensor<uint32_t> packed, Globa
 // block also copies unused tail bytes; the input slot reserves a full packet-row
 // stride, while Cast/reduction consume exactly hidden elements.
 __aicore__ inline void LoadGatewayCombineRow(LocalTensor<bfloat16_t> input, GlobalTensor<bfloat16_t> rows, uint64_t row,
-                                             uint32_t hidden, bool packetized)
+                                             uint32_t hidden)
 {
-    if (!packetized) {
-        DataCopy(input, rows[row * hidden], hidden);
-        return;
-    }
     const uint32_t rowBytes = CalcGatewayCombinePacketRowBytes(hidden);
     GlobalTensor<uint32_t> source;
     source.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(rows.GetPhyAddr(0U)) +

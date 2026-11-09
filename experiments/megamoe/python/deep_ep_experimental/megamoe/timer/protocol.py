@@ -215,9 +215,19 @@ def task_metadata(raw, core_id, logical_index):
     mask = (1 << 32) - 1
     if family == "AIV_COMBINE_ASYNC":
         expert, row = ((first >> 32) & mask) - 1, first & mask
-        if expert < 0 or second != 1:
+        phase, slot = second & mask, ((second >> 32) & mask) - 1
+        if expert < 0 or phase not in (1, 2, 3) or slot not in (-1, 0, 1) or (slot == -1 and phase != 1):
             raise ValueError(f"invalid async Combine metadata: core={core_id}, slot={dynamic_index}")
-        return dict(granularity="combine_async", expert_id=expert, row_start=row, row_count=1, scope="row_lifetime")
+        result = dict(
+            granularity="combine_async",
+            expert_id=expert,
+            row_start=row,
+            row_count=1,
+            scope={1: "row_lifetime", 2: "issue", 3: "reuse_wait"}[phase],
+        )
+        if slot >= 0:
+            result.update(buffer_slot=slot, observation="software_retirement" if phase == 1 else "phase_interval")
+        return result
     if family == "AIV_COMBINE_READY":
         qp, token = (first >> 32) & mask, first & mask
         pending, observed = (second >> 32) & mask, second & mask

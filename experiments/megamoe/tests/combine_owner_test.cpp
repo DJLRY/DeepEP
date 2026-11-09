@@ -14,7 +14,6 @@ uint32_t GetSubBlockIdx()
 {
     return 1U;
 }
-constexpr int64_t GM_FLAG_POLL_BACKOFF_CYCLES = 4;
 /* TILE_CONSTANTS */
 namespace Ops::Base {
 uint32_t CeilDiv(uint32_t x, uint32_t y)
@@ -22,9 +21,6 @@ uint32_t CeilDiv(uint32_t x, uint32_t y)
     return (x + y - 1U) / y;
 }
 }  // namespace Ops::Base
-namespace AscendTimer {
-constexpr int64_t NO_WAVE = -1;
-}
 namespace AscendC {
 uint32_t reads = 0U;
 int32_t ReadGmByPassDCache(const int32_t* flag)
@@ -50,22 +46,13 @@ struct MoeStageCommonConfig {
 };
 struct TilingData {
     bool hierarchical = true;
-    bool reduction = false;
-    uint32_t pipelineFlags = 0U;
-    uint32_t combineReduceQps = 8U;
 };
-bool UseHierarchicalCombineReduction(const TilingData* tiling)
-{
-    return tiling->hierarchical && tiling->reduction;
-}
+
 bool UseHierarchicalRoce(const TilingData* tiling)
 {
     return tiling->hierarchical;
 }
-uint32_t HierarchicalSendJob()
-{
-    return 1U;
-}
+
 struct Params {
     TilingData* tilingData;
     std::array<int32_t, 128> ready{};
@@ -180,10 +167,9 @@ struct FixtureImpl : FixtureBase<Tag> {
     bool activationReady = false, activationDone = false;
     uint32_t currentSlice = 0U, retired = 0U, remoteCalls = 0U;
 
-    explicit FixtureImpl(uint32_t block = 0U, uint32_t blocks = 28U, bool hierarchical = true, bool reduction = false)
+    explicit FixtureImpl(uint32_t block = 0U, uint32_t blocks = 28U, bool hierarchical = true)
     {
         tiling.hierarchical = hierarchical;
-        tiling.reduction = reduction;
         waveCombineJob_ = {block, blocks};
         gmmExecutionConfig_.blockJob = waveCombineJob_;
         this->aivJob_ = {2U * block + 1U, 2U * blocks};
@@ -210,9 +196,6 @@ struct FixtureImpl : FixtureBase<Tag> {
     bool TryRunReadyCombine(const AivTaskCursor& cursor)
     { /* READY_COMBINE */
     }
-    void ProcessAiv1PriorityStages(int32_t& readySequence)
-    { /* SCHEDULER */
-    }
 
     bool NextAivSlice(AivTaskCursor& cursor, bool activation)
     {
@@ -237,7 +220,23 @@ struct FixtureImpl : FixtureBase<Tag> {
         cursor.nextSlice = next + 1U;
         return true;
     }
-    bool TryRunReadyActivation(const AivTaskCursor&, int32_t& readySequence)
+    struct Pipeline {
+        bool Enabled(const Params&) const
+        {
+            return false;
+        }
+        void Drain(Timer&) {}
+        void IssueSlice(const MoeStageCommonConfig&, const Params&, const ExpertLoopState&, uint32_t, const WorkRange&,
+                        Timer&)
+        {
+            assert(false);
+        }
+    } combinePipeline_;
+    bool IsActivationReady(const AivTaskCursor&, int32_t)
+    {
+        return activationReady && !activationDone;
+    }
+    bool RunReadyActivation(const AivTaskCursor&, int32_t& readySequence)
     {
         if (!activationReady) {
             return false;
@@ -251,25 +250,10 @@ struct FixtureImpl : FixtureBase<Tag> {
     {
         assert(false);
     }
-    bool TryRunSharedExpertActivation(SharedActivationCursor&)
+    bool TryRunSharedExpertActivation(SharedActivationCursor&, Pipeline*)
     {
         assert(false);
         return false;
-    }
-    bool TryProgressRemoteCombine(bool = true)
-    {
-        assert(this->aivJob_.jobIndex == HierarchicalSendJob() && tiling.hierarchical);
-        assert(++remoteCalls < 100U);
-        if (remoteCalls == 1U) {
-            activationReady = true;
-        } else {
-            assert(activationDone);
-            if (currentSlice < slices.size()) {
-                ++Ready(slices[currentSlice]);
-            }
-        }
-        // Exercise both the successful progress and idle/backoff paths.
-        return remoteCalls % 2U != 0U;
     }
 };
 
@@ -277,16 +261,14 @@ using Fixture = FixtureImpl<void>;
 
 void Coverage()
 {
-    for (uint32_t mode : {0U, 1U, 2U}) {
-        const bool hierarchical = mode != 0U;
-        const bool reduction = mode == 2U;
+    for (bool hierarchical : {false, true}) {
         for (uint32_t blocks : {1U, 2U, 4U, 28U}) {
             for (uint32_t rows : {1U, 7U, 21U, 22U, 27U, 28U, 29U, 32U, 255U, 256U, 257U, 1024U}) {
                 for (uint64_t prefix : {0ULL, 1ULL, 27ULL, 257ULL, (1ULL << 40U) + 17ULL}) {
                     for (uint64_t wave : {0ULL, 1ULL, 27ULL, 28ULL, (1ULL << 35U) + 3ULL}) {
                         std::vector<uint32_t> writes(rows, 0U), loads;
                         for (uint32_t block = 0U; block < blocks; ++block) {
-                            Fixture f(block, blocks, hierarchical, reduction);
+                            Fixture f(block, blocks, hierarchical);
                             // H8192 requires all 28 producers, exposing accidental use of 27 consumers.
                             f.commonConfig_.tokenHiddenDim = 8192U;
                             auto cursor = Fixture::Slice(rows, prefix + 256U, wave, 3U, 256U);
@@ -303,19 +285,16 @@ void Coverage()
                             for (auto count : writes) {
                                 after += count;
                             }
-                            const bool offload = hierarchical && !reduction && blocks > 1U;
-                            if (offload && block == 0U) {
-                                assert(f.params_.sendCalls == 0U && after == before);
-                            } else {
-                                loads.push_back(after - before);
-                                uint32_t consumers = blocks - static_cast<uint32_t>(offload);
-                                uint32_t consumer = block - static_cast<uint32_t>(offload);
-                                uint32_t first =
-                                    (cursor.slice.begin.globalTokenIndex % consumers + wave % consumers) % consumers;
-                                uint32_t logical = (consumer + consumers - first) % consumers;
-                                assert(after - before ==
-                                       rows / consumers + static_cast<uint32_t>(logical < rows % consumers));
-                            }
+
+                            loads.push_back(after - before);
+                            uint32_t consumers = blocks;
+                            uint32_t consumer = block;
+                            uint32_t first =
+                                (cursor.slice.begin.globalTokenIndex % consumers + wave % consumers) % consumers;
+                            uint32_t logical = (consumer + consumers - first) % consumers;
+                            assert(after - before ==
+                                   rows / consumers + static_cast<uint32_t>(logical < rows % consumers));
+
                             assert(f.waveCombineJob_.jobIndex == block && f.waveCombineJob_.totalJobs == blocks);
                             assert(f.gmmExecutionConfig_.blockJob.jobIndex == block);
                             assert(f.aivJob_.jobIndex == 2U * block + 1U);
@@ -352,7 +331,7 @@ void Readiness()
             ++f.Ready(cursor);
             assert(f.TryRunReadyCombine(cursor));
             assert(f.timer_.wave == 28);
-            assert(f.params_.sendCalls == (block == 0U ? 0U : 1U));
+            assert(f.params_.sendCalls == 1U);
         }
     }
     // Empty non-owner consumers still skip without polling unrelated producers.
@@ -362,28 +341,10 @@ void Readiness()
     assert(AscendC::reads == 0U && empty.params_.sendCalls == 0U);
 }
 
-void Scheduler()
-{
-    Fixture f;
-    f.commonConfig_.tokenHiddenDim = 8192U;
-    for (uint32_t expert = 0U; expert < 12U; ++expert) {
-        f.slices.push_back(Fixture::Slice(21U, 21U * expert, expert / 4U, expert));
-        f.Ready(f.slices.back()) = f.Producers(f.slices.back()) - 2U;
-    }
-    int32_t readySequence = 40;
-    f.ProcessAiv1PriorityStages(readySequence);
-    assert(readySequence == 41 && f.activationDone);
-    assert(f.retired == f.slices.size() && f.currentSlice == f.slices.size());
-    assert(f.remoteCalls > f.slices.size());
-    assert(f.params_.sendCalls == 0U);
-    assert(f.timer_.clears == 1U && f.timer_.wave == AscendTimer::NO_WAVE);
-    assert(f.waveCombineJob_.totalJobs == 28U && f.gmmExecutionConfig_.blockJob.totalJobs == 28U);
-}
-
 void DispatchSubsetCoverage()
 {
     constexpr uint32_t physicalWorkers = 28U;
-    for (uint32_t selected : {1U, 8U, 14U, 28U}) {
+    for (uint32_t selected : {14U, 28U}) {
         std::array<uint32_t, physicalWorkers> participation{};
         for (uint32_t expert = 0U; expert < 28U; ++expert) {
             for (uint32_t worker = 0U; worker < physicalWorkers; ++worker) {
@@ -429,7 +390,6 @@ int main(int argc, char** argv)
     } else if (std::strcmp(scenario, "dispatch") == 0) {
         DispatchSubsetCoverage();
     } else {
-        assert(std::strcmp(scenario, "scheduler") == 0);
-        Scheduler();
+        assert(false);
     }
 }

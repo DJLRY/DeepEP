@@ -359,31 +359,6 @@ def export_text(source, output=None, *, ranks=None, attachments=(), label=None, 
     return export_bundle(bundle, output, find_timer_directory(source), max_bytes)
 
 
-def collect_pipeline(source, suite="all"):
-    rows = json.loads((Path(source) / "summary.json").read_text(encoding="utf-8"))
-    if suite not in ("all", "q0", "q8"):
-        raise ValueError("Unknown pipeline suite")
-    if suite != "all":
-        rows = [row for row in rows if row["case"].startswith(suite + "_")]
-    if not rows or any(row["status"] != "OK" or row["action"] != "trace" for row in rows):
-        raise ValueError("Pipeline export requires completed trace cases")
-    if len({row["node"] for row in rows}) != 1:
-        raise ValueError("Pipeline export must contain one host")
-    captures = []
-    for row in rows:
-        captures.append(dict(name=row["case"], bundle=collect_bundle(row["run_dir"], label=row["case"])))
-    bundle = dict(
-        format=COLLECTION_FORMAT,
-        label=f"pipeline-node{rows[0]['node']}",
-        ranks=sorted({rank for capture in captures for rank in capture["bundle"]["ranks"]}),
-        cycles_per_us=protocol.CYCLE_TO_US,
-        notes=NOTES,
-        captures=captures,
-    )
-    validate_bundle(bundle)
-    return bundle
-
-
 def bundle_files(bundle):
     if bundle["format"] == FORMAT:
         return bundle["files"]
@@ -622,17 +597,6 @@ def main(argv=None):
         "--max-bytes", type=int, default=DEFAULT_MAX_BYTES, help="Whole block limit including CRLF; 1024..65535"
     )
     export.add_argument("--print-parts", action="store_true", help="Print every complete block after export")
-    pipeline = commands.add_parser("export-pipeline", help="Compress all completed cases from one pipeline together")
-    pipeline.add_argument("source", type=Path)
-    pipeline.add_argument("--output-dir", type=Path)
-    pipeline.add_argument(
-        "--suite",
-        choices=("all", "q0", "q8"),
-        default="all",
-        help="Export only the selected cases without rerunning experiments",
-    )
-    pipeline.add_argument("--max-bytes", type=int, default=CLIPBOARD_LIMIT)
-    pipeline.add_argument("--print-parts", action="store_true")
     show = commands.add_parser("show", help="Print exactly one block, with no other stdout")
     show.add_argument("directory", type=Path, help="Directory returned by export")
     show.add_argument("--part", type=int, required=True, help="One-based part number")
@@ -644,20 +608,15 @@ def main(argv=None):
     restore.add_argument("--no-render", action="store_true", help="Restore and verify files without rendering JSON")
     args = parser.parse_args(argv)
     try:
-        if args.command in ("export", "export-pipeline"):
-            if args.command == "export-pipeline":
-                output, index = export_bundle(
-                    collect_pipeline(args.source, args.suite), args.output_dir, args.source, args.max_bytes
-                )
-            else:
-                output, index = export_text(
-                    args.source,
-                    args.output_dir,
-                    ranks=args.ranks,
-                    attachments=args.attach,
-                    label=args.label,
-                    max_bytes=args.max_bytes,
-                )
+        if args.command == "export":
+            output, index = export_text(
+                args.source,
+                args.output_dir,
+                ranks=args.ranks,
+                attachments=args.attach,
+                label=args.label,
+                max_bytes=args.max_bytes,
+            )
             print(
                 f"[TEXT] label={index['label']} ranks={index['ranks']} compressed_bytes={index['bundle_bytes']} parts={len(index['parts'])}",
                 flush=True,

@@ -91,36 +91,14 @@ __aicore__ inline void SendCombineTokenRow(uint32_t rowElements, uint64_t gmRemo
 {
     CombineTokenRoute route = LoadCombineTokenRoute(metaInfoTensor, 0U);
 
-    // Keep (source rank, token, top-k slot) unchanged in metadata. Remote experts
-    // write their BF16 row to the source's paired gateway on this host; only that
-    // gateway's communication owner submits the cross-host transfer.
-    const bool viaGateway =
-        UseHierarchicalRoce(params.tilingData) && HierarchicalHost(route.dstRankId) != HierarchicalHost(rankId);
-    const uint32_t destinationRank = viaGateway ? HierarchicalGateway(route.dstRankId) : route.dstRankId;
-    if (viaGateway) {
-        gmRemoteBaseOffset =
-            static_cast<uint64_t>(params.peermemInfo.gatewayCombinePtr - params.peermemInfo.rankSyncInWorldPtr);
-    }
-
+    (void)rankId;
     GlobalTensor<Element> gmRemoteD;
     gmRemoteD.SetGlobalBuffer(
-        reinterpret_cast<__gm__ Element*>(GetRankWinAddrWithOffset(destinationRank, gmRemoteBaseOffset)));
+        reinterpret_cast<__gm__ Element*>(GetRankWinAddrWithOffset(route.dstRankId, gmRemoteBaseOffset)));
     uint64_t gmDstRowOffset = GetCombineDstRowIndex(route, params) * rowElements;
 
     DataCopyExtParams ub2GmParams{1U, static_cast<uint32_t>(rowElements * sizeof(Element)), 0U, 0U, 0U};
     DataCopyPad(gmRemoteD[gmDstRowOffset], rowTensor, ub2GmParams);
-
-    if (viaGateway) {
-        // Publish only after the entire row is visible to the gateway. Each
-        // (token, top-k) slot has one producer and its own 512-byte flag line.
-        // MTE3_S is independent of the row ring's MTE3_MTE2 events.
-        SyncFuncStatic<HardEvent::MTE3_S, SYNC_EVENT_ID0>();
-        const uint64_t readyOffset =
-            static_cast<uint64_t>(params.peermemInfo.gatewayCombineReadyPtr - params.peermemInfo.rankSyncInWorldPtr) +
-            GetCombineDstRowIndex(route, params) * HIERARCHICAL_FLAG_BYTES;
-        auto* ready = reinterpret_cast<__gm__ int32_t*>(GetRankWinAddrWithOffset(destinationRank, readyOffset));
-        WriteGmByPassDCache(ready, static_cast<int32_t>(params.tilingData->hierarchicalSequence));
-    }
 }
 
 // 通过本地 MTE 路径或远端 URMA 路径发送一个 layered 模板 token。
@@ -271,10 +249,6 @@ struct WaveCombineScratch {
     LocalTensor<int32_t> metaInfoTensor;
     LocalTensor<bfloat16_t> rowBufferTensor;
     LocalTensor<float> quantTempTensor;
-    uint32_t singleRowBytes = 0U;
-    uint64_t singleSendOffset = 0U;
-    uint64_t singleGatewayOffset = 0U;
-    uint64_t singleReadyOffset = 0U;
 };
 
 constexpr uint32_t WAVE_COMBINE_MIN_ROW_BUFFER_COUNT = 2U;
@@ -285,47 +259,6 @@ constexpr uint32_t WAVE_COMBINE_UB_BASE = 64U * 1024U;
 // The ready scan starts at 184 KiB, so adaptive row buffers must stay below it.
 constexpr uint32_t WAVE_COMBINE_UB_LIMIT = 184U * 1024U;
 constexpr uint32_t WAVE_COMBINE_META_INFO_TOKEN_CAPACITY = 1536U;
-
-// A drained, synchronous specialization for exactly one owned BF16 row.
-// Metadata and payload loads share one MTE2 stream. The final MTE3 completion
-// both protects UB reuse and precedes ready publication; no row-ring events or
-// in-flight state survive the call. Constants are cached per kernel invocation.
-__aicore__ inline void RunSingleRowCombine(const MoeStageCommonConfig& common, const Params& params, uint64_t globalRow,
-                                           WaveCombineScratch& scratch)
-{
-    if (scratch.singleRowBytes == 0U) {
-        scratch.singleRowBytes = common.tokenHiddenDim * sizeof(bfloat16_t);
-        scratch.singleSendOffset = params.peermemInfo.combineSendPtr - params.peermemInfo.rankSyncInWorldPtr;
-        scratch.singleGatewayOffset = params.peermemInfo.gatewayCombinePtr - params.peermemInfo.rankSyncInWorldPtr;
-        scratch.singleReadyOffset = params.peermemInfo.gatewayCombineReadyPtr - params.peermemInfo.rankSyncInWorldPtr;
-    }
-    LocalTensor<int32_t> meta(TPosition::VECCALC, META_INFO_TENSOR_ADDR, META_INFO_SIZE);
-    LocalTensor<bfloat16_t> row(TPosition::VECIN, WAVE_COMBINE_UB_BASE, common.tokenHiddenDim);
-    GlobalTensor<int32_t> metaGm;
-    GlobalTensor<bfloat16_t> source, target;
-    metaGm.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.metaInfoPtr));
-    source.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(params.workspaceInfo.gmm2MmadResPtr));
-    DataCopy(meta, metaGm[globalRow * META_INFO_SIZE], META_INFO_SIZE);
-    SetFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    DataCopyExtParams copy{1U, scratch.singleRowBytes, 0U, 0U, 0U};
-    DataCopyPad(row, source[globalRow * common.tokenHiddenDim], copy, {false, 0U, 0U, 0U});
-    SetFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-    WaitFlag<HardEvent::MTE2_S>(EVENT_ID0);
-    const auto route = CombineImpl::LoadCombineTokenRoute(meta, 0U);
-    const bool gateway = HierarchicalHost(route.dstRankId) != HierarchicalHost(common.rankId);
-    const uint32_t destination = gateway ? HierarchicalGateway(route.dstRankId) : route.dstRankId;
-    const uint64_t destinationRow = CombineImpl::GetCombineDstRowIndex(route, params);
-    const uint64_t offset = gateway ? scratch.singleGatewayOffset : scratch.singleSendOffset;
-    target.SetGlobalBuffer(reinterpret_cast<__gm__ bfloat16_t*>(GetRankWinAddrWithOffset(destination, offset)));
-    WaitFlag<HardEvent::MTE2_MTE3>(EVENT_ID0);
-    DataCopyPad(target[destinationRow * common.tokenHiddenDim], row, copy);
-    SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
-    if (gateway) {
-        auto* ready = reinterpret_cast<__gm__ int32_t*>(GetRankWinAddrWithOffset(
-            destination, scratch.singleReadyOffset + destinationRow * HIERARCHICAL_FLAG_BYTES));
-        WriteGmByPassDCache(ready, static_cast<int32_t>(params.tilingData->hierarchicalSequence));
-    }
-}
 
 // 非 layered 路径统一使用的 Combine 行环。常规 Wave 只有 AIV1 建立并使用这些 UB 视图；
 // 最后一轮不再与 GMM1/SwiGLU 并行时，调用方才为 AIV0 补充初始化。
@@ -1300,22 +1233,7 @@ __aicore__ inline void RunTokenCombineSlice(const MoeStageCommonConfig& common, 
     if (owned.count == 0U) {
         return;
     }
-    if (owned.count == 1U && UseHierarchicalRoce(params.tilingData) &&
-        !UseHierarchicalCombineReduction(params.tilingData) && (params.tilingData->pipelineFlags & 128U) != 0U) {
-        if constexpr (!InputReadyChecked) {
-            AscendTimerWaitScope wait(timer.Enabled() ? &timer : nullptr, AscendTimer::AIV_COMBINE_WAIT);
-            WaitUntilGmFlagAtLeast(GetTokenCombineReadyCounter(params, state.expertIdx, rowStart),
-                                   static_cast<int32_t>(GetTokenCombineProducerCount(common, job, rowCount)));
-        }
-        timer.SetSlice(state.expertIdx, rowStart, rowCount);
-        {
-            AscendTimerTileScope timing(timer.Enabled() ? &timer : nullptr, AscendTimer::AIV_COMBINE, owned.start,
-                                        static_cast<uint32_t>(-1), 1U);
-            RunSingleRowCombine(common, params, globalRowStart + owned.start, scratch);
-        }
-        timer.ClearSlice();
-        return;
-    }
+
     // 按实际单卡 BS 选择，不能用专家 slice 行数：Prefill 恢复两槽以限制并发搬运，Decode 保留六槽。
     // AIV1 任务不抢占；Dispatch/Combine 均排空后才交还 UB 和事件 0..5。
     auto buffers =

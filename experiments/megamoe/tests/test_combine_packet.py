@@ -18,7 +18,11 @@ def test_packet_sender_payload_markers_bounds_and_ring_lifetime(tmp_path):
     )
     routes = production[production.index("struct CombineTokenRoute") : production.index("// 为 tile 内")]
     sender = production[production.index("template <typename Element>\n") : production.index("// 通过本地 MTE")]
-    config = production[production.index("struct WaveCombineBufferConfig") : production.index("// A drained,")]
+    config = production[
+        production.index("struct WaveCombineBufferConfig") : production.index(
+            "// 非 layered 路径统一使用的 Combine 行环。"
+        )
+    ]
     init = production[
         production.index("template <uint8_t CombineMode, bool IncludeAiv0") : production.index("// 默认由 AIV1")
     ]
@@ -28,6 +32,15 @@ def test_packet_sender_payload_markers_bounds_and_ring_lifetime(tmp_path):
     send = production[
         production.index("template <uint8_t CombineMode, bool IsBufferReuse>") : production.index("// 使用行级流水")
     ]
+    preload = production[
+        production.index("__aicore__ inline void PreloadWaveCombineMetaInfo") : production.index("// 搬运并按需量化")
+    ]
+    pipeline = (directory.parent / "csrc/kernels/mega_moe/stage/mega_moe_combine_pipeline.hpp").read_text(
+        encoding="utf-8"
+    )
+    pipeline = pipeline[
+        pipeline.index("class CrossExpertCombinePipeline") : pipeline.index("}  // namespace MegaMoeImpl")
+    ]
     fixture = (directory / "combine_packet_test.cpp").read_text(encoding="utf-8")
     for key, code in {
         "ROUTES": routes,
@@ -36,6 +49,8 @@ def test_packet_sender_payload_markers_bounds_and_ring_lifetime(tmp_path):
         "INIT": init,
         "DRAIN": drain,
         "SEND": send,
+        "PRELOAD": preload,
+        "PIPELINE": pipeline,
     }.items():
         fixture = fixture.replace(f"/* PRODUCTION_{key} */", code)
     source = tmp_path / "combine_packet.cpp"

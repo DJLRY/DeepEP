@@ -39,9 +39,9 @@ def test_aiv0_reduction_waits_for_all_prologues_and_keeps_exclusive_qp_ownership
     fixture = (directory / "aiv0_combine_owner_test.cpp").read_text(encoding="utf-8")
     source = tmp_path / "aiv0_combine_owner.cpp"
     source.write_text(
-        fixture.replace("/* PRODUCTION_STAGES */", stages)
-        .replace("/* PRODUCTION_PROGRESS */", body(kernel, "bool TryProgressRemoteCombine(")[1:-1])
-        .replace("/* PRODUCTION_HOST_BARRIER */", body(dispatch, "void CrossRankSyncInHierarchicalHost(")[1:-1]),
+        fixture.replace("/* PRODUCTION_STAGES */", stages).replace(
+            "/* PRODUCTION_HOST_BARRIER */", body(dispatch, "void CrossRankSyncInHierarchicalHost(")[1:-1]
+        ),
         encoding="utf-8",
     )
     binary = tmp_path / "aiv0_combine_owner"

@@ -93,8 +93,6 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
     "world,ranks_per_node,case,error",
     [
         (32, 16, "normal", None),
-        (32, 16, "qp4", None),
-        (32, 16, "qp8", None),
         (32, 16, "qp-mismatch", "QP configuration"),
         (16, 16, "no-rdma", None),
         (32, 8, "no-rdma", None),
@@ -157,17 +155,16 @@ def test_megamoe_roce_collective_bootstrap(monkeypatch, world, ranks_per_node, c
 
     group = StoreGroup(None, 0, world, prefix="test-roce")
     monkeypatch.setattr(group, "all_gather", exchange)
-    qps = 8 if case == "qp8" else 4 if case in ("qp4", "qp-mismatch") else 1
     if error is not None:
         with pytest.raises((ValueError, RuntimeError), match=error):
-            _MegaRuntime(group, 2 << 20, ranks_per_node=ranks_per_node, roce_app_qps=qps)
+            _MegaRuntime(group, 2 << 20, ranks_per_node=ranks_per_node)
         assert not created
         assert _runtime._OWNER is None
     else:
-        runtime = _MegaRuntime(group, 2 << 20, ranks_per_node=ranks_per_node, roce_app_qps=qps)
+        runtime = _MegaRuntime(group, 2 << 20, ranks_per_node=ranks_per_node)
         try:
             assert runtime.use_roce == (ranks_per_node == 16 and world > 16)
             assert len(created) == 1
-            assert created[0][5:] == ((True, qps) if qps != 1 else (True,) if runtime.use_roce else ())
+            assert created[0][5:] == ((True,) if runtime.use_roce else ())
         finally:
             runtime.close()

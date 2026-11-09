@@ -56,35 +56,6 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
             "0,16",
         ],
     )
-    # Exercise the full CLI -> buffer/manifest/profiling option path as well as
-    # the default path, without requiring a device or changing the timing loop.
-    pipeline = dict(
-        dispatch_workers=14 if rank == 16 else 0,
-        reduce_lane_init=rank == 16,
-        combine_sparse_scan=rank == 0,
-        combine_single_row=rank == 0,
-        reduce_double_buffer=rank == 16,
-        combine_ready_trace=rank == 16,
-        dispatch_skip_empty=rank == 0,
-        dispatch_lookahead=rank == 16,
-        dispatch_single_row=rank == 16,
-    )
-    if rank == 16:
-        sys.argv.extend(
-            [
-                "--combine-reduce-qps",
-                "8",
-                "--reduce-lane-init",
-                "--dispatch-workers",
-                "14",
-                "--reduce-double-buffer",
-                "--combine-ready-trace",
-                "--dispatch-lookahead",
-                "--dispatch-single-row",
-            ]
-        )
-    elif rank == 0:
-        sys.argv.extend(["--combine-sparse-scan", "--combine-single-row", "--dispatch-skip-empty"])
     torch = MagicMock()
     torch.npu.get_device_properties.return_value.L2_cache_size = 128
     monkeypatch.setitem(sys.modules, "torch", torch)
@@ -129,9 +100,9 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
 
     # --mode trace must enable timers itself; no --timer flag is passed.
     benchmark.main()
-    assert {key: buffer_options[0][key] for key in pipeline} == pipeline
+    assert set(buffer_options[0]) == {"num_max_tokens_per_rank", "ranks_per_node", *config["model"]}
     manifest = json.loads((output / f"rank_{rank}" / "manifest.json").read_text())
-    assert {key: manifest[key] for key in pipeline} == pipeline
+    assert manifest["implementation"] == "qp8_cross_expert"
 
     selected = mode == "trace" and rank in (0, 16)
     assert len(calls) == warmup + iters
@@ -150,7 +121,7 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
         assert not list(output.rglob(name))
     if mode == "perf":
         report = json.loads((output / f"rank_{rank}" / "bs_2" / "profiling.json").read_text())
-        assert {key: report[key] for key in pipeline} == pipeline
+        assert report["implementation"] == "qp8_cross_expert"
         assert report["iteration_sync"] == ("none" if method == "legacy" else "shmem_world_on_stream")
         assert report["alignment_scope"] == ("once_before_batch" if method == "legacy" else "before_each_iteration")
         assert report["perf_method"] == method

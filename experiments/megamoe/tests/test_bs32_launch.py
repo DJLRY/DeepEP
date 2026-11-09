@@ -187,73 +187,6 @@ def test_stage_separation_and_fixed_case(saved, monkeypatch, action, expected):
             assert command[command.index("--config") + 1] == str(case_path)
 
 
-@pytest.mark.parametrize("action", ["run", "perf", "trace"])
-@pytest.mark.parametrize(
-    "qps,flags,expected",
-    [
-        (0, ["--combine-single-row"], dict(combine_single_row=True)),
-        (0, ["--dispatch-skip-empty"], dict(dispatch_skip_empty=True)),
-        (8, ["--dispatch-lookahead"], dict(dispatch_lookahead=True)),
-        (0, ["--dispatch-single-row"], dict(dispatch_single_row=True)),
-        (
-            8,
-            ["--dispatch-skip-empty", "--dispatch-lookahead", "--dispatch-single-row"],
-            dict(dispatch_skip_empty=True, dispatch_lookahead=True, dispatch_single_row=True),
-        ),
-        (8, ["--dispatch-workers", "14", "--reduce-lane-init"], dict(dispatch_workers=14, reduce_lane_init=True)),
-        (8, ["--reduce-double-buffer"], dict(reduce_double_buffer=True)),
-        (
-            8,
-            ["--reduce-double-buffer", "--combine-ready-trace"],
-            dict(reduce_double_buffer=True, combine_ready_trace=True),
-        ),
-        (0, ["--dispatch-workers", "8"], dict(dispatch_workers=8, reduce_lane_init=False)),
-        (0, ["--dispatch-workers", "14", "--combine-sparse-scan"], dict(dispatch_workers=14, combine_sparse_scan=True)),
-        (0, ["--combine-sparse-scan"], dict(dispatch_workers=0, combine_sparse_scan=True)),
-        (8, ["--reduce-lane-init"], dict(dispatch_workers=0, reduce_lane_init=True)),
-        (4, ["--reduce-lane-init"], dict(dispatch_workers=0, reduce_lane_init=True)),
-    ],
-)
-def test_pipeline_experiments_propagate_and_are_recorded(saved, monkeypatch, action, qps, flags, expected):
-    path, config = saved
-    before = path.read_bytes()
-    monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(launcher, "environment", lambda _: {})
-    monkeypatch.setattr(launcher, "preflight", lambda *a: None)
-    monkeypatch.setattr(launcher, "performance_summary", lambda *a: None)
-    calls = []
-    monkeypatch.setattr(launcher, "execute", lambda command, *a, **kw: calls.append(command))
-    launcher.main([action, "--config", str(path), "--combine-reduce-qps", str(qps), *flags])
-    command = next(c for c in calls if "deep_ep_experimental.megamoe.benchmark" in c)
-    for flag in flags:
-        assert flag in command
-    run_dir = Path(command[command.index("--output-dir") + 1])
-    recorded = json.loads((run_dir / "run.json").read_text())
-    assert {key: recorded[key] for key in expected} == expected
-    assert path.read_bytes() == before
-
-
-@pytest.mark.parametrize(
-    "args",
-    [
-        ["build", "--dispatch-workers", "14"],
-        ["golden", "--dispatch-workers", "0"],
-        ["perf", "--reduce-lane-init"],
-        ["run", "--combine-reduce-qps", "8", "--combine-single-row"],
-        ["run", "--reduce-double-buffer"],
-        ["run", "--combine-ready-trace"],
-        ["build", "--combine-sparse-scan"],
-        ["golden", "--combine-sparse-scan"],
-        ["perf", "--combine-reduce-qps", "8", "--combine-sparse-scan"],
-    ],
-)
-def test_pipeline_cli_rejects_invalid_experiments_before_launch(saved, monkeypatch, args):
-    path, _ = saved
-    monkeypatch.setattr(launcher, "dispatch", lambda *a, **kw: pytest.fail("Invalid experiment launched"))
-    with pytest.raises(SystemExit):
-        launcher.main([*args, "--config", str(path)])
-
-
 def test_second_host_rank_range_and_saved_python(saved):
     _, config = saved
     config = dict(config, node_rank=1, python="/opt/env with spaces/bin/python")
@@ -261,28 +194,6 @@ def test_second_host_rank_range_and_saved_python(saved):
     assert golden[golden.index("--ranks") + 1] == "16-31"
     assert benchmark[benchmark.index("--node-rank") + 1] == "1"
     assert golden[0] == benchmark[0] == config["python"]
-
-
-@pytest.mark.parametrize("qps", [0, 4, 8])
-@pytest.mark.parametrize("action", ["run", "perf", "trace"])
-def test_reduction_qps_propagate_without_rebuild_or_saved_config_change(saved, monkeypatch, qps, action):
-    path, config = saved
-    before = path.read_bytes()
-    monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
-    monkeypatch.setattr(launcher, "environment", lambda _: {})
-    monkeypatch.setattr(launcher, "preflight", lambda *a: None)
-    monkeypatch.setattr(launcher, "performance_summary", lambda *a: None)
-    calls = []
-    monkeypatch.setattr(launcher, "execute", lambda command, *a, **kw: calls.append(command))
-    launcher.main([action, "--config", str(path), "--combine-reduce-qps", str(qps)])
-    benchmark = next(c for c in calls if "torch.distributed.run" in c)
-    assert ("--combine-reduce-qps" in benchmark) == bool(qps)
-    if qps:
-        assert benchmark[benchmark.index("--combine-reduce-qps") + 1] == str(qps)
-    run_dir = Path(benchmark[benchmark.index("--output-dir") + 1])
-    assert json.loads((run_dir / "run.json").read_text())["combine_reduce_qps"] == qps
-    assert path.read_bytes() == before
-    assert not any("build.sh" in str(c) for c in calls)
 
 
 def test_environment_uses_positional_paths_and_removes_import_overrides(saved, monkeypatch):
@@ -395,6 +306,7 @@ def test_sampling_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, 
         if "torch.distributed.run" in command:
             assert command[command.index("--node-rank") + 1] == str(node)
             assert command[command.index("--mode") + 1] == action
+            assert not any(arg.startswith(("--combine-", "--dispatch-", "--reduce-")) for arg in command)
             assert command[command.index("--perf-method") + 1] == method
             assert command[command.index("--input") + 1] == "fp8"
             assert command[command.index("--routing") + 1] == "balanced"
@@ -412,7 +324,15 @@ def test_sampling_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, 
                 report_dir = output / f"rank_{node * 16}" / "bs_32"
                 report_dir.mkdir(parents=True)
                 (report_dir / "profiling.json").write_text(
-                    json.dumps(dict(rounds=50, recorded_rounds=100, mean_us=12.5, rank_max_mean_us=25.0))
+                    json.dumps(
+                        dict(
+                            implementation="qp8_cross_expert",
+                            rounds=50,
+                            recorded_rounds=100,
+                            mean_us=12.5,
+                            rank_max_mean_us=25.0,
+                        )
+                    )
                 )
         elif str(launcher.ROOT / "experiments/megamoe/scripts/trace_text.py") in command:
             assert command[-3:] == ["--max-bytes", "65535", "--print-parts"]
@@ -426,6 +346,7 @@ def test_sampling_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, 
     for _ in range(2):
         launcher.main([action, "--config", str(path), "--perf-method", method])
     assert json.loads((outputs[-1] / "run.json").read_text())["perf_method"] == method
+    assert json.loads((outputs[-1] / "run.json").read_text())["implementation"] == "qp8_cross_expert"
     assert len(calls) == (6 if action == "trace" else 2)
     assert outputs[0] != outputs[1]
     summary = (outputs[-1] / "summary.txt").read_text()
@@ -583,7 +504,7 @@ def test_preflight_checks_installed_timer_support(saved, tmp_path, monkeypatch, 
     modules["deep_ep._native"].require_native = lambda operation: None
     modules["deep_ep_experimental.megamoe._C"].timer_enabled = compiled
     modules["deep_ep_experimental.megamoe._C"].hierarchical_max_tokens = limit
-    modules["deep_ep_experimental.megamoe._C"].api_protocol = 10
+    modules["deep_ep_experimental.megamoe._C"].api_protocol = 11
 
     def execute(command, env):
         monkeypatch.setattr(sys, "argv", ["-c", *command[4:]])
@@ -638,7 +559,14 @@ def test_extra_batches_keep_independent_capacity_and_aggregate_reports(saved, mo
         report_dir.mkdir(parents=True)
         (report_dir / "profiling.json").write_text(
             json.dumps(
-                dict(perf_method=method, rounds=4, recorded_rounds=8, mean_us=bs * 1.5, rank_max_mean_us=bs * 2.5)
+                dict(
+                    implementation="qp8_cross_expert",
+                    perf_method=method,
+                    rounds=4,
+                    recorded_rounds=8,
+                    mean_us=bs * 1.5,
+                    rank_max_mean_us=bs * 2.5,
+                )
             )
         )
 
@@ -683,3 +611,26 @@ def test_extra_batches_stop_on_failure_without_success_summary(saved, monkeypatc
     assert batches == [32, 1, 4]
     assert not (outputs[0].parent / "summary.txt").exists()
     assert "[DONE]" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "option",
+    [
+        "--combine-reduce-qps",
+        "--dispatch-workers",
+        "--reduce-lane-init",
+        "--combine-sparse-scan",
+        "--reduce-double-buffer",
+        "--combine-single-row",
+        "--combine-ready-trace",
+        "--dispatch-skip-empty",
+        "--dispatch-lookahead",
+        "--dispatch-single-row",
+        "--combine-cross-expert",
+    ],
+)
+def test_perf_rejects_removed_algorithm_options(saved, monkeypatch, option):
+    path, _ = saved
+    monkeypatch.setattr(launcher, "dispatch", lambda *a, **kw: pytest.fail("Retired option launched"))
+    with pytest.raises(SystemExit):
+        launcher.main(["perf", "--config", str(path), option])

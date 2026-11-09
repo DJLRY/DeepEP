@@ -24,6 +24,23 @@ int main()
     auto wave = [&](int timing) { return buffer[WAVE_ID_OFFSET + core * WAVE_ID_PER_CORE_ALIGN + timing]; };
 
 #ifdef DEEPEP_MEGAMOE_TIMER
+    {
+        const auto before = pipelineBarriers;
+        timer.SetWave(0);
+        int first = timer.BeginCombineRow(2, 16, 0, CombineRowPhase::Lifetime);
+        timer.SetWave(1);
+        int second = timer.BeginCombineRow(6, 3, 1, CombineRowPhase::Issue);
+        int reuse = timer.BeginCombineRowAtWave(2, 16, 0, CombineRowPhase::ReuseWait, 0);
+        timer.EndCombineRow(reuse);
+        timer.EndCombineRow(second);
+        timer.EndCombineRow(first);
+        assert(wave(logical(AIV_COMBINE_ASYNC, first)) == 0);
+        assert(wave(logical(AIV_COMBINE_ASYNC, second)) == 1);
+        assert(wave(logical(AIV_COMBINE_ASYNC, reuse)) == 0);
+        assert(meta(AIV_COMBINE_ASYNC, first, 0) == ((3LL << 32) | 16));
+        assert(meta(AIV_COMBINE_ASYNC, second, 1) == ((2LL << 32) | 2));
+        assert(pipelineBarriers == before);
+    }
     // Independent handles preserve the live tile/wait and capture their own
     // scheduler wave even when SetWave changes before Finish.
     timer.SetWave(7);
@@ -68,8 +85,7 @@ int main()
     int progress = logical(AIV_COMBINE_PROGRESS, 0);
     assert(count(AIV_COMBINE_PROGRESS) == 1);
     assert(at(AIV_COMBINE_INIT) > 0 && at(AIV_COMBINE_INIT, 1) < at(progress));
-    assert(at(progress) < at(logical(AIV_RDMA_POST, 0)) &&
-           at(logical(AIV_RDMA_POST, 0), 1) < at(progress, 1));
+    assert(at(progress) < at(logical(AIV_RDMA_POST, 0)) && at(logical(AIV_RDMA_POST, 0), 1) < at(progress, 1));
     assert(at(progress, 1) - at(progress) > 500 && meta(AIV_COMBINE_PROGRESS, 0, 1) == 19);
     assert(meta(AIV_COMBINE_PROGRESS, 0, 0) ==
            (int64_t(1024) | (int64_t(925) << 16) | (int64_t(3) << 32) | (int64_t(128) << 48)));

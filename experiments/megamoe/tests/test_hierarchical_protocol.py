@@ -764,52 +764,37 @@ def cpp_function_body(path, signature):
     raise AssertionError(f"Unclosed function body in {path.name}: {signature}")
 
 
-@pytest.mark.parametrize(
-    "header,signature,timed",
-    [
-        ("mega_moe_arch35.hpp", "::ProcessWave(Derived& derived)", True),
-        ("mega_moe_wave_a8w8.hpp", "::Process()", False),
-    ],
-)
-def test_real_kernel_entrypoints_overlap_owner_retirement_after_output_ready(header, signature, timed):
+def test_real_kernel_entrypoint_overlaps_owner_retirement_after_output_ready():
     kernels = Path(__file__).resolve().parents[1] / "csrc/kernels/mega_moe"
-    body = cpp_function_body(kernels / header, signature)
+    body = cpp_function_body(kernels / "mega_moe_arch35.hpp", "::ProcessWave(Derived& derived)")
     expected = (
         "CrossRankSyncInHierarchicalHost(",
-        "DrainHierarchicalReducedCombine(" if timed else "DrainHierarchicalCombine(",
+        "DrainHierarchicalReducedCombine(",
         "RocePublishCommit(",
         "RoceWaitCommit(",
         "RoceFinishOutstanding(",
-        "HierarchicalSignal::TxDone",
         "UnpermuteTokens<",
         "Stage::COMPLETE",
     )
     positions = []
     for token in expected:
         positions.append(body.index(token, positions[-1] + 1 if positions else 0))
-    assert positions == sorted(positions), "Both entrypoints must close all RDMA lifetimes before kernel return"
+    assert positions == sorted(positions)
     assert body.count("RoceFinishOutstanding(") == 1
-    # The final retirement remains on the designated communication owner and is
-    # reached on empty-route calls too; it must not be guarded by sentRows.
     tail_begin = body.index("Stage::UNPERMUTE")
     tail = body[tail_begin : body.index("Stage::COMPLETE")]
-    if header == "mega_moe_arch35.hpp":
-        assert "DrainHierarchicalCombine(" not in body
-        # A8W4 supports one or multiple fixed QP owners through this predicate.
-        assert "IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)" in tail
-        owner = cpp_function_body(kernels / "common/mega_moe_peermem.hpp", "bool IsHierarchicalCombineOwner(")
-        assert "UseHierarchicalRoce(t)" in owner
-        assert "HierarchicalCombineLane(t, physicalJob) < HierarchicalCombineOwnerCount(t)" in owner
-        assert "HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex) + 1U" in tail
-    else:
-        assert "UseHierarchicalRoce(params_.tilingData)" in tail
-        assert "aivJob_.jobIndex == HierarchicalSendJob()" in tail
+    assert "IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)" in tail
+    assert "HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex) + 1U" in tail
     assert "expectedRows" not in tail and "sentRows" not in tail
-    assert "} else {" in tail[tail.index("HierarchicalSignal::TxDone") : tail.index("UnpermuteTokens<")]
+    assert "} else {" in tail[tail.index("RoceFinishOutstanding(") : tail.index("UnpermuteTokens<")]
     assert "SyncAll<true>()" in body[body.index("RoceWaitCommit(") : tail_begin]
     assert "SyncAll" not in tail, "The owner must not gate other AIVs behind its final quiet"
-    if timed:
-        assert positions[-2] < body.index("timer_.End(AscendTimer::KERNEL_TIMING)")
-        assert positions[-2] < body.index("timer_.FlushDynamicCounts()")
-        finish_call = re.search(r"RoceFinishOutstanding\([^;]+;", tail)
-        assert finish_call is not None and "timer_" in finish_call.group()
+    assert positions[-2] < body.index("timer_.End(AscendTimer::KERNEL_TIMING)")
+    assert positions[-2] < body.index("timer_.FlushDynamicCounts()")
+
+
+def test_a8w8_entrypoint_keeps_local_transport_only():
+    kernels = Path(__file__).resolve().parents[1] / "csrc/kernels/mega_moe"
+    body = cpp_function_body(kernels / "mega_moe_wave_a8w8.hpp", "::Process()")
+    assert "CrossRankSyncInWorldSize(" in body
+    assert "Roce" not in body and "Hierarchical" not in body

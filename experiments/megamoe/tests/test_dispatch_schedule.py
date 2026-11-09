@@ -11,7 +11,7 @@ import pytest
 from test_combine_owner import function_body
 
 
-def test_dispatch_continuations_preserve_rows_and_readiness(tmp_path):
+def test_dispatch14_preserves_rows_and_ready_publication(tmp_path):
     directory = Path(__file__).parent
     kernel = directory.parent / "csrc/kernels/mega_moe"
     wave = (kernel / "mega_moe_wave_a8w4.hpp").read_text(encoding="utf-8")
@@ -28,9 +28,6 @@ def test_dispatch_continuations_preserve_rows_and_readiness(tmp_path):
         ("DISPATCH_SUBSET", utils, "uint32_t GetDispatchSubsetJobIndex("),
     ]:
         source = source.replace(f"/* {marker} */", function_body(text, name)[1:-1])
-    start = wave.index("    struct DispatchTaskCursor {")
-    end = wave.index("} dispatchTask_;", start) + len("} dispatchTask_;")
-    source = source.replace("/* CONTINUATION */", wave[start:end])
     compiler = shutil.which("g++") or shutil.which("clang++")
     if compiler is None:
         pytest.skip("Dispatch scheduling requires g++ or clang++")

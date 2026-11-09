@@ -119,56 +119,10 @@ def main():
     parser.add_argument("--bs-values", help="Only model config override, e.g. 96,4096")
     parser.add_argument("--mode", choices=("accuracy", "perf", "trace"), default="accuracy")
     parser.add_argument(
-        "--combine-reduce-qps",
-        type=int,
-        choices=(0, 4, 8),
-        default=0,
-        help="0: BF16 forwarding; 4/8: FP32 gateway reduction with that many owned QPs",
-    )
-    parser.add_argument(
         "--perf-method",
         choices=PERF_METHODS,
         default="legacy",
         help="legacy: one Exp prefix; shmem: per-round L2 flush, device sleep and SHMEM barrier",
-    )
-    parser.add_argument(
-        "--dispatch-workers",
-        type=int,
-        choices=(0, 8, 14, 28),
-        default=0,
-        help="Dispatch participants per expert; 0 keeps all workers",
-    )
-    parser.add_argument(
-        "--reduce-lane-init", action="store_true", help="q=4/8 only: initialize only this lane's routes"
-    )
-    parser.add_argument(
-        "--reduce-double-buffer", action="store_true", help="q=4/8: overlap expert row loads with FP32 reduction"
-    )
-    parser.add_argument(
-        "--combine-single-row",
-        action="store_true",
-        help="q=0: use a synchronous lightweight path for single-row Combine tasks",
-    )
-    parser.add_argument(
-        "--dispatch-skip-empty",
-        action="store_true",
-        help="Skip prefix reload on Dispatch workers with no assigned rows",
-    )
-    parser.add_argument(
-        "--dispatch-lookahead",
-        action="store_true",
-        help="Let one ready completed-wave Combine precede future-wave Dispatch",
-    )
-    parser.add_argument(
-        "--dispatch-single-row", action="store_true", help="Yield after each assigned Dispatch row for BS <= 256"
-    )
-    parser.add_argument(
-        "--combine-ready-trace",
-        action="store_true",
-        help="q=4/8: record readiness snapshots and synchronization boundaries (timer builds)",
-    )
-    parser.add_argument(
-        "--combine-sparse-scan", action="store_true", help="q=0 only: skip empty pending tokens and stop on completion"
     )
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
     parser.add_argument(
@@ -215,6 +169,7 @@ def run(args, config, group):
     from .validation import collective_check
 
     rank, world = group.rank(), group.size()
+    hierarchical = int(os.environ["LOCAL_WORLD_SIZE"]) == 16 and world == 32
     collective_check(
         group,
         "benchmark configuration",
@@ -229,16 +184,6 @@ def run(args, config, group):
             args.timer_ranks,
             args.check_tokens,
             args.relative_rmse,
-            args.combine_reduce_qps,
-            args.dispatch_workers,
-            args.reduce_lane_init,
-            args.combine_sparse_scan,
-            args.reduce_double_buffer,
-            args.combine_single_row,
-            args.combine_ready_trace,
-            args.dispatch_skip_empty,
-            args.dispatch_lookahead,
-            args.dispatch_single_row,
         ),
     )
     timer_ranks = args.timer_ranks if args.timer_ranks is not None else list(range(min(world, 8)))
@@ -286,18 +231,9 @@ def run(args, config, group):
         ),
         api="fp8_fp4_mega_moe",
         numerical_contract=(
-            "ascend_post_gmm2_host_reduce_fp32_v1" if args.combine_reduce_qps else "ascend_post_gmm2_route_weight_v1"
+            "ascend_post_gmm2_host_reduce_fp32_v1" if hierarchical else "ascend_post_gmm2_route_weight_v1"
         ),
-        combine_reduce_qps=args.combine_reduce_qps,
-        dispatch_workers=args.dispatch_workers,
-        reduce_lane_init=args.reduce_lane_init,
-        combine_sparse_scan=args.combine_sparse_scan,
-        reduce_double_buffer=args.reduce_double_buffer,
-        combine_single_row=args.combine_single_row,
-        combine_ready_trace=args.combine_ready_trace,
-        dispatch_skip_empty=args.dispatch_skip_empty,
-        dispatch_lookahead=args.dispatch_lookahead,
-        dispatch_single_row=args.dispatch_single_row,
+        implementation="qp8_cross_expert" if hierarchical else "mte",
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
     )
@@ -307,16 +243,6 @@ def run(args, config, group):
         group,
         num_max_tokens_per_rank=max(config["bs_values"]),
         ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
-        combine_reduce_qps=args.combine_reduce_qps,
-        dispatch_workers=args.dispatch_workers,
-        reduce_lane_init=args.reduce_lane_init,
-        combine_sparse_scan=args.combine_sparse_scan,
-        reduce_double_buffer=args.reduce_double_buffer,
-        combine_single_row=args.combine_single_row,
-        combine_ready_trace=args.combine_ready_trace,
-        dispatch_skip_empty=args.dispatch_skip_empty,
-        dispatch_lookahead=args.dispatch_lookahead,
-        dispatch_single_row=args.dispatch_single_row,
         **model,
     )
 
@@ -471,24 +397,13 @@ def run(args, config, group):
             per_rank = group.all_gather(timings, f"profiling BS={bs}")
             report = summarize_rounds(per_rank, int(os.environ["LOCAL_WORLD_SIZE"]))
             report.update(measurement)
-            report["combine_reduce_qps"] = args.combine_reduce_qps
-            report.update(
-                dispatch_workers=args.dispatch_workers,
-                reduce_lane_init=args.reduce_lane_init,
-                combine_sparse_scan=args.combine_sparse_scan,
-                reduce_double_buffer=args.reduce_double_buffer,
-                combine_single_row=args.combine_single_row,
-                combine_ready_trace=args.combine_ready_trace,
-                dispatch_skip_empty=args.dispatch_skip_empty,
-                dispatch_lookahead=args.dispatch_lookahead,
-                dispatch_single_row=args.dispatch_single_row,
-            )
+            report["implementation"] = manifest["implementation"]
             (case / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
             if rank == 0:
                 print(
                     f"[PERF] BS={bs} MegaMoe E2E={report['mean_us']:.3f}us "
                     f"rank-max-mean={report['rank_max_mean_us']:.3f}us "
-                    f"combine-reduce-qps={args.combine_reduce_qps} "
+                    f"implementation={report['implementation']} "
                     f"rounds={report['rounds']}/{report['recorded_rounds']} "
                     f"(last ceil(iters/2); kernel Duration; rank-min mean; timer off; method={args.perf_method})",
                     flush=True,

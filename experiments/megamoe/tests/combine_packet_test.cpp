@@ -29,6 +29,8 @@ std::vector<Write> queued;
 std::array<std::vector<Write>, 8> inFlight;
 const uint8_t* sourceBegin = nullptr;
 const uint8_t* sourceEnd = nullptr;
+const uint8_t* metaBegin = nullptr;
+const uint8_t* metaEnd = nullptr;
 uint32_t stores = 0U, sends = 0U, mte3ScalarWaits = 0U;
 void CheckWritable(const void* pointer, uint32_t bytes)
 {
@@ -123,7 +125,8 @@ void DataCopyPad(LocalTensor<T> dst, GlobalTensor<T> src, DataCopyExtParams copy
     assert(reinterpret_cast<uint8_t*>(dst.data) + bytes <= ub.data() + ub.size());
     for (uint32_t i = 0U; i < copy.blockCount; ++i) {
         const auto* first = reinterpret_cast<const uint8_t*>(src.data) + i * (copy.blockLen + copy.srcStride);
-        assert(first >= sourceBegin && first + copy.blockLen <= sourceEnd);
+        assert((first >= sourceBegin && first + copy.blockLen <= sourceEnd) ||
+               (metaBegin && first >= metaBegin && first + copy.blockLen <= metaEnd));
     }
     loads.push_back([=]() {
         auto* target = reinterpret_cast<uint8_t*>(dst.data);
@@ -203,6 +206,10 @@ struct MoeStageCommonConfig {
 struct Params {
     MegaMoeTilingData* tilingData;
     PeermemInfo peermemInfo;
+    struct {
+        uint8_t* gmm2MmadResPtr = nullptr;
+        uint8_t* metaInfoPtr = nullptr;
+    } workspaceInfo{};
 };
 uint8_t* windows[32]{};
 uint8_t* GetRankWinAddrWithOffset(uint32_t rank, uint64_t offset)
@@ -234,10 +241,42 @@ namespace MegaMoeImpl {
 /* PRODUCTION_INIT */
 /* PRODUCTION_DRAIN */
 /* PRODUCTION_SEND */
+/* PRODUCTION_PRELOAD */
+struct ExpertLoopState {
+    uint32_t expertIdx;
+    uint64_t globalTokenStartIndex;
+};
+struct WorkRange {
+    uint32_t start, count;
+};
+namespace AscendTimer {
+enum class CombineRowPhase { Lifetime = 1, Issue = 2, ReuseWait = 3 };
+}
+struct AscendTimerDevice {
+    uint32_t begins = 0U, ends = 0U;
+    int64_t CurrentWave() const
+    {
+        return 0;
+    }
+    int BeginCombineRowAtWave(uint32_t expert, uint32_t row, uint32_t slot, AscendTimer::CombineRowPhase phase, int64_t)
+    {
+        return BeginCombineRow(expert, row, slot, phase);
+    }
+    int BeginCombineRow(uint32_t, uint32_t, uint32_t, AscendTimer::CombineRowPhase)
+    {
+        return begins++;
+    }
+    void EndCombineRow(int handle)
+    {
+        assert(handle >= 0);
+        ++ends;
+    }
+};
+/* PRODUCTION_PIPELINE */
 }  // namespace MegaMoeImpl
 using namespace MegaMoeImpl;
 
-void CheckCase(uint32_t hidden, uint32_t qps, uint32_t sequence, uint32_t rank)
+void CheckCase(uint32_t hidden, uint32_t sequence, uint32_t rank)
 {
     using namespace PacketTest;
     ub.fill(0xA5);
@@ -246,7 +285,6 @@ void CheckCase(uint32_t hidden, uint32_t qps, uint32_t sequence, uint32_t rank)
     MegaMoeTilingData t{};
     t.h = hidden;
     t.topK = 4U;
-    t.combineReduceQps = qps;
     t.hierarchicalSequence = sequence;
     t.topoType = TOPO_TYPE_MTE_ROCE;
     std::vector<uint8_t> local(1024U * 1024U, 0xA5), peer(local.size(), 0xA5);
@@ -257,22 +295,28 @@ void CheckCase(uint32_t hidden, uint32_t qps, uint32_t sequence, uint32_t rank)
     memory.rankSyncInWorldPtr = local.data();
     memory.combineSendPtr = local.data();
     memory.gatewayCombinePtr = local.data() + 256U * 1024U;
-    memory.gatewayCombineReadyPtr = qps == 8U ? nullptr : local.data() + 768U * 1024U;
     Params params{&t, memory};
     MoeStageCommonConfig common{hidden, rank};
     WaveCombineScratch scratch;
     const auto config = InitWaveCombineBuffers<COMBINE_NO_QUANT>(common, scratch, UsePacketizedGatewayCombine(&t));
     assert(config.rowBufferCount == 6U);
     const uint32_t packedBytes = (hidden * 2U + 507U) / 508U * 512U;
-    assert(config.slotStrideBytes == (qps == 8U ? packedBytes : hidden * 2U));
+    assert(config.slotStrideBytes == packedBytes);
     assert(WAVE_COMBINE_UB_BASE + config.slotStrideBytes * config.rowBufferCount <= WAVE_COMBINE_UB_LIMIT);
     const uint32_t count = 19U;
     std::vector<uint16_t> rows(count * hidden);
     for (uint32_t i = 0U; i < rows.size(); ++i) rows[i] = (i * 131U + i / 7U) & 0xFFFFU;
     GlobalTensor<bfloat16_t> source;
     source.SetGlobalBuffer(rows.data());
-    uint32_t issued = 0U;
-    for (uint32_t i = 0U; i < count; ++i, ++issued) {
+    CrossExpertCombinePipeline pipeline;
+    AscendTimerDevice timer;
+    std::vector<int32_t> metadata(count * META_INFO_SIZE);
+    params.workspaceInfo.gmm2MmadResPtr = reinterpret_cast<uint8_t*>(rows.data());
+    params.workspaceInfo.metaInfoPtr = reinterpret_cast<uint8_t*>(metadata.data());
+    metaBegin = reinterpret_cast<uint8_t*>(metadata.data());
+    metaEnd = metaBegin + metadata.size() * sizeof(int32_t);
+    assert(pipeline.Enabled(params));
+    for (uint32_t i = 0U; i < count; ++i) {
         const bool gateway = i % 3U != 1U;
         // Include local gateway, another same-host gateway, and direct peer output.
         const uint32_t destination = i % 3U == 0U ? host : host + 7U;
@@ -282,25 +326,33 @@ void CheckCase(uint32_t hidden, uint32_t qps, uint32_t sequence, uint32_t rank)
         meta.SetValue(TOPK_INDEX, i % 4U);
         sourceBegin = reinterpret_cast<uint8_t*>(rows.data() + i * hidden);
         sourceEnd = sourceBegin + hidden * 2U;
-        if (i < config.rowBufferCount)
-            SendWaveCombineToken<COMBINE_NO_QUANT, false>(common, config, scratch, params, source, 0U, i, meta,
-                                                          i % config.rowBufferCount);
-        else
-            SendWaveCombineToken<COMBINE_NO_QUANT, true>(common, config, scratch, params, source, 0U, i, meta,
-                                                         i % config.rowBufferCount);
+
+        std::copy(meta.data, meta.data + META_INFO_SIZE, metadata.data() + i * META_INFO_SIZE);
+        pipeline.IssueSlice(common, params, {i / 2U, i / 2U * 2U}, i % 2U, {0U, 1U}, timer);
+        // Two rows from different calls remain in flight simultaneously.
+        if (i == 1U) assert(!inFlight[0].empty() && !inFlight[1].empty());
+        if (i % 7U == 5U) {
+            pipeline.Drain(timer);
+            for (const auto& pending : inFlight) assert(pending.empty());
+            CheckWritable(ub.data(), ub.size());
+            ub.fill(0xA5);  // activation/Dispatch can reuse ALL stage UB
+        }
         assert(sends == i + 1U);  // one MTE3 submission per row, never per packet
-        if (qps == 8U) assert(stores == 0U && mte3ScalarWaits == 0U);
+        if (true) assert(stores == 0U && mte3ScalarWaits == 0U);
     }
-    if (qps == 8U) assert(!inFlight[(count - 1U) % config.rowBufferCount].empty());
-    DrainCombineRowBuffers(issued, config.rowBufferCount);
-    assert(issued == 0U && loads.empty() && queued.empty());
+
+    pipeline.Drain(timer);
+    pipeline.Drain(timer);  // no duplicate event waits on empty drain
+    assert(timer.begins == count * 3U && timer.ends == timer.begins);
+
+    assert(loads.empty() && queued.empty());
     for (const auto& writes : inFlight) assert(writes.empty());
     for (const auto& type : events)
         for (bool event : type) assert(!event);
     for (uint32_t i = 0U; i < count; ++i) {
         const bool gateway = i % 3U != 1U;
         const uint8_t* base = (i % 3U == 0U ? local.data() : peer.data()) + (gateway ? 256U * 1024U : 0U);
-        const bool packet = gateway && qps == 8U;
+        const bool packet = gateway;
         const uint32_t stride = packet ? packedBytes : hidden * 2U;
         const auto* bytes = base + i * stride;
         const auto* expected = reinterpret_cast<const uint8_t*>(rows.data() + i * hidden);
@@ -316,13 +368,14 @@ void CheckCase(uint32_t hidden, uint32_t qps, uint32_t sequence, uint32_t rank)
     }
     const uint32_t ringEnd = WAVE_COMBINE_UB_BASE + config.rowBufferCount * config.slotStrideBytes;
     for (uint32_t i = ringEnd; i < WAVE_COMBINE_UB_LIMIT; ++i) assert(ub[i] == 0xA5);
+    metaBegin = metaEnd = nullptr;
     ub.fill(0xCC);  // a subsequent stage may safely take every UB slot
 }
 int main()
 {
     static_assert(WAVE_COMBINE_STEADY_ROW_BUFFER_COUNT == 1U);
-    for (uint32_t hidden = 1024U; hidden <= 8192U; hidden += 32U) CheckCase(hidden, 8U, 0x80000101U, 14U);
-    for (uint32_t qps : {0U, 4U, 8U})
-        for (uint32_t seq : {1U, 129U, 0xFFFFFFFFU})
-            for (uint32_t rank : {0U, 30U}) CheckCase(3584U, qps, seq, rank);
+    for (uint32_t hidden : {1024U, 3584U, 8128U, 8192U})
+        for (uint32_t sequence : {1U, 129U, 0xffffffffU})
+            for (uint32_t rank : {0U, 30U}) CheckCase(hidden, sequence, rank);
+    for (uint32_t hidden = 1024U; hidden <= 8192U; hidden += 32U) CheckCase(hidden, 0x80000101U, 14U);
 }

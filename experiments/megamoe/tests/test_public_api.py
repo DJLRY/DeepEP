@@ -138,14 +138,13 @@ def backend(monkeypatch):
     monkeypatch.setattr(
         api,
         "require_native",
-        lambda _: SimpleNamespace(megamoe_workspace_address=lambda _: 4096, megamoe_combine_reduce_version=1),
+        lambda _: SimpleNamespace(megamoe_workspace_address=lambda _: 4096, megamoe_combine_reduce_version=2),
     )
 
     class Runtime:
-        def __init__(self, group, capacity, timeout, *, ranks_per_node=0, roce_app_qps=1):
+        def __init__(self, group, capacity, timeout, *, ranks_per_node=0):
             self.device, self.stream, self.native = 0, stream, SimpleNamespace(capacity=capacity)
             self.ranks_per_node = ranks_per_node
-            self.roce_app_qps = roce_app_qps
             self.closed = False
 
         def ensure_alive(self):
@@ -481,7 +480,7 @@ def test_plan_allocation_failure_is_collective_and_retryable(backend):
     assert backend.buffer._plan_bs == 17
 
 
-def hierarchical_buffer(backend, *, size=32, mma_type="fp8xfp4", combine_reduce_qps=0, **pipeline):
+def hierarchical_buffer(backend, *, size=32, mma_type="fp8xfp4", capacity=257, **options):
     from deep_ep._store import StoreGroup
 
     group = StoreGroup(None, 0, size, prefix="hierarchical-api-test")
@@ -489,153 +488,20 @@ def hierarchical_buffer(backend, *, size=32, mma_type="fp8xfp4", combine_reduce_
     buffer = api.SymmBuffer(
         group,
         size * 2,
-        257,
+        capacity,
         2,
         1024,
         256,
         ranks_per_node=16,
         mma_type=mma_type,
-        combine_reduce_qps=combine_reduce_qps,
-        **pipeline,
+        **options,
     )
     buffer.topk_idx.data[:] = [0, size]
     buffer.topk_weights.data[:] = [0.4, 0.6]
     return buffer
 
 
-@pytest.mark.parametrize("qps", [0, 4, 8])
-def test_reduction_configuration_reaches_heap_runtime_and_plan(backend, qps):
-    sizes = []
-    backend.ext.buffer_size = lambda *args: sizes.append(args) or (2 << 20)
-    b = hierarchical_buffer(backend, combine_reduce_qps=qps)
-    try:
-        b.prepare(32)
-        assert b.combine_reduce_qps == qps
-        assert sizes[0][-1] == qps and b._plan.options[-3:] == (qps, 0, 0)
-        assert b._runtime.roce_app_qps == (qps or 1)
-    finally:
-        b.destroy()
-
-
-@pytest.mark.parametrize("case", ["bad-qps", "ep16", "fp8", "old-core", "peer-mismatch"])
-def test_reduction_bad_configuration_fails_collectively_before_runtime(backend, monkeypatch, case):
-    from deep_ep._store import StoreGroup
-
-    monkeypatch.setattr(api, "_MegaRuntime", lambda *a, **kw: pytest.fail("Invalid configuration started SHMEM"))
-    if case == "old-core":
-        monkeypatch.setattr(api, "require_native", lambda _: SimpleNamespace())
-    size = 16 if case == "ep16" else 32
-    group = StoreGroup(None, 0, size, prefix="reduction-invalid")
-
-    def gather(value, stage):
-        peers = [value] * size
-        if case == "peer-mismatch" and stage == "check:configuration":
-            error, config = value
-            other = list(config)
-            other[10] = 8
-            peers[-1] = (error, tuple(other))
-        return peers
-
-    group.all_gather = gather
-    with pytest.raises(ValueError):
-        api.SymmBuffer(
-            group,
-            size * 2,
-            32,
-            2,
-            1024,
-            256,
-            ranks_per_node=16,
-            mma_type="fp8xfp8" if case == "fp8" else "fp8xfp4",
-            combine_reduce_qps=2 if case == "bad-qps" else 4,
-        )
-
-
-@pytest.mark.parametrize(
-    "qps,workers,lane_init,sparse_scan",
-    [
-        (0, 0, False, False),
-        (0, 8, False, False),
-        (0, 14, False, False),
-        (0, 28, False, False),
-        (4, 0, True, False),
-        (8, 0, True, False),
-        (8, 14, True, False),
-        (4, 8, True, False),
-        (0, 0, False, True),
-        (0, 14, False, True),
-    ],
-)
-def test_pipeline_options_reach_every_bs_plan(backend, qps, workers, lane_init, sparse_scan):
-    b = hierarchical_buffer(
-        backend,
-        combine_reduce_qps=qps,
-        dispatch_workers=workers,
-        reduce_lane_init=lane_init,
-        combine_sparse_scan=sparse_scan,
-    )
-    try:
-        for bs in (1, 32, 256):
-            b.prepare(bs)
-            assert b._plan.options[-3:] == (qps, (int(lane_init) << 1) | (int(sparse_scan) << 2), workers)
-    finally:
-        b.destroy()
-
-
-@pytest.mark.parametrize(
-    "options",
-    [
-        dict(reduce_lane_init=1),
-        dict(reduce_lane_init=True),
-        dict(dispatch_workers=-1),
-        dict(dispatch_workers=129),
-        dict(dispatch_workers=True),
-        dict(combine_reduce_qps=8, combine_single_row=True),
-        dict(reduce_double_buffer=True),
-        dict(combine_ready_trace=True),
-        dict(mma_type="fp8xfp8", dispatch_workers=14),
-        dict(size=16, dispatch_workers=14),
-        dict(combine_sparse_scan=1),
-        dict(dispatch_skip_empty=1),
-        dict(dispatch_lookahead="yes"),
-        dict(dispatch_single_row=None),
-        dict(size=16, dispatch_skip_empty=True),
-        dict(mma_type="fp8xfp8", dispatch_lookahead=True),
-        dict(size=16, dispatch_single_row=True),
-        dict(combine_reduce_qps=8, combine_sparse_scan=True),
-        dict(combine_reduce_qps=4, combine_sparse_scan=True),
-        dict(mma_type="fp8xfp8", combine_sparse_scan=True),
-        dict(size=16, combine_sparse_scan=True),
-    ],
-)
-def test_invalid_pipeline_configuration_does_not_start_runtime(backend, monkeypatch, options):
-    monkeypatch.setattr(api, "_MegaRuntime", lambda *a, **kw: pytest.fail("Invalid pipeline started SHMEM"))
-    with pytest.raises(ValueError):
-        hierarchical_buffer(backend, **options)
-
-
-@pytest.mark.parametrize("field", [11, 12, 13, 14, 15, 16, 17, 18, 19])
-def test_pipeline_options_must_match_on_all_ranks(backend, monkeypatch, field):
-    from deep_ep._store import StoreGroup
-
-    group = StoreGroup(None, 0, 32, prefix="pipeline-mismatch")
-
-    def gather(value, stage):
-        peers = [value] * 32
-        if stage == "check:configuration":
-            error, config = value
-            other = list(config)
-            other[field] = not other[field] if field != 11 else 8
-            peers[-1] = (error, tuple(other))
-        return peers
-
-    group.all_gather = gather
-    monkeypatch.setattr(api, "_MegaRuntime", lambda *a, **kw: pytest.fail("Mismatched pipeline started SHMEM"))
-    with pytest.raises(ValueError, match="configuration"):
-        api.SymmBuffer(group, 64, 32, 2, 1024, 256, ranks_per_node=16, combine_reduce_qps=8)
-
-
-@pytest.mark.parametrize("mma_type", ["fp8xfp4", "fp8xfp8"])
+@pytest.mark.parametrize("mma_type", ["fp8xfp4"])
 def test_hierarchical_sequence_survives_plan_recreation_and_old_epoch_wrap(backend, mma_type):
     b = hierarchical_buffer(backend, mma_type=mma_type)
     assert b._runtime.ranks_per_node == 16 and b._hierarchical_roce
@@ -699,7 +565,7 @@ def test_hierarchical_launch_failure_and_sequence_exhaustion(backend, monkeypatc
         b.destroy()
 
 
-@pytest.mark.parametrize("size,mma_type", [(64, "fp8xfp4"), (64, "fp8xfp8")])
+@pytest.mark.parametrize("size,mma_type", [(64, "fp8xfp4")])
 def test_hierarchical_unsupported_configuration_fails_collectively(backend, size, mma_type):
     with pytest.raises(ValueError, match="MTE\\+RoCE MegaMoE requires EP32"):
         hierarchical_buffer(backend, size=size, mma_type=mma_type)
@@ -717,26 +583,7 @@ def test_sixteen_rank_single_host_keeps_mte(backend):
         b.destroy()
 
 
-@pytest.mark.parametrize("bf16", [False, True])
-def test_hierarchical_a8w8_bs32_uses_fp8_weights_without_layout_conversion(backend, bf16):
-    b = hierarchical_buffer(backend, mma_type="fp8xfp8")
-    pairs = fp8_weights()
-    try:
-        b.prepare(32)
-        x = Tensor(np.ones((32, 1024)), "bfloat16") if bf16 else (b.x[:32], b.x_sf[:32])
-        out = Tensor(np.zeros((32, 1024)), "bfloat16")
-        y, stats = api.mega_moe(x, b.topk_idx[:32], b.topk_weights[:32], *pairs, b, out=out)
-        assert y is out and stats.shape == (2,)
-        launch = [e[1] for e in backend.events if isinstance(e, tuple) and e[0] == "launch"][-1]
-        assert launch[4] is pairs[0][0] and launch[5] is pairs[1][0]
-        assert (launch[1] is None) == bf16
-        assert launch[-2] == 1
-        assert not any(isinstance(e, tuple) and e[0] == "format_cast" for e in backend.events)
-    finally:
-        b.destroy()
-
-
-@pytest.mark.parametrize("protocol", [5, 6, 7, 8, 9, 10])
+@pytest.mark.parametrize("protocol", [5, 6, 7, 8, 9, 10, 11])
 def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypatch, protocol):
     api._extension.cache_clear()
     core = SimpleNamespace(create_megamoe_runtime=lambda: None)
@@ -744,7 +591,7 @@ def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypa
     monkeypatch.setattr(api, "require_native", lambda _: core)
     monkeypatch.setattr(api.importlib, "import_module", lambda _: extension)
     try:
-        if protocol != 10:
+        if protocol != 11:
             with pytest.raises(RuntimeError, match="versions differ"):
                 api._extension()
         else:
@@ -753,24 +600,47 @@ def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypa
         api._extension.cache_clear()
 
 
-@pytest.mark.parametrize(
-    "qps,options,flags",
-    [
-        (0, dict(combine_single_row=True), 128),
-        (0, dict(combine_single_row=True, combine_sparse_scan=True), 132),
-        (8, dict(reduce_double_buffer=True, dispatch_workers=14, reduce_lane_init=True), 258),
-        (4, dict(reduce_double_buffer=True, combine_ready_trace=True), 320),
-        (4, dict(combine_ready_trace=True), 64),
-        (0, dict(dispatch_skip_empty=True), 512),
-        (8, dict(dispatch_lookahead=True), 1024),
-        (0, dict(dispatch_single_row=True), 2048),
-        (8, dict(dispatch_skip_empty=True, dispatch_lookahead=True, dispatch_single_row=True), 3584),
-    ],
-)
-def test_tail_pipeline_options_reach_plan(backend, qps, options, flags):
-    b = hierarchical_buffer(backend, combine_reduce_qps=qps, **options)
+def test_hierarchical_plan_has_no_selectable_algorithm_arguments(backend):
+    sizes = []
+    backend.ext.buffer_size = lambda *args: sizes.append(args) or (2 << 20)
+    b = hierarchical_buffer(backend)
     try:
-        b.prepare(32)
-        assert b._plan.options[-3:] == (qps, flags, options.get("dispatch_workers", 0))
+        for bs in (1, 32, 256):
+            b.prepare(bs)
+            assert len(b._plan.options) == 11
+            assert b._plan.options[-2:] == (4096, 2 << 20)
+        assert sizes == [(32, 2, 257, 2, 1024, 16)]
+        assert b._runtime.ranks_per_node == 16
     finally:
         b.destroy()
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "combine_reduce_qps",
+        "dispatch_workers",
+        "reduce_lane_init",
+        "combine_sparse_scan",
+        "reduce_double_buffer",
+        "combine_single_row",
+        "combine_ready_trace",
+        "dispatch_skip_empty",
+        "dispatch_lookahead",
+        "dispatch_single_row",
+        "combine_cross_expert",
+    ],
+)
+def test_retired_algorithm_switches_are_not_public_api(backend, monkeypatch, name):
+    monkeypatch.setattr(api, "_MegaRuntime", lambda *a, **kw: pytest.fail("Retired option started SHMEM"))
+    with pytest.raises(TypeError, match="unexpected keyword"):
+        hierarchical_buffer(backend, **{name: True})
+
+
+@pytest.mark.parametrize("case", ["fp8", "old-core"])
+def test_qp8_rejects_incompatible_mode_or_old_runtime_before_shmem(backend, monkeypatch, case):
+    monkeypatch.setattr(api, "_MegaRuntime", lambda *a, **kw: pytest.fail("Invalid configuration started SHMEM"))
+    if case == "old-core":
+        monkeypatch.setattr(api, "require_native", lambda _: SimpleNamespace(megamoe_combine_reduce_version=1))
+    with pytest.raises(ValueError, match="FP8xFP4|Rebuild"):
+        hierarchical_buffer(backend, mma_type="fp8xfp8" if case == "fp8" else "fp8xfp4")

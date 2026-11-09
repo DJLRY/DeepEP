@@ -1,7 +1,7 @@
 // Copyright (c) 2026, Lu Lu
 
 // CPU stage doubles around the extracted production scheduler. Readiness changes
-// during local Combine, remote progress, or polling; no scheduler is reimplemented.
+// during local Combine or polling; no scheduler is reimplemented.
 #include <cassert>
 #include <cstddef>
 #include <cstdint>
@@ -22,24 +22,6 @@ int64_t GetSystemCycle()
     return cycle();
 }
 }  // namespace AscendC
-
-struct TilingData {
-    bool hierarchicalRoce = true;
-    bool reduction = false;
-    uint32_t pipelineFlags = 0U;
-};
-bool UseHierarchicalRoce(const TilingData* tiling)
-{
-    return tiling->hierarchicalRoce;
-}
-bool UseHierarchicalCombineReduction(const TilingData* tiling)
-{
-    return tiling->hierarchicalRoce && tiling->reduction;
-}
-uint32_t HierarchicalSendJob()
-{
-    return 1U;
-}
 
 struct Fixture {
     struct AivTaskCursor {
@@ -67,10 +49,6 @@ struct Fixture {
         uint32_t moeExpertPerRank = 0;
         uint32_t tokenNum = 32U;
     } commonConfig_;
-    TilingData tiling;
-    struct {
-        TilingData* tilingData;
-    } params_{&tiling};
     struct {
         uint32_t clears = 0;
         int64_t finalWave = 999;
@@ -98,8 +76,6 @@ struct Fixture {
     uint32_t consumedShared = 0;
     uint32_t activationAdvances = 0;
     uint32_t combineAdvances = 0;
-    uint32_t remoteCalls = 0;
-    std::vector<bool> remoteForeground;
     uint32_t operationCount = 0;
     uint32_t blockJobs = 2;
     int64_t clock = 0;
@@ -107,7 +83,6 @@ struct Fixture {
     std::function<void(Fixture&, uint32_t)> afterCombine;
     std::function<void(Fixture&, uint32_t, uint32_t)> afterActivation;
     std::function<void(Fixture&)> afterDispatch;
-    std::function<bool(Fixture&)> remoteProgress;
     std::function<void(Fixture&)> onClock;
 
     void Guard()
@@ -156,7 +131,22 @@ struct Fixture {
         cursor.wave = cursor.sliceIndex / mGroupsPerWave_;
         return true;
     }
-    bool TryRunReadyActivation(const AivTaskCursor& cursor, int32_t& readySequence)
+    struct Pipeline {
+        bool enabled = true;
+        uint32_t pending = 0U;
+        std::vector<uint32_t> drains;
+        template <typename Timer>
+        void Drain(Timer&)
+        {
+            if (pending) drains.push_back(pending);
+            pending = 0U;
+        }
+    } combinePipeline_;
+    bool IsActivationReady(const AivTaskCursor& cursor, int32_t)
+    {
+        return readyTiles.count({cursor.sliceIndex, cursor.nextTile}) != 0U;
+    }
+    bool RunReadyActivation(const AivTaskCursor& cursor, int32_t& readySequence)
     {
         Guard();
         auto key = std::make_pair(cursor.sliceIndex, cursor.nextTile);
@@ -164,6 +154,7 @@ struct Fixture {
         if (readyTiles.count(key) == 0) {
             return false;
         }
+        assert(combinePipeline_.pending == 0U);
         assert(consumedTiles.insert(key).second);
         events.push_back("A" + std::to_string(key.first) + ":" + std::to_string(key.second));
         ++readySequence;
@@ -179,6 +170,7 @@ struct Fixture {
             return false;
         }
         assert(consumedCombines.insert(cursor.sliceIndex).second);
+        if (combinePipeline_.enabled) ++combinePipeline_.pending;
         events.push_back("C" + std::to_string(cursor.sliceIndex));
         if (afterCombine) {
             afterCombine(*this, cursor.sliceIndex);
@@ -188,6 +180,7 @@ struct Fixture {
     void DispatchNextExpertSlice(ExpertTokenPosition& position, uint32_t& groups, uint64_t wave)
     {
         Guard();
+        assert(combinePipeline_.pending == 0U);
         events.push_back("D" + std::to_string(position.expertIdx) + ":" + std::to_string(wave));
         ++position.expertIdx;
         ++groups;
@@ -195,30 +188,18 @@ struct Fixture {
             afterDispatch(*this);
         }
     }
-    bool TryRunSharedExpertActivation(SharedActivationCursor& cursor)
+    bool TryRunSharedExpertActivation(SharedActivationCursor& cursor, Pipeline* pipeline)
     {
         Guard();
         if (!sharedReady) {
             return false;
         }
+        pipeline->Drain(timer_);
         assert(cursor.tile == consumedShared);
         events.push_back("S" + std::to_string(cursor.tile));
         ++consumedShared;
         cursor.done = ++cursor.tile == sharedTiles;
         return true;
-    }
-    bool TryProgressRemoteCombine(bool foregroundPending = true)
-    {
-        Guard();
-        ++remoteCalls;
-        remoteForeground.push_back(foregroundPending);
-        if (!UseHierarchicalRoce(params_.tilingData) || aivJob_.jobIndex != HierarchicalSendJob()) {
-            events.push_back("R:noop");
-            return false;
-        }
-        events.push_back(remoteCalls == 1 ? "R:init" : "R:scan");
-        // Every completed local Combine offers progress, even with no ready payload.
-        return remoteProgress ? remoteProgress(*this) : false;
     }
 
     void ProcessAiv1PriorityStages(int32_t& readySequence)
@@ -265,30 +246,11 @@ void CombineReleasesMultipleTilesAndSlices()
         }
     };
     f.Run(5);
-    f.Expect({"C0", "R:init", "A0:1", "A0:3", "A0:5", "A1:0", "A1:2", "C1", "R:scan"});
-    assert(f.remoteForeground == std::vector<bool>({true, false}));
+    f.Expect({"C0", "A0:1", "A0:3", "A0:5", "A1:0", "A1:2", "C1"});
     assert(f.clock == 0);
 }
 
-void RemoteProgressRunsAfterEveryCombine()
-{
-    for (uint32_t slices : {1U, 3U}) {
-        Fixture f;
-        f.combineSlices = slices;
-        f.ReadyAllCombines();
-        f.Run(0);
-        if (slices == 1) {
-            f.Expect({"C0", "R:init"});
-        } else {
-            f.Expect({"C0", "R:init", "C1", "R:scan", "C2", "R:scan"});
-        }
-        assert(f.remoteCalls == slices);
-        assert(f.remoteForeground == std::vector<bool>(slices, false));
-        assert(f.clock == 0);
-    }
-}
-
-void SharedActivationReleasedByCombineFollowsRemoteProgress()
+void SharedActivationDrainsCombineBeforeRunning()
 {
     Fixture f;
     f.sharedExpertNum_ = 1;
@@ -296,8 +258,7 @@ void SharedActivationReleasedByCombineFollowsRemoteProgress()
     f.ReadyAllCombines();
     f.afterCombine = [](Fixture& fixture, uint32_t) { fixture.sharedReady = true; };
     f.Run(0);
-    f.Expect({"C0", "R:init", "S0", "S1", "C1", "R:scan"});
-    assert(f.remoteForeground == std::vector<bool>({true, false}));
+    f.Expect({"C0", "S0", "S1", "C1"});
 }
 
 void ExistingActivationDispatchSharedPriorityIsPreserved()
@@ -311,40 +272,7 @@ void ExistingActivationDispatchSharedPriorityIsPreserved()
     f.combineSlices = 1;
     f.ReadyAllCombines();
     f.Run(2);
-    f.Expect({"A0:1", "A0:3", "D0:0", "D1:0", "D2:1", "S0", "S1", "C0", "R:init"});
-}
-
-void UnreadyActivationAllowsRemoteProgressThenResumes()
-{
-    Fixture f;
-    f.activationPlans = {{0, 3}};
-    f.combineSlices = 2;
-    f.ReadyAllCombines();
-    f.afterCombine = [](Fixture& fixture, uint32_t slice) {
-        if (slice == 0) {
-            fixture.readyTiles.emplace(0, 0);
-        }
-    };
-    f.remoteProgress = [](Fixture& fixture) {
-        fixture.readyTiles.emplace(0, 2);
-        return true;
-    };
-    f.Run(2);
-    f.Expect({"C0", "R:init", "A0:0", "A0:2", "C1", "R:scan"});
-}
-
-void FallbackRemoteProgressCanReleaseActivation()
-{
-    Fixture f;
-    f.activationPlans = {{1, 2}};
-    f.remoteProgress = [](Fixture& fixture) {
-        fixture.ReadyAllActivationTiles();
-        return true;
-    };
-    f.Run(1);
-    f.Expect({"R:init", "A0:1"});
-    assert(f.remoteForeground == std::vector<bool>({true}));
-    assert(f.clock == 0);
+    f.Expect({"A0:1", "A0:3", "D0:0", "D1:0", "D2:1", "S0", "S1", "C0"});
 }
 
 void BackoffCanReleaseActivationAndCombine()
@@ -364,45 +292,13 @@ void BackoffCanReleaseActivationAndCombine()
         }
     };
     f.Run(2);
-    f.Expect({"R:init", "A0:1", "A1:0", "C0", "R:scan"});
+    f.Expect({"A0:1", "A1:0", "C0"});
     assert(f.clock >= GM_FLAG_POLL_BACKOFF_CYCLES);
-}
-
-void NonOwnersLeaveRemoteProgressToTheOwner()
-{
-    for (auto setting : {std::make_pair(true, 3U), std::make_pair(false, 1U), std::make_pair(false, 3U)}) {
-        Fixture f;
-        f.tiling.hierarchicalRoce = setting.first;
-        f.aivJob_.jobIndex = setting.second;
-        f.combineSlices = 2;
-        f.ReadyAllCombines();
-        f.Run(0);
-        f.Expect({"C0", "R:noop", "C1", "R:noop"});
-        assert(f.remoteCalls == 2);
-        assert(f.clock == 0);
-    }
-}
-
-void ReadyCombineCanOvertakeFutureDispatchWithoutStarvingIt()
-{
-    Fixture f;
-    f.tiling.pipelineFlags = 1024U;
-    f.aivJob_.jobIndex = 3U;
-    f.commonConfig_.moeExpertPerRank = 6;
-    f.combineSlices = 4;
-    f.ReadyAllCombines();
-    f.Run(0);
-    f.Expect({"D0:0", "D1:0", "C0", "R:noop", "D2:1", "C1", "R:noop", "D3:1", "C2", "R:noop", "D4:2", "C3", "R:noop",
-              "D5:2"});
-    // No activation remains, but early completion must still be gated while
-    // Dispatch needs this AIV (otherwise completion can wait on its own work).
-    assert(f.remoteForeground == std::vector<bool>(4U, true));
 }
 
 void UnreadyCombineDoesNotStopDispatch()
 {
     Fixture f;
-    f.tiling.pipelineFlags = 1024U;
     f.aivJob_.jobIndex = 3U;
     f.commonConfig_.moeExpertPerRank = 4;
     f.combineSlices = 2;
@@ -413,13 +309,12 @@ void UnreadyCombineDoesNotStopDispatch()
         }
     };
     f.Run(0);
-    f.Expect({"D0:0", "D1:0", "D2:1", "D3:1", "C0", "R:noop", "C1", "R:noop"});
+    f.Expect({"D0:0", "D1:0", "D2:1", "D3:1", "C0", "C1"});
 }
 
 void EarlyCombineImmediatelyYieldsToNewActivation()
 {
     Fixture f;
-    f.tiling.pipelineFlags = 1024U;
     f.aivJob_.jobIndex = 3U;
     f.commonConfig_.moeExpertPerRank = 4;
     f.combineSlices = 1;
@@ -427,31 +322,34 @@ void EarlyCombineImmediatelyYieldsToNewActivation()
     f.ReadyAllCombines();
     f.afterCombine = [](Fixture& fixture, uint32_t) { fixture.ReadyAllActivationTiles(); };
     f.Run(1);
-    f.Expect({"D0:0", "D1:0", "C0", "R:noop", "A0:0", "D2:1", "D3:1"});
+    f.Expect({"D0:0", "D1:0", "D2:1", "D3:1", "C0", "A0:0"});
 }
 
-void SingleCoreFinishesOwnCombineBeforeCompletion()
+void ConsecutiveRowsSurviveFailedProbesButYieldToActivation()
 {
     Fixture f;
-    f.gmmExecutionConfig_.blockJob.totalJobs = f.blockJobs = 1U;
-    f.combineSlices = 3U;
+    f.combinePipeline_.enabled = true;
+    f.aivJob_.jobIndex = 3U;
+    f.combineSlices = 4U;
+    f.activationPlans = {{0, 1}};
     f.ReadyAllCombines();
-    f.Run(0);
-    assert(f.remoteForeground == std::vector<bool>({true, true, false}));
+    // Also cover an activation becoming ready after wave 1 Combine starts.
+    f.afterCombine = [](Fixture& fixture, uint32_t slice) {
+        if (slice == 2U) fixture.ReadyAllActivationTiles();
+    };
+    f.Run(1);
+    assert(f.combinePipeline_.drains == std::vector<uint32_t>({3U, 1U}));
+    assert(f.combinePipeline_.pending == 0U);
+    f.Expect({"C0", "C1", "C2", "A0:0", "C3"});
 }
 
 int main()
 {
+    ConsecutiveRowsSurviveFailedProbesButYieldToActivation();
     CombineReleasesMultipleTilesAndSlices();
-    RemoteProgressRunsAfterEveryCombine();
-    SharedActivationReleasedByCombineFollowsRemoteProgress();
+    SharedActivationDrainsCombineBeforeRunning();
     ExistingActivationDispatchSharedPriorityIsPreserved();
-    UnreadyActivationAllowsRemoteProgressThenResumes();
-    FallbackRemoteProgressCanReleaseActivation();
     BackoffCanReleaseActivationAndCombine();
-    NonOwnersLeaveRemoteProgressToTheOwner();
-    ReadyCombineCanOvertakeFutureDispatchWithoutStarvingIt();
     UnreadyCombineDoesNotStopDispatch();
     EarlyCombineImmediatelyYieldsToNewActivation();
-    SingleCoreFinishesOwnCombineBeforeCompletion();
 }

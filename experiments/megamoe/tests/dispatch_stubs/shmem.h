@@ -31,7 +31,6 @@ inline uint32_t metadataMarker = 0U;
 inline uint32_t payloadCommit = 0U;
 inline uint32_t metaReady = 0U;
 inline uint32_t relayReady = 0U;
-inline uint32_t txDone = 0U;
 inline uint32_t sequence = 0U;
 inline uint32_t waits = 0U;
 inline uint32_t metadataWaits = 0U;

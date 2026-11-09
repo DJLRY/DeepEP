@@ -35,28 +35,24 @@ template <typename T> T AlignUp(T v, T a) { return CeilDiv(v, a) * a; }
         + """
 int main() {
     for (auto topology : {TOPO_TYPE_MTE, TOPO_TYPE_MTE_ROCE})
-    for (uint32_t qps : {0U, 4U, 8U})
     for (uint32_t physical : {2U, 4U, 16U, 48U, 56U, 64U})
     for (uint32_t bs = 1U; bs <= 65U; ++bs)
     for (uint32_t topk : {1U, 8U, 32U}) {
-        if (qps != 0 && (topology != TOPO_TYPE_MTE_ROCE || physical < 2 * qps)) continue;
+        if (topology == TOPO_TYPE_MTE_ROCE && physical < 28U) continue;
         MegaMoeTilingData t{};
         t.topoType = topology;
-        t.combineReduceQps = qps;
         t.blockAivNum = physical;
         t.bs = bs;
         t.topK = topk;
         t.h = 3584U;
         SetUnpermuteConfigs(t, 192U * 1024U - 256U);
         const uint32_t jobs = UnpermuteJobCount(&t);
-        assert(jobs == physical - (topology == TOPO_TYPE_MTE_ROCE ? (qps == 0 ? 1U : qps) : 0U));
+        assert(jobs == physical - (topology == TOPO_TYPE_MTE_ROCE ? 8U : 0U));
         std::vector<unsigned> owners(bs, 0U);
         for (uint32_t p = 0; p < physical; ++p) {
             const uint32_t logical = UnpermuteJobIndex(&t, p);
-            const uint32_t ownerCount = qps == 0 ? 1U : qps;
-            const uint32_t ownerParity = qps == 8 ? 0U : 1U;
             const bool expectedOwner = topology == TOPO_TYPE_MTE_ROCE &&
-                p % 2U == ownerParity && p / 2U < ownerCount;
+                p % 2U == 0U && p / 2U < 8U;
             assert(IsHierarchicalCombineOwner(&t, p) == expectedOwner);
             if (expectedOwner) assert(HierarchicalCombineLane(&t, p) == p / 2U);
             if (IsHierarchicalCombineOwner(&t, p)) {

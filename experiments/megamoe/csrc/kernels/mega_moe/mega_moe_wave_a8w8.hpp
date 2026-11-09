@@ -29,13 +29,11 @@
 #include "epilogue/block_epilogue_activation_mx_quant.hpp"
 #include "stage/mega_moe_token_quant.hpp"
 #include "stage/mega_moe_send_mask.hpp"
-#include "stage/mega_moe_hierarchical_dispatch.hpp"
 #include "stage/mega_moe_workspace_reset.hpp"
 #include "stage/mega_moe_shared_expert_input.hpp"
 #include "stage/mega_moe_token_dispatch.hpp"
 #include "stage/mega_moe_gmm1_activation.hpp"
 #include "stage/mega_moe_gmm2_combine.hpp"
-#include "stage/mega_moe_hierarchical_combine.hpp"
 #include "stage/mega_moe_unpermute.hpp"
 #include "mc2_common/quantize_functions.hpp"
 
@@ -92,22 +90,7 @@ private:
     __aicore__ inline void ProcessMoeExpertStages();
     __aicore__ inline void ProcessSharedExpertGmm2();
     __aicore__ inline void ProcessGmmPipeline();
-    __aicore__ inline bool TryProgressRemoteCombine()
-    {
-        if constexpr (g_coreType == AIV) {
-            // Physical AIV1 owns QP1 throughout Dispatch and Combine. A8W8's
-            // AIC can FIX across AIV0's full UB; AIV1 has no FIX writer and
-            // safely owns the RDMA scratch.
-            if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
-                return TryProgressHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_,
-                                                      HierarchicalRoceScratch(params_), nullptr,
-                                                      {8U, HIERARCHICAL_MAX_TOKENS * commonConfig_.topK, true, true});
-            }
-        }
-        return false;
-    }
-    __aicore__ inline void SendHierarchicalCombineSlice(const ExpertLoopState& state, uint32_t rowStart,
-                                                        uint32_t rowCount);
+
     __aicore__ inline bool IsSameExpertTokenPosition(const ExpertTokenPosition& currentPosition,
                                                      const ExpertTokenPosition& targetPosition) const;
     __aicore__ inline ExpertTokenPosition DispatchNextWave(ExpertTokenPosition& dispatchPosition);
@@ -184,7 +167,6 @@ private:
     SendMaskScratch sendMaskScratch_;
     TokenDispatchScratch<ActivationType> tokenDispatchScratch_;
     WaveCombineScratch waveCombineScratch_;
-    HierarchicalCombineProgress hierarchicalCombine_{};
     TokenUnpermuteScratch tokenUnpermuteScratch_;
 
     static constexpr uint32_t GMM1_TILE_M = L1_TILE_M_256;
@@ -693,46 +675,6 @@ __aicore__ inline ExpertTokenPosition MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTyp
 }
 
 template <TemplateMegaMoeA8W8WaveTypeClass>
-__aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::SendHierarchicalCombineSlice(
-    const ExpertLoopState& state, uint32_t rowStart, uint32_t rowCount)
-{
-    if constexpr (g_coreType == AIC) {
-        return;
-    }
-    if (GetSubBlockIdx() != 1U || rowCount == 0U) {
-        return;
-    }
-    const uint64_t globalRowStart = static_cast<uint64_t>(state.globalTokenStartIndex) + rowStart;
-    const WorkRange owned = GetWaveCombineOwnedRange(waveCombineJob_, rowCount, globalRowStart);
-    if (owned.count == 0U) {
-        return;
-    }
-    // Dispatch has already drained the current/next wave, and AIV0 owns its
-    // activation. This AIV1 therefore holds no work needed by these GMM2 producers.
-    // A complete row is required before its gateway flag can release RDMA.
-    WaitUntilGmFlagAtLeast(
-        GetTokenCombineReadyCounter(params_, state.expertIdx, rowStart),
-        static_cast<int32_t>(GetTokenCombineProducerCount(commonConfig_, waveCombineJob_, rowCount)));
-    SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
-    const auto buffers = InitWaveCombineBuffers<COMBINE_NO_QUANT>(commonConfig_, waveCombineScratch_,
-                                                                  UsePacketizedGatewayCombine(params_.tilingData));
-    // GM_ADDR is a pointer macro: qualify the pointer, not the pointed-to data.
-    GM_ADDR const output =
-        params_.workspaceInfo.gmm2MmadResPtr + globalRowStart * commonConfig_.tokenHiddenDim * sizeof(bfloat16_t);
-    uint32_t rowSequence = 0U;
-    for (uint32_t done = 0U; done < owned.count;) {
-        const uint32_t remaining = owned.count - done;
-        const uint32_t count =
-            remaining < WAVE_COMBINE_META_INFO_TOKEN_CAPACITY ? remaining : WAVE_COMBINE_META_INFO_TOKEN_CAPACITY;
-        PreloadWaveCombineMetaInfo(params_, waveCombineScratch_, globalRowStart + owned.start + done, count, 0U);
-        CombineWaveTokenRange<COMBINE_NO_QUANT>(commonConfig_, buffers, waveCombineScratch_, params_, output,
-                                                owned.start + done, count, 0U, rowSequence);
-        DrainCombineRowBuffers(rowSequence, buffers.rowBufferCount);
-        done += count;
-    }
-}
-
-template <TemplateMegaMoeA8W8WaveTypeClass>
 __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::ProcessGmm2Wave(
     ExpertTokenPosition& gmm2Position, const ExpertTokenPosition& waveEndPosition, ExpertLoopState& gmm2ExpertState,
     GMMAddrInfo& gmm2AddrInfo, GmmRuntimeState& runtimeState, int32_t& gmm2TileSequence,
@@ -801,24 +743,12 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
         if constexpr (CombineQuantMode == COMBINE_NO_QUANT) {
             tileSequence = &gmm2TileSequence;
         }
-        if (UseHierarchicalRoce(params_.tilingData)) {
-            // Legacy A8W8 combines N tiles immediately. The two-host path instead
-            // completes every N tile of this slice, then sends each BF16 row once
-            // through the common local-source/paired-gateway row sender.
-            RunGmm2ByMode<COMBINE_NO_QUANT, QuantOutType, ActivationType, Weight1Type, QuantScaleOutType, false, false,
-                          GMM1_TILE_M, TopkWeightsPrefetch, false, GMM1_INTERLEAVED, true, false>(
-                gmmExecutionConfig_, gmm2AddrInfo, gmm2WaveProblemShape, runtimeState, nullptr, isWholeExpert,
-                gmm2Position.tokenIndexInExpert);
-            NotifyTokenCombineSliceReady(params_, gmm2Position.expertIdx, gmm2Position.tokenIndexInExpert);
-            SendHierarchicalCombineSlice(gmm2ExpertState, gmm2Position.tokenIndexInExpert, waveRowCount);
-            TryProgressRemoteCombine();
-        } else {
-            RunGmm2ByMode<COMBINE_NO_QUANT, QuantOutType, ActivationType, Weight1Type, QuantScaleOutType, false, false,
-                          GMM1_TILE_M, TopkWeightsPrefetch, false, GMM1_INTERLEAVED, true,
-                          CombineQuantMode == COMBINE_NO_QUANT>(
-                gmmExecutionConfig_, gmm2AddrInfo, gmm2WaveProblemShape, runtimeState, nullptr, isWholeExpert,
-                gmm2Position.tokenIndexInExpert, &params_, tileSequence);
-        }
+
+        RunGmm2ByMode<COMBINE_NO_QUANT, QuantOutType, ActivationType, Weight1Type, QuantScaleOutType, false, false,
+                      GMM1_TILE_M, TopkWeightsPrefetch, false, GMM1_INTERLEAVED, true,
+                      CombineQuantMode == COMBINE_NO_QUANT>(gmmExecutionConfig_, gmm2AddrInfo, gmm2WaveProblemShape,
+                                                            runtimeState, nullptr, isWholeExpert,
+                                                            gmm2Position.tokenIndexInExpert, &params_, tileSequence);
 
         gmm2Position.tokenIndexInExpert = waveEndTokenIndexInExpert;
         gmm2Position.globalTokenIndex += waveRowCount;
@@ -995,7 +925,6 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
     }
     gmm1PingPongIdx_ = 0;
     ExportCompactExpertTokenCounts(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
-    TryProgressRemoteCombine();
 }
 
 template <TemplateMegaMoeA8W8WaveTypeClass>
@@ -1008,10 +937,9 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
 
     // Legacy MTE retains its world handshake. Hierarchical counts carry the input
     // epoch and Dispatch separately acquires each required gateway's payload.
-    if (!UseHierarchicalRoce(params_.tilingData)) {
-        exceptionDump_.UpdateStage(MegaMoeImpl::Stage::CROSS_RANK_SYNC_INPUT);
-        CrossRankSyncInWorldSize(params_.peermemInfo.rankSyncInWorldPtr, rankId_, worldSize_, aivJob_);
-    }
+
+    exceptionDump_.UpdateStage(MegaMoeImpl::Stage::CROSS_RANK_SYNC_INPUT);
+    CrossRankSyncInWorldSize(params_.peermemInfo.rankSyncInWorldPtr, rankId_, worldSize_, aivJob_);
 
     // Dispatch、GMM1、SwiGLU、GMM2 与 Combine 使用同一 wave 边界滚动推进。
     ProcessMoeExpertStages();
@@ -1039,19 +967,10 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
     exceptionDump_.UpdateStage(MegaMoeImpl::Stage::INPUT_PREPARE);
     QuantizeLocalTokens<QuantMode, QuantOutType, ActivationType, TopkWeightsType, TopkWeightsPrefetch>(
         aivJob_, commonConfig_, params_, quantProcessConfig_, quantProcessScratch_);
-    if (UseHierarchicalRoce(params_.tilingData)) {
-        if constexpr (g_coreType == AIV) {
-            // The QP owner can read every local quantized row, independently of
-            // which AIV produced it. Drain all quant producers before posting.
-            PipeBarrier<PIPE_ALL>();
-            SyncAll<true>();
-        }
-        GatherAndPostHierarchicalDispatch(aivJob_, commonConfig_, params_, g_winRankAddr_, sendMaskConfig_,
-                                          sendMaskScratch_);
-    } else {
-        GatherAndSendExpertCompactRoutes(aivJob_, commonConfig_, params_, g_winRankAddr_, sendMaskConfig_,
-                                         sendMaskScratch_);
-    }
+
+    GatherAndSendExpertCompactRoutes(aivJob_, commonConfig_, params_, g_winRankAddr_, sendMaskConfig_,
+                                     sendMaskScratch_);
+
     ResetSyncStatus<TopkWeightsPrefetch>(aivJob_, params_, resetBatchElementCount_, resetTensor_);
     if (sharedExpertNum_ > 0) {
         // 可选：为共享专家拆分连续布局的输入数据与 scale。
@@ -1062,16 +981,8 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
             PipeBarrier<PIPE_ALL>();
         }
     }
-    if (UseHierarchicalRoce(params_.tilingData)) {
-        FinishHierarchicalDispatch(aivJob_, commonConfig_, params_);
-        AdvanceInputEpochLocally(params_.peermemInfo.rankSyncInWorldPtr, aivJob_);
-        if constexpr (g_coreType == AIV) {
-            PipeBarrier<PIPE_ALL>();
-        }
-    }
-    // Dispatch has posted its ordered commit and acquired the incoming commit
-    // before this barrier. HNS defers outbound CQ retirement until kernel exit;
-    // physical AIV1 remains the only QP1/CQ1 owner throughout both phases.
+
+    // Finish input writes before any local GMM/activation consumer starts.
     SyncAll<false>();  // AIC 等待 AIV 完成输入准备与 flag 清零后再进入计算
 
     ProcessGmmPipeline();
@@ -1079,39 +990,14 @@ __aicore__ inline void MegaMoeA8W8Wave<TemplateMegaMoeA8W8WaveTypeFunc>::Process
     // 阶段 3：等待所有 rank 的 Combine 发送完成，再执行本卡 Unpermute。
     if constexpr (g_coreType == AIV) {
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::CROSS_RANK_SYNC_OUTPUT);
-        if (UseHierarchicalRoce(params_.tilingData)) {
-            // Every routed producer and Dispatch reader on this host must finish
-            // before a commit can allow the paired source to reuse its buffers.
-            CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
-            if (aivJob_.jobIndex == HierarchicalSendJob()) {
-                auto* scratch = HierarchicalRoceScratch(params_);
-                DrainHierarchicalCombine(commonConfig_, params_, hierarchicalCombine_, scratch);
-                RocePublishCommit(reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(
-                                      params_.peermemInfo, HierarchicalSignal::CombineCommit)),
-                                  reinterpret_cast<GM_ADDR>(
-                                      HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::Sequence)),
-                                  HierarchicalGateway(rankId_), scratch, nullptr, AscendTimer::RdmaPhase::Combine);
-                RoceWaitCommit(HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::CombineCommit),
-                               params_.tilingData->hierarchicalSequence, nullptr, AscendTimer::RdmaPhase::Combine,
-                               HierarchicalGateway(rankId_), scratch);
-            }
-            PipeBarrier<PIPE_ALL>();
-            SyncAll<true>();
-        } else {
-            CrossRankSyncInWorldSize(params_.peermemInfo.rankSyncInWorldPtr, rankId_, worldSize_, aivJob_);
-        }
+
+        CrossRankSyncInWorldSize(params_.peermemInfo.rankSyncInWorldPtr, rankId_, worldSize_, aivJob_);
+
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::UNPERMUTE);
-        if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalSendJob()) {
-            // Output readiness is already acquired. Other AIVs own all output
-            // rows and overlap their Unpermute with this owner's final quiet.
-            RoceFinishOutstanding(HierarchicalGateway(rankId_), HierarchicalRoceScratch(params_), nullptr,
-                                  AscendTimer::RdmaPhase::Combine);
-            PublishHierarchicalLocalSignal(params_, HierarchicalSignal::TxDone);
-        } else {
-            UnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();
-            UnpermuteTokens<CombineQuantMode, TopkWeightsType, TopkWeightsPrefetch, GMM1_TILE_M>(
-                tokenUnpermuteConfig_, commonConfig_, params_, tokenUnpermuteScratch_, unpermuteBufferConfig);
-        }
+
+        UnpermuteBufferConfig unpermuteBufferConfig = InitTokenUnpermuteBuffers();
+        UnpermuteTokens<CombineQuantMode, TopkWeightsType, TopkWeightsPrefetch, GMM1_TILE_M>(
+            tokenUnpermuteConfig_, commonConfig_, params_, tokenUnpermuteScratch_, unpermuteBufferConfig);
     }
     // 恢复入口时保存的溢出模式。
     SetCtrlSpr<OVERFLOW_MODE_CTRL, OVERFLOW_MODE_CTRL>(oriOverflowMode);

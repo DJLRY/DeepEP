@@ -31,7 +31,7 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 10:
+    if getattr(extension, "api_protocol", None) != 11:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
@@ -81,16 +81,6 @@ class SymmBuffer:
         *,
         ranks_per_node: int = 0,
         timeout: int = 120,
-        combine_reduce_qps: int = 0,
-        dispatch_workers: int = 0,
-        reduce_lane_init: bool = False,
-        combine_sparse_scan: bool = False,
-        reduce_double_buffer: bool = False,
-        combine_single_row: bool = False,
-        combine_ready_trace: bool = False,
-        dispatch_skip_empty: bool = False,
-        dispatch_lookahead: bool = False,
-        dispatch_single_row: bool = False,
     ):
         import torch
         import torch.distributed as dist
@@ -109,46 +99,6 @@ class SymmBuffer:
             integer("world_size", size, 2, 128)
             integer("ranks_per_node", ranks_per_node, 0, size)
             integer("timeout", timeout, 1, 300)
-            integer("combine_reduce_qps", combine_reduce_qps, 0, 8)
-            integer("dispatch_workers", dispatch_workers, 0, 128)
-            if any(
-                type(value) is not bool
-                for value in (
-                    reduce_lane_init,
-                    combine_sparse_scan,
-                    reduce_double_buffer,
-                    combine_single_row,
-                    combine_ready_trace,
-                    dispatch_skip_empty,
-                    dispatch_lookahead,
-                    dispatch_single_row,
-                )
-            ):
-                raise TypeError("Pipeline switches must be bool")
-            if combine_reduce_qps not in (0, 4, 8):
-                raise ValueError("combine_reduce_qps must be 0, 4 or 8")
-            if combine_reduce_qps and (size != 32 or ranks_per_node != 16 or mma_type != "fp8xfp4"):
-                raise ValueError("Gateway weighted reduction requires EP32, ranks_per_node=16 and FP8xFP4")
-            if (
-                dispatch_workers
-                or reduce_lane_init
-                or combine_sparse_scan
-                or reduce_double_buffer
-                or combine_single_row
-                or combine_ready_trace
-                or dispatch_skip_empty
-                or dispatch_lookahead
-                or dispatch_single_row
-            ) and (size != 32 or ranks_per_node != 16 or mma_type != "fp8xfp4"):
-                raise ValueError("Pipeline experiments require EP32, ranks_per_node=16 and FP8xFP4")
-            if reduce_lane_init and not combine_reduce_qps:
-                raise ValueError("reduce_lane_init requires combine_reduce_qps=4 or 8")
-            if combine_sparse_scan and combine_reduce_qps:
-                raise ValueError("combine_sparse_scan requires combine_reduce_qps=0")
-            if (reduce_double_buffer or combine_ready_trace) and not combine_reduce_qps:
-                raise ValueError("reduce_double_buffer and ready_trace require combine_reduce_qps=4 or 8")
-            if combine_single_row and combine_reduce_qps:
-                raise ValueError("combine_single_row requires combine_reduce_qps=0")
             if hidden % 64 or intermediate_hidden % 128:
                 raise ValueError("hidden must be divisible by 64; intermediate_hidden by 128")
             if activation != "swiglu" or mma_type not in {"fp8xfp4", "fp8xfp8"}:
@@ -160,6 +110,8 @@ class SymmBuffer:
             if ranks_per_node and size % ranks_per_node:
                 raise ValueError("ranks_per_node must divide EP (contiguous node-major ranks)")
             if ranks_per_node == 16 and size > 16:
+                if mma_type != "fp8xfp4":
+                    raise ValueError("MTE+RoCE MegaMoE requires FP8xFP4 weights")
                 if size != 32:
                     raise ValueError("MTE+RoCE MegaMoE requires EP32 on two 16-rank hosts")
         except (TypeError, ValueError) as failure:
@@ -176,23 +128,11 @@ class SymmBuffer:
             activation,
             ranks_per_node,
             timeout,
-            combine_reduce_qps,
-            dispatch_workers,
-            reduce_lane_init,
-            combine_sparse_scan,
-            reduce_double_buffer,
-            combine_single_row,
-            combine_ready_trace,
-            dispatch_skip_empty,
-            dispatch_lookahead,
-            dispatch_single_row,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
         capacity = int(
-            ext.buffer_size(
-                size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, ranks_per_node, combine_reduce_qps
-            )
+            ext.buffer_size(size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, ranks_per_node)
         )
         self._lock = threading.Lock()
         self._device = torch.device(f"npu:{npu_api().current_device()}")
@@ -202,22 +142,12 @@ class SymmBuffer:
         self.hidden, self.intermediate_hidden = hidden, intermediate_hidden
         self.num_shared_experts, self.mma_type = num_shared_experts, mma_type
         self.ranks_per_node = ranks_per_node
-        self.combine_reduce_qps = combine_reduce_qps
-        self.dispatch_workers = dispatch_workers
-        self.reduce_lane_init = reduce_lane_init
-        self.combine_sparse_scan = combine_sparse_scan
-        self.reduce_double_buffer = reduce_double_buffer
-        self.combine_single_row = combine_single_row
-        self.combine_ready_trace = combine_ready_trace
-        self.dispatch_skip_empty = dispatch_skip_empty
-        self.dispatch_lookahead = dispatch_lookahead
-        self.dispatch_single_row = dispatch_single_row
         self._hierarchical_roce = ranks_per_node == 16 and size > 16
         self._sequence = 0
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
         try:
-            if combine_reduce_qps and getattr(require_native("MegaMoE"), "megamoe_combine_reduce_version", 0) != 1:
+            if self._hierarchical_roce and getattr(require_native("MegaMoE"), "megamoe_combine_reduce_version", 0) != 2:
                 raise RuntimeError("Rebuild the complete wheel for MegaMoE weighted reduction and owned QPs")
             self.allocate_inputs()
         except Exception as failure:
@@ -225,8 +155,6 @@ class SymmBuffer:
         # 输入分配失败先通知所有 rank，再进入 SHMEM，避免其他 rank 已在建链等待。
         collective_check(group, "input allocation", error)
         runtime_options = dict(ranks_per_node=ranks_per_node)
-        if combine_reduce_qps:
-            runtime_options["roce_app_qps"] = combine_reduce_qps
         self._runtime = _MegaRuntime(group, capacity, timeout, **runtime_options)
 
     def allocate_inputs(self):
@@ -275,16 +203,6 @@ class SymmBuffer:
             ext.ffts_config(),
             address,
             runtime.native.capacity,
-            self.combine_reduce_qps,
-            (int(self.reduce_lane_init) << 1)
-            | (int(self.combine_sparse_scan) << 2)
-            | (int(self.reduce_double_buffer) << 8)
-            | (int(self.combine_single_row) << 7)
-            | (int(self.combine_ready_trace) << 6)
-            | (int(self.dispatch_skip_empty) << 9)
-            | (int(self.dispatch_lookahead) << 10)
-            | (int(self.dispatch_single_row) << 11),
-            self.dispatch_workers,
         )
         self._plan_bs = bs
 

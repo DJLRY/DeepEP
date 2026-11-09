@@ -171,9 +171,6 @@ __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, cons
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetPayloadCommit)),
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence)), gateway,
         HierarchicalRoceScratch(params), timer, AscendTimer::RdmaPhase::DispatchPayload);
-#if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-    PublishHierarchicalLocalSignal(params, HierarchicalSignal::TxDone);
-#endif
     // Both hosts post before waiting, so this receive cannot depend on Relay,
     // count preparation or another owner's broadcast. Empty/all-local routing
     // still takes this path. Acquire the receive before forwarding its epoch.

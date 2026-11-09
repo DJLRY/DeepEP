@@ -85,10 +85,6 @@ inline void WriteGmByPassDCache(int32_t* address, int32_t value)
         Check(metadataWaits >= 1U && RoceTest::mteCanRead,
               "metadata readiness preceded the independent receive acquire");
     }
-    if (offset == txDone) {
-        Check(queued.empty() && ReadWord(remote, payloadCommit) == sequence,
-              "TxDone preceded outgoing payload completion");
-    }
     std::memcpy(address, &value, sizeof(value));
 }
 inline int32_t ReadGmByPassDCache(const int32_t* address)
@@ -168,7 +164,7 @@ void SyncAll()
 using namespace MegaMoeImpl;
 
 void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidden, uint32_t topk,
-                   std::string_view pattern, uint32_t invocation = 257U, uint32_t reduceQps = 0U)
+                   std::string_view pattern, uint32_t invocation = 257U)
 {
     using namespace DispatchTest;
     MegaMoeTilingData t{};
@@ -184,10 +180,9 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     t.groupedMatmulMode = GROUPED_MATMUL_MODE_A8W4;
     t.roceScratchUbOffset = kScratchOffset;
     t.hierarchicalSequence = invocation;
-    t.combineReduceQps = reduceQps;
     Check(UseDecodeRailRouting(&t), "fixture requires the production decode rail layout");
-    const PeermemSizeParams sizes{capacity,           topk, hidden, 12U,      32U, 2U, 1U, false, false,
-                                  TOPO_TYPE_MTE_ROCE, true, 16U,    reduceQps};
+    const PeermemSizeParams sizes{capacity,           topk, hidden, 12U, 32U, 2U, 1U, false, false,
+                                  TOPO_TYPE_MTE_ROCE, true, 16U};
     const auto heapBytes = static_cast<size_t>(CalcPeermemLeastSize(sizes));
     // Append compact mapped ready regions for the other fifteen peers.
     // Only their ready slots are accessed by this fixture.
@@ -226,7 +221,6 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     payloadCommit = flagOffset(HierarchicalSignal::NetPayloadCommit);
     metaReady = flagOffset(HierarchicalSignal::MetaReady);
     relayReady = flagOffset(HierarchicalSignal::RelayPayloadReady);
-    txDone = flagOffset(HierarchicalSignal::TxDone);
     const auto writeWord = [&](uint32_t offset, uint32_t value) {
         std::memcpy(local.data() + offset, &value, sizeof(value));
     };
@@ -284,13 +278,13 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     Check(packCalls == 1U && posts.front().source == messageStart && posts.front().destination == messageStart &&
               posts.front().bytes == messageBytes,
           "metadata was not the first Put");
-    if (reduceQps != 0U) {
-        Check(std::memcmp(local.data() + messageStart, weights.data(), weights.size() * sizeof(float)) == 0,
-              "packed weights do not match the source top-k probabilities");
-        Check(std::all_of(local.begin() + messageStart + weights.size() * sizeof(float), local.begin() + rail,
-                          [](uint8_t b) { return b == 0x7BU; }),
-              "packer overwrote weight padding");
-    }
+
+    Check(std::memcmp(local.data() + messageStart, weights.data(), weights.size() * sizeof(float)) == 0,
+          "packed weights do not match the source top-k probabilities");
+    Check(std::all_of(local.begin() + messageStart + weights.size() * sizeof(float), local.begin() + rail,
+                      [](uint8_t b) { return b == 0x7BU; }),
+          "packer overwrote weight padding");
+
     Check(posts.back().source == source && posts.back().destination == destination && posts.back().bytes == activeBytes,
           "payload range did not follow metadata on the same owned QP");
     for (uint32_t end = 512U; end <= railBytes; end += 512U) {
@@ -376,7 +370,6 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     DeliverPosted();
     Check(queued.size() == 3U, "remote visibility incorrectly retired CQ entries");
     RoceFinishOutstanding(peer, HierarchicalRoceScratch(params));
-    PublishHierarchicalLocalSignal(params, HierarchicalSignal::TxDone);
 #else
     RoceFinishOutstanding(peer, HierarchicalRoceScratch(params));
 #endif
@@ -392,8 +385,7 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     Check(quiets == 4U && (RoceTest::operations == std::vector<int>{1, 2, 1, 2, 1, 2, 1, 2}),
           "XSCALE metadata/payload phase completion order changed");
 #endif
-    Check(ReadWord(local, txDone) == sequence && ReadWord(local, metaReady) == sequence,
-          "outgoing completion lost independent metadata readiness");
+    Check(ReadWord(local, metaReady) == sequence, "outgoing completion lost independent metadata readiness");
     std::fill_n(local.data() + source, activeBytes, uint8_t{0xDDU});
     std::fill_n(local.data() + rail, railBytes, uint8_t{0xCCU});
     Check(remote == expected, "completed receive still referenced the reusable source");
@@ -417,11 +409,11 @@ int main()
             CheckDispatch(rank, 1U, 64U, 3584U, 32U, "local");
             CheckDispatch(rank, 32U, 64U, 3584U, 8U, "mixed", 0x80000101U);
             CheckDispatch(rank, 7U, 64U, 3584U, 8U, "last", 0xffffffffU);
-            for (uint32_t qps : {4U, 8U}) {
-                CheckDispatch(rank, 32U, 64U, 3584U, 8U, "mixed", 257U, qps);
-                CheckDispatch(rank, 7U, 32U, 1024U, 1U, "remote", 0xffffffffU, qps);
-                CheckDispatch(rank, 1U, 64U, 3584U, 32U, "local", 257U, qps);
-                CheckDispatch(rank, 256U, 256U, 1024U, 32U, "last", 257U, qps);
+            {
+                CheckDispatch(rank, 32U, 64U, 3584U, 8U, "mixed", 257U);
+                CheckDispatch(rank, 7U, 32U, 1024U, 1U, "remote", 0xffffffffU);
+                CheckDispatch(rank, 1U, 64U, 3584U, 32U, "local", 257U);
+                CheckDispatch(rank, 256U, 256U, 1024U, 32U, "last", 257U);
             }
         }
         // Negative control: the asynchronous double must detect early source
