@@ -874,6 +874,13 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
     }
     SendAndQuantBuffInit();
     if constexpr (g_coreType == AIV) {
+        if (UseHierarchicalRoce(params_.tilingData) && aivJob_.jobIndex == HierarchicalPackJob()) {
+            // All eight senders may publish commits after the quant barrier,
+            // independently of metadata packing. Never rewrite this source later.
+            PublishHierarchicalLocalSignal(params_, HierarchicalSignal::Sequence);
+        }
+    }
+    if constexpr (g_coreType == AIV) {
         timer_.End(AscendTimer::AIV_INPUT_BUFFER_INIT);
         timer_.Start(AscendTimer::AIV_QUANT);
     }

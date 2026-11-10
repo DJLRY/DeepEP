@@ -19,6 +19,7 @@ struct Write {
     uint32_t source;
     uint32_t bytes;
     std::vector<uint8_t> sourceAtPost;
+    uint32_t qp;
     bool delivered = false;
 };
 inline std::vector<uint8_t> local;
@@ -39,6 +40,7 @@ inline uint32_t packCalls = 0U;
 inline uint32_t relayCalls = 0U;
 inline uint32_t receiveLeaderJob = 0U;
 inline uint32_t progressCalls = 0U;
+inline bool handoff = false;
 inline std::function<void()> completePacking;
 inline std::function<void()> completeIncomingPayload;
 constexpr uint32_t kScratchOffset = 4096U;
@@ -64,8 +66,11 @@ inline uint32_t ReadWord(const std::vector<uint8_t>& heap, uint32_t offset)
 
 inline void CheckResource(uint32_t actualPeer, uint32_t qp, uint8_t* ub, uint32_t event)
 {
-    Check(RoceTest::blockIndex == 1 && RoceTest::subBlockIndex == 1, "QP owner is not physical AIV1");
-    Check(actualPeer == peer && qp == 1U && reinterpret_cast<uintptr_t>(ub) == kScratchOffset && event == 7U,
+    Check(qp >= 1U && qp <= 8U, "invalid application QP");
+    Check(RoceTest::blockIndex == static_cast<int>(2U * (qp - 1U) + (handoff ? 0U : 1U)) &&
+              RoceTest::subBlockIndex == (handoff ? 0 : 1),
+          "wrong QP owner across input barrier");
+    Check(actualPeer == peer && reinterpret_cast<uintptr_t>(ub) == kScratchOffset && event == 7U,
           "Dispatch used an unowned peer/QP/UB/event");
 }
 
@@ -81,9 +86,14 @@ inline void Deliver(Write& item)
 
 // Complete WQEs in an order compatible with their terminal SO packets, without
 // retiring CQEs. Tests separately deliver metadata while delaying payload.
-inline void DeliverPosted()
+inline void DeliverPosted(uint32_t qp = 0U)
 {
-    for (auto& item : queued) Deliver(item);
+    for (auto& item : queued)
+        if (qp == 0U || item.qp == qp) Deliver(item);
+}
+inline bool IsPayloadCommit(uint32_t offset)
+{
+    return offset >= payloadCommit && offset < payloadCommit + 8U * 512U && (offset - payloadCommit) % 512U == 0U;
 }
 }  // namespace DispatchTest
 
@@ -96,13 +106,14 @@ void aclshmemx_roce_qp_put_nbi(T* destination, T* source, T* scratch, uint32_t c
     CheckResource(static_cast<uint32_t>(peer), qp, scratch, event);
     const uint32_t destinationOffset = Offset(destination, count);
     const uint32_t sourceOffset = Offset(source, count);
-    if (destinationOffset == metaCommit || destinationOffset == payloadCommit) {
+    if (destinationOffset == metaCommit || IsPayloadCommit(destinationOffset)) {
         Check(count == sizeof(uint32_t), "commit was not a single-fragment epoch");
 #if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
-        Check(queued.empty(), "XSCALE commit overtook unfinished payload");
+        Check(std::none_of(queued.begin(), queued.end(), [=](const Write& w) { return w.qp == qp; }),
+              "XSCALE commit overtook unfinished payload");
 #endif
     }
-    Write operation{destinationOffset, sourceOffset, count, std::vector<uint8_t>(source, source + count)};
+    Write operation{destinationOffset, sourceOffset, count, std::vector<uint8_t>(source, source + count), qp};
     posts.push_back(operation);
     queued.push_back(operation);
     RoceTest::operations.push_back(1);
@@ -114,8 +125,9 @@ void aclshmemx_roce_qp_quiet(uint32_t peer, uint32_t qp, T* scratch, uint32_t ev
     static_assert(sizeof(T) == 1U);
     using namespace DispatchTest;
     CheckResource(peer, qp, scratch, event);
-    DeliverPosted();
-    queued.clear();
+    DeliverPosted(qp);
+    queued.erase(std::remove_if(queued.begin(), queued.end(), [=](const Write& w) { return w.qp == qp; }),
+                 queued.end());
     ++quiets;
     RoceTest::operations.push_back(2);
 }
@@ -139,14 +151,12 @@ inline int aclshmem_int32_test(int32_t* address, int comparison, int32_t value)
     }
     const auto offset = Offset(reinterpret_cast<uint8_t*>(address), sizeof(int32_t));
     Check(comparison == ACLSHMEM_CMP_EQ && static_cast<uint32_t>(value) == sequence, "incorrect invocation wait");
-    if (offset == payloadCommit && ReadWord(local, offset) != sequence && completeIncomingPayload) {
-        auto arrive = std::move(completeIncomingPayload);
-        completeIncomingPayload = nullptr;
-        arrive();
+    if (IsPayloadCommit(offset) && ReadWord(local, offset) != sequence && completeIncomingPayload) {
+        completeIncomingPayload();
         return 0;
     }
     if (ReadWord(local, offset) != sequence) return 0;
-    if (offset == payloadCommit) ++waits;
+    if (IsPayloadCommit(offset)) ++waits;
     if (offset == metadataMarker || offset == metaCommit) ++metadataWaits;
     RoceTest::signalObserved = true;
     return 1;
@@ -155,9 +165,9 @@ inline int aclshmem_int32_test(int32_t* address, int comparison, int32_t value)
 inline int32_t aclshmem_signal_wait_until(int32_t* address, int comparison, int32_t value)
 {
     const auto offset = DispatchTest::Offset(reinterpret_cast<uint8_t*>(address), sizeof(int32_t));
-    DispatchTest::Check(offset == DispatchTest::metaCommit || offset == DispatchTest::payloadCommit,
+    DispatchTest::Check(offset == DispatchTest::metaCommit || DispatchTest::IsPayloadCommit(offset),
                         "XSCALE receiver did not wait on an independent commit");
-    if (offset == DispatchTest::payloadCommit && DispatchTest::completeIncomingPayload)
+    if (DispatchTest::IsPayloadCommit(offset) && DispatchTest::completeIncomingPayload)
         aclshmem_int32_test(address, comparison, value);  // first failed poll, then arrival
     DispatchTest::Check(aclshmem_int32_test(address, comparison, value) != 0, "receiver accepted a stale invocation");
     return value;

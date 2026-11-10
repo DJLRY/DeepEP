@@ -71,6 +71,7 @@ DYNAMIC_NAMES = [
     "AIV_COMBINE_ASYNC",
     "AIV_COMBINE_READY",
     "AIV_COMBINE_SYNC",
+    "AIV_PAYLOAD_ALL_LANES_WAIT",
 ]
 
 RDMA_PHASES = ("dispatch_meta", "dispatch_payload", "combine")
@@ -320,19 +321,41 @@ def task_metadata(raw, core_id, logical_index):
         if not (0 <= source < 32 and gateway == (source + 16) % 32 and 0 < second <= mask):
             raise ValueError(f"invalid gateway wait metadata: core={core_id}, slot={dynamic_index}")
         return dict(granularity="startup_dependency", source_rank=source, gateway_rank=gateway, sequence=second)
+    if family == "AIV_PAYLOAD_ALL_LANES_WAIT":
+        missing, polls = first >> 32, first & mask
+        if missing > 255 or polls == 0 or not 0 < second <= mask:
+            raise ValueError("invalid payload lane wait metadata")
+        return dict(
+            granularity="startup_dependency",
+            initial_missing_mask=missing,
+            initial_missing_lanes=[i for i in range(8) if missing & (1 << i)],
+            poll_rounds=polls,
+            sequence=second,
+            lane_count=8,
+        )
     if family.startswith("AIV_RDMA_"):
         peer = ((first >> 32) & mask) - 1
-        phase = (first & mask) - 1
-        kind = (second >> 32) & mask
-        if not (0 <= peer < 32 and 0 <= phase < len(RDMA_PHASES) and kind in (0, 1)):
+        phase = (first & 255) - 1
+        row_count = (first & mask) >> 8
+        kind = (second >> 32) & 255
+        qp = (second >> 40) & 255
+        row_start = (second >> 48) & 65535
+        if not (0 <= peer < 32 and 0 <= phase < len(RDMA_PHASES) and kind in (0, 1) and qp <= 8):
             raise ValueError(f"invalid RDMA metadata: core={core_id}, slot={dynamic_index}")
-        return dict(
+        result = dict(
             granularity="rdma",
             peer_rank=peer,
             phase=RDMA_PHASES[phase],
             kind="commit" if kind else "data",
             bytes=second & mask,
         )
+        if qp:
+            result["qp"] = qp
+            if phase == 1:
+                result["lane"] = qp - 1
+        if row_count:
+            result.update(row_start=row_start, row_count=row_count, row_end=row_start + row_count)
+        return result
     if first == second == 0:
         return {}
     expert = ((first >> 32) & mask) - 1

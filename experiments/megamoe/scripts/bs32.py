@@ -1,6 +1,6 @@
 # Copyright (c) 2026, Lu Lu
 
-"""Persist per-host settings and build, check, profile or trace the two-host EP32 BS32 case."""
+"""Persist per-host settings and build, check, profile or trace the two-host EP32 case (BS32 by default)."""
 
 import argparse
 from collections import deque
@@ -244,7 +244,7 @@ import torch, torch_npu, deep_ep
 from deep_ep._native import require_native
 import deep_ep_experimental.megamoe._C as megamoe
 require_native('BS32 preflight')
-if getattr(megamoe, 'api_protocol', None) != 11:
+if getattr(megamoe, 'api_protocol', None) != 12:
     raise RuntimeError('Installed MegaMoE protocol is outdated; run run_bs32.sh build on both hosts first')
 info = json.loads(files('deep_ep').joinpath('_build_info.json').read_text())
 if Path(deep_ep.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()):
@@ -405,11 +405,11 @@ def trace_summary(run_dir, case, local_timer_ranks):
     summary = (
         "\n".join(
             [
-                "[TRACE SUMMARY] EP32 BS32; FP8 input / FP4 weights; balanced routing",
+                f"[TRACE SUMMARY] EP32 BS{case['bs_values'][0]}; FP8 input / FP4 weights; balanced routing",
                 f"Warmup calls: {case['warmup']}; trace batch calls: {case['iters']}; only the final call is instrumented.",
                 "Performance profiler disabled; run the perf action for a performance baseline.",
                 f"Local traced ranks: {local_timer_ranks}",
-                f"Local timer files: {run_dir / 'bs_32' / 'timer'}",
+                f"Local timer files: {run_dir / ('bs_' + str(case['bs_values'][0])) / 'timer'}",
                 "Trace time is relative to each rank; merged ranks are not globally clock-aligned.",
             ]
         )
@@ -449,8 +449,15 @@ def dispatch(
     include_wait=False,
     perf_method="legacy",
     extra_bs=False,
+    bs=None,
     print_text=True,
 ):
+    if bs is not None and (
+        type(bs) is not int or not 1 <= bs <= 256 or action not in ("run", "golden", "perf", "trace")
+    ):
+        raise ValueError("--bs requires run/golden/perf/trace and an integer in [1,256]")
+    if bs is not None and extra_bs:
+        raise ValueError("--bs and --extra-bs are mutually exclusive")
     if extra_bs and action != "perf":
         raise ValueError("--extra-bs requires perf")
     if platform.system() != "Linux":
@@ -477,6 +484,8 @@ def dispatch(
         return
     if extra_bs:
         preflight(config, env, max_bs=max(EXTRA_PERF_BATCHES))
+    elif bs is not None:
+        preflight(config, env, max_bs=bs)
     else:
         preflight(config, env)
     directory = Path(config["case_dir"])
@@ -485,6 +494,8 @@ def dispatch(
     prefix = f"{action}_node_" if sampling else "node_"
     run_dir = Path(tempfile.mkdtemp(prefix=f"{prefix}{config['node_rank']}_", dir=directory))
     case = dict(CASE)
+    if bs is not None:
+        case["bs_values"] = [bs]
     if extra_bs:
         case["bs_values"] = [32, *EXTRA_PERF_BATCHES]
     if sampling:
@@ -553,7 +564,7 @@ def dispatch(
                 "-I",
                 "-m",
                 "deep_ep_experimental.megamoe.timer",
-                str(run_dir / "bs_32" / "timer"),
+                str(run_dir / f"bs_{case['bs_values'][0]}" / "timer"),
                 "--ranks",
                 ",".join(map(str, local_ranks)),
                 *(["--include-wait"] if include_wait else []),
@@ -592,6 +603,7 @@ def main(argv=None, *, print_text=True):
         action="store_true",
         help="perf only: after BS32, also measure BS1,4,8,16,256 with identical performance options",
     )
+    parser.add_argument("--bs", type=int, help="run/golden/perf/trace: tokens per rank in [1,256] (default: 32)")
     parser.add_argument("--timer", action="store_true", help="build only: enable device timer support for trace")
     waits = parser.add_mutually_exclusive_group()
     waits.add_argument(
@@ -629,6 +641,11 @@ def main(argv=None, *, print_text=True):
             help="configure only: persist this setting",
         )
     args = parser.parse_args(argv)
+    if args.bs is not None:
+        if args.action not in ("run", "golden", "perf", "trace") or not 1 <= args.bs <= 256:
+            parser.error("--bs requires run/golden/perf/trace and an integer in [1,256]")
+        if args.extra_bs:
+            parser.error("--bs and --extra-bs are mutually exclusive")
     if args.action != "configure" and any(getattr(args, name) is not None for name in FIELDS):
         parser.error("Settings may only be changed with configure")
     if args.rebuild_shmem and args.action != "build":
@@ -665,6 +682,8 @@ def main(argv=None, *, print_text=True):
         print(json.dumps(config, indent=2, ensure_ascii=False))
         return
     options = dict(rebuild_shmem=args.rebuild_shmem, errors_only=args.errors_only)
+    if args.bs is not None:
+        options["bs"] = args.bs
     if args.extra_bs:
         options["extra_bs"] = True
     if args.timer:

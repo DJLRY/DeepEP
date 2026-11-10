@@ -61,6 +61,8 @@ HOST_DEVICE bool UseHierarchicalCombineReduction(const MegaMoeTilingData* t)
 }
 
 constexpr uint32_t HIERARCHICAL_COMBINE_QPS = deepep::megamoe_config::COMBINE_QPS;
+constexpr uint32_t HIERARCHICAL_DISPATCH_QPS = deepep::megamoe_config::DISPATCH_QPS;
+static_assert(HIERARCHICAL_DISPATCH_QPS == HIERARCHICAL_COMBINE_QPS);
 constexpr uint32_t HIERARCHICAL_DISPATCH_WORKERS = deepep::megamoe_config::DISPATCH_WORKERS;
 constexpr uint32_t HIERARCHICAL_RANKS_PER_HOST = 16U;
 constexpr uint32_t HIERARCHICAL_WORLD_SIZE = 32U;
@@ -81,6 +83,7 @@ enum class HierarchicalSignal : uint32_t {
     NetMetaCommit,
     MetaReady,
     NetPayloadCommit,
+    NetPayloadCommitLast = NetPayloadCommit + HIERARCHICAL_DISPATCH_QPS - 1U,
     RelayPayloadReady,
     Count
 };
@@ -106,6 +109,18 @@ HOST_DEVICE uint32_t HierarchicalSendJob()
     return 1U;
 }
 
+// Input QP1..8 belong to g0..g7 AIV1 until the all-core input barrier.
+HOST_DEVICE uint32_t HierarchicalDispatchLane(uint32_t physicalJob)
+{
+    const uint32_t lane = physicalJob / 2U;
+    return (physicalJob & 1U) != 0U && lane < HIERARCHICAL_DISPATCH_QPS ? lane : HIERARCHICAL_DISPATCH_QPS;
+}
+
+HOST_DEVICE uint32_t HierarchicalPayloadTokenBegin(uint32_t tokens, uint32_t lane)
+{
+    return tokens * lane / HIERARCHICAL_DISPATCH_QPS;
+}
+
 HOST_DEVICE uint32_t HierarchicalCombineOwnerCount(const MegaMoeTilingData* t)
 {
     (void)t;
@@ -118,8 +133,7 @@ HOST_DEVICE bool UseAiv0CombineOwners(const MegaMoeTilingData* t)
 }
 
 // QP=8 uses g0..g7 AIV0 only after all of each owner's prologues have drained.
-// Dispatch uses physical job 1; the existing
-// input barrier transfers QP1 to the Combine owner before any GMM can start.
+// The input barrier transfers QP1..8 from g0..g7 AIV1 to these owners.
 HOST_DEVICE uint32_t HierarchicalCombineLane(const MegaMoeTilingData* t, uint32_t physicalJob)
 {
     const uint32_t count = HierarchicalCombineOwnerCount(t);

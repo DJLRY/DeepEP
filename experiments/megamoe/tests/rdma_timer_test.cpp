@@ -81,20 +81,26 @@ int main()
             assert(meta(type, slot, 0) == (int64_t(kPeer + 1) << 32 | (phase + 1)));
             assert(wave(type, slot) == NO_WAVE);
         }
-        assert(meta(AIV_RDMA_POST, phase * 2, 1) == 32);
-        assert(meta(AIV_RDMA_POST, phase * 2 + 1, 1) == (int64_t(1) << 32 | 4));
-        assert(meta(AIV_RDMA_QUIET_WAIT, phase * quietsPerPhase, 1) == 0);
-        assert(meta(AIV_RDMA_RECV_WAIT, phase, 1) == (int64_t(1) << 32 | 4));
+        assert(meta(AIV_RDMA_POST, phase * 2, 1) == (int64_t(1) << 40 | 32));
+        assert(meta(AIV_RDMA_POST, phase * 2 + 1, 1) == (int64_t(1) << 40 | int64_t(1) << 32 | 4));
+        assert(meta(AIV_RDMA_QUIET_WAIT, phase * quietsPerPhase, 1) == (int64_t(1) << 40));
+        assert(meta(AIV_RDMA_RECV_WAIT, phase, 1) == (int64_t(1) << 40 | int64_t(1) << 32 | 4));
     }
     // Span state survives independent RDMA handles too, with no extra split.
     timer.StartSpan(AIV_DISPATCH);
     {
-        AscendTimerRdmaScope rdma(&timer, AIV_RDMA_POST, RdmaPhase::Combine, kPeer, 8, false);
+        AscendTimerRdmaScope rdma(&timer, AIV_RDMA_POST, RdmaPhase::DispatchPayload, kPeer, 59392, false, 8, 112, 16);
     }
+    timer.RecordDetail(AIV_PAYLOAD_ALL_LANES_WAIT, 101000, 102000, uint64_t(0x81) << 32 | 4, 257);
     timer.EndSpan(AIV_DISPATCH);
     timer.FlushDynamicCounts();
     assert(count(AIV_DISPATCH) == 1 && end(AIV_DISPATCH, 0) > start(AIV_DISPATCH, 0));
     assert(wave(AIV_DISPATCH, 0) == 7);
+    assert(meta(AIV_RDMA_POST, 6, 0) == (int64_t(kPeer + 1) << 32 | 16 << 8 | 2));
+    assert(meta(AIV_RDMA_POST, 6, 1) == (int64_t(112) << 48 | int64_t(8) << 40 | 59392));
+    assert(count(AIV_PAYLOAD_ALL_LANES_WAIT) == 1);
+    assert(meta(AIV_PAYLOAD_ALL_LANES_WAIT, 0, 0) == (int64_t(0x81) << 32 | 4));
+    assert(meta(AIV_PAYLOAD_ALL_LANES_WAIT, 0, 1) == 257);
     // Overflow must retain the real count for host rejection, without corrupting
     // the next family's time slots or the currently active compute span.
     auto neighbor = start(AIV_RDMA_QUIET_WAIT, 0);

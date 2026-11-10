@@ -543,3 +543,48 @@ def test_previous_raw_schema_size_is_rejected(tmp_path):
         stream.truncate(previous_size * 8)
     with pytest.raises(ValueError, match="invalid binary timer size"):
         load_raw(previous)
+
+
+def test_multi_qp_payload_trace_ranges_and_collective_wait(raw_file):
+    core = 2  # g0 AIV1
+    with raw_file.open("r+b") as stream:
+
+        def put(index, *values):
+            stream.seek(index * 8)
+            stream.write(struct.pack("<" + "q" * len(values), *values))
+
+        records = [
+            ("AIV_RDMA_POST", 17 << 32 | 16 << 8 | 2, 112 << 48 | 8 << 40 | 59392),
+            ("AIV_PAYLOAD_ALL_LANES_WAIT", 0x81 << 32 | 4, 257),
+        ]
+        for name, first, second in records:
+            family = p.DYNAMIC_NAMES.index(name)
+            slot = family * p.MAX_DYNAMIC_ITER
+            logical = len(p.FIXED_NAMES) + slot
+            put(core * p.COUNTERS_PER_CORE + logical * 2, 101000, 102000)
+            put(p.N_TIMING_COUNTER + core * p.DYNAMIC_ITER_PER_CORE + family, 1)
+            put(p.TASK_METADATA_OFFSET + (core * len(p.DYNAMIC_NAMES) * p.MAX_DYNAMIC_ITER + slot) * 2, first, second)
+            put(p.WAVE_ID_OFFSET + core * p.WAVE_ID_PER_CORE + logical, p.NO_WAVE)
+    parsed = raw_file.with_suffix(".parsed.csv")
+    decode(raw_file, parsed)
+    raw = raw_events_for_rank(parsed, 0)
+    events = trace_events(raw, "keep", first_start_cycle(raw), include_wait=True)
+    post = next(e for e in events if e["args"].get("granularity") == "rdma")
+    assert post["name"].endswith("_qp8")
+    assert {k: post["args"][k] for k in ("qp", "lane", "row_start", "row_end", "row_count", "bytes")} == dict(
+        qp=8, lane=7, row_start=112, row_end=128, row_count=16, bytes=59392
+    )
+    wait = next(e for e in events if e["name"] == "AIV_PAYLOAD_ALL_LANES_WAIT")
+    assert wait["args"]["initial_missing_lanes"] == [0, 7]
+    assert wait["args"]["poll_rounds"] == 4
+    assert wait["args"]["sequence"] == 257
+    assert wait["tid"].endswith("/STARTUP")
+    hidden = trace_events(raw, "keep", first_start_cycle(raw), include_wait=False)
+    assert not any(e["name"] == "AIV_PAYLOAD_ALL_LANES_WAIT" for e in hidden)
+
+    report = raw_file.with_suffix(".startup.csv")
+    write_startup_breakdown({0: raw}, report)
+    with report.open(newline="", encoding="utf-8") as stream:
+        row = next(row for row in csv.DictReader(stream) if row["event_family"] == "AIV_PAYLOAD_ALL_LANES_WAIT")
+    assert json.loads(row["initial_missing_lanes"]) == [0, 7]
+    assert row["poll_rounds"] == "4"

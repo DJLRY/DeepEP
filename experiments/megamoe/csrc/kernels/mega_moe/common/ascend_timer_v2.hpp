@@ -67,6 +67,7 @@ enum DynamicTimingType {
     AIV_COMBINE_ASYNC,
     AIV_COMBINE_READY,
     AIV_COMBINE_SYNC,
+    AIV_PAYLOAD_ALL_LANES_WAIT,
     DYNAMIC_TYPE_COUNT_ENUM
 };
 
@@ -118,7 +119,10 @@ static constexpr int DYNAMIC_ITER_TOTAL_SIZE = DYNAMIC_ITER_PER_CORE_ALIGN * N_C
 static constexpr int TASK_METADATA_OFFSET = N_TIMING_COUNTER + DYNAMIC_ITER_TOTAL_SIZE;
 // 每个动态槽追加两个 int64：(expert+1,row_start)、(n_tile+1,row_count)，各占 32 bit。
 // 全零表示旧路径无任务坐标；n_tile+1 为零表示 slice 级记录。
-// RDMA slots instead store (peer+1,phase+1), (is_commit,bytes), each field 32 bits.
+// RDMA word0: peer+1 (high32), row_count (bits8..31), phase+1 (low8).
+// word1: row_start (high16), QP (bits40..47), commit (bit32), bytes (low32).
+// Old records have zero QP/row fields. Payload rows are bounded by 256.
+// ALL_LANES_WAIT stores initial_missing_mask (high32), poll rounds (low32), then sequence.
 // Data Quiet covers preceding QP operations; its byte count is unknown (zero).
 // GATEWAY_PAYLOAD_WAIT stores (source+1,gateway+1), then the invocation sequence.
 // COMBINE_PROGRESS/DRAIN pack pending_before, pending_after, posts, scanned_rows

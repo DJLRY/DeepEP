@@ -248,10 +248,13 @@ public:
     // RDMA may progress inside a compute tile/span. Keep its handle independent
     // of activeType_/waitType_ and never drain a pipeline just for timestamps.
     __aicore__ inline int BeginRdma(AscendTimer::DynamicTimingType type, AscendTimer::RdmaPhase phase, uint32_t peer,
-                                    uint32_t bytes, bool isCommit)
+                                    uint32_t bytes, bool isCommit, uint32_t qp = 0U, uint32_t rowStart = 0U,
+                                    uint32_t rowCount = 0U)
     {
-        return BeginIndependent(type, (static_cast<uint64_t>(peer + 1) << 32) | (static_cast<uint32_t>(phase) + 1),
-                                (static_cast<uint64_t>(isCommit) << 32) | bytes);
+        return BeginIndependent(
+            type, (static_cast<uint64_t>(peer + 1) << 32) | (rowCount << 8) | (static_cast<uint32_t>(phase) + 1),
+            (static_cast<uint64_t>(rowStart) << 48) | (static_cast<uint64_t>(qp) << 40) |
+                (static_cast<uint64_t>(isCommit) << 32) | bytes);
     }
 
     __aicore__ inline void EndRdma(AscendTimer::DynamicTimingType type, int index)
@@ -589,8 +592,11 @@ private:
 class AscendTimerRdmaScope {
 public:
     __aicore__ inline AscendTimerRdmaScope(AscendTimerDevice* timer, AscendTimer::DynamicTimingType type,
-                                           AscendTimer::RdmaPhase phase, uint32_t peer, uint32_t bytes, bool isCommit)
-        : timer_(timer), type_(type), index_(timer ? timer->BeginRdma(type, phase, peer, bytes, isCommit) : -1)
+                                           AscendTimer::RdmaPhase phase, uint32_t peer, uint32_t bytes, bool isCommit,
+                                           uint32_t qp = 0U, uint32_t rowStart = 0U, uint32_t rowCount = 0U)
+        : timer_(timer),
+          type_(type),
+          index_(timer ? timer->BeginRdma(type, phase, peer, bytes, isCommit, qp, rowStart, rowCount) : -1)
     {
     }
     __aicore__ inline ~AscendTimerRdmaScope()

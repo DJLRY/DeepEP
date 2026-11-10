@@ -11,7 +11,7 @@
 
 namespace MegaMoeImpl {
 
-// QP0 belongs to SHMEM's default collectives. Physical AIV1 owns Dispatch QP1.
+// QP0 belongs to SHMEM's default collectives. g0..g7 AIV1 own Dispatch QP1..8.
 // Combine transfers QP1..8 to g0..g7 AIV0
 // after the input barrier, with reduction deferred until their prologues end.
 // Explicit qpIndex arguments refer to the caller's exclusive owner in this phase.
@@ -116,6 +116,17 @@ __aicore__ inline void RoceWaitFlagEquals(__gm__ int32_t* flag, uint32_t sequenc
 #endif
 }
 
+// Match the SDK device/host signal API split used by RoceWaitFlagEquals.
+__aicore__ inline bool RoceTestFlagEquals(__gm__ int32_t* flag, uint32_t sequence)
+{
+#if defined(__CCE_AICORE__) || defined(__CCE_KT_TEST__)
+    return aclshmem_int32_test(flag, ACLSHMEM_CMP_EQ, static_cast<int32_t>(sequence)) != 0;
+#else
+    aclshmem_signal_wait_until(flag, ACLSHMEM_CMP_EQ, static_cast<int32_t>(sequence));
+    return true;
+#endif
+}
+
 // Both operands are LOCAL symmetric-heap addresses, including the destination.
 // SHMEM applies the destination PE translation. A mapped peer GM address is invalid here.
 // Producers must drain their MTE3 writes before publishing readiness to this owner;
@@ -124,12 +135,14 @@ __aicore__ inline void RoceWaitFlagEquals(__gm__ int32_t* flag, uint32_t sequenc
 __aicore__ inline void RocePutBytes(GM_ADDR dstLocalSym, GM_ADDR srcLocalSym, uint32_t bytes, uint32_t peer,
                                     __ubuf__ uint8_t* scratch, AscendTimerDevice* timer = nullptr,
                                     AscendTimer::RdmaPhase phase = AscendTimer::RdmaPhase::DispatchPayload,
-                                    bool isCommit = false, uint32_t qpIndex = MEGAMOE_ROCE_QP_INDEX)
+                                    bool isCommit = false, uint32_t qpIndex = MEGAMOE_ROCE_QP_INDEX,
+                                    uint32_t rowStart = 0U, uint32_t rowCount = 0U)
 {
     if (bytes == 0U) {
         return;
     }
-    AscendTimerRdmaScope timing(timer, AscendTimer::AIV_RDMA_POST, phase, peer, bytes, isCommit);
+    AscendTimerRdmaScope timing(timer, AscendTimer::AIV_RDMA_POST, phase, peer, bytes, isCommit, qpIndex, rowStart,
+                                rowCount);
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_XSCALE) || defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
     aclshmemx_roce_qp_put_nbi<uint8_t>(dstLocalSym, srcLocalSym, scratch, bytes, static_cast<int>(peer), qpIndex,
                                        MEGAMOE_ROCE_EVENT_ID);
@@ -149,7 +162,7 @@ __aicore__ inline void RoceQuiet(uint32_t peer, __ubuf__ uint8_t* scratch, Ascen
                                  bool isCommit = false, uint32_t qpIndex = MEGAMOE_ROCE_QP_INDEX)
 {
     AscendTimerRdmaScope timing(timer, AscendTimer::AIV_RDMA_QUIET_WAIT, phase, peer, isCommit ? sizeof(uint32_t) : 0U,
-                                isCommit);
+                                isCommit, qpIndex);
 #if defined(ACLSHMEMI_RDMA_K_BACKEND_XSCALE) || defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
     aclshmemx_roce_qp_quiet<uint8_t>(peer, qpIndex, scratch, MEGAMOE_ROCE_EVENT_ID);
 #else
@@ -214,7 +227,7 @@ __aicore__ inline void RoceWaitCommit(__gm__ int32_t* localFlag, uint32_t sequen
                                       uint32_t peer = 0U, __ubuf__ uint8_t* scratch = nullptr,
                                       uint32_t qpIndex = MEGAMOE_ROCE_QP_INDEX)
 {
-    AscendTimerRdmaScope timing(timer, AscendTimer::AIV_RDMA_RECV_WAIT, phase, peer, sizeof(uint32_t), true);
+    AscendTimerRdmaScope timing(timer, AscendTimer::AIV_RDMA_RECV_WAIT, phase, peer, sizeof(uint32_t), true, qpIndex);
     RoceWaitFlagEquals(localFlag, sequence, peer, scratch, RoceWaitKind::Commit, qpIndex);
     AscendC::SetFlag<AscendC::HardEvent::S_MTE2>(static_cast<AscendC::TEventID>(MEGAMOE_ROCE_EVENT_ID));
     AscendC::WaitFlag<AscendC::HardEvent::S_MTE2>(static_cast<AscendC::TEventID>(MEGAMOE_ROCE_EVENT_ID));

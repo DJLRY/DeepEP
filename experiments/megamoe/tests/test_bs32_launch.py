@@ -504,7 +504,7 @@ def test_preflight_checks_installed_timer_support(saved, tmp_path, monkeypatch, 
     modules["deep_ep._native"].require_native = lambda operation: None
     modules["deep_ep_experimental.megamoe._C"].timer_enabled = compiled
     modules["deep_ep_experimental.megamoe._C"].hierarchical_max_tokens = limit
-    modules["deep_ep_experimental.megamoe._C"].api_protocol = 11
+    modules["deep_ep_experimental.megamoe._C"].api_protocol = 12
 
     def execute(command, env):
         monkeypatch.setattr(sys, "argv", ["-c", *command[4:]])
@@ -634,3 +634,36 @@ def test_perf_rejects_removed_algorithm_options(saved, monkeypatch, option):
     monkeypatch.setattr(launcher, "dispatch", lambda *a, **kw: pytest.fail("Retired option launched"))
     with pytest.raises(SystemExit):
         launcher.main(["perf", "--config", str(path), option])
+
+
+@pytest.mark.parametrize("action", ["run", "golden", "perf", "trace"])
+@pytest.mark.parametrize("bs", [72, 128])
+def test_explicit_batch_reaches_preflight_case_and_trace_paths(saved, monkeypatch, action, bs):
+    path, config = saved
+    monkeypatch.setattr(launcher.platform, "system", lambda: "Linux")
+    monkeypatch.setattr(launcher, "environment", lambda _: {})
+    probes, calls, summaries = [], [], []
+    monkeypatch.setattr(launcher, "preflight", lambda *args, **kwargs: probes.append(kwargs))
+    monkeypatch.setattr(launcher, "execute", lambda *args, **kwargs: calls.append(args[0]))
+    monkeypatch.setattr(launcher, "performance_summary", lambda *args: summaries.append(args))
+    run_dir = launcher.main([action, "--config", str(path), "--bs", str(bs)], print_text=False)
+    assert probes == [{"max_bs": bs}]
+    case = json.loads((run_dir / "case.json").read_text(encoding="utf-8"))
+    assert case["bs_values"] == [bs]
+    assert launcher.CASE["bs_values"] == [32]
+    if action == "trace":
+        parser = next(command for command in calls if "deep_ep_experimental.megamoe.timer" in command)
+        assert str(run_dir / f"bs_{bs}" / "timer") in parser
+        summary = (run_dir / "summary.txt").read_text(encoding="utf-8")
+        assert f"BS{bs}" in summary and str(run_dir / f"bs_{bs}" / "timer") in summary
+    if action == "perf":
+        assert summaries[0][-1] == [bs]
+
+
+@pytest.mark.parametrize(
+    "args",
+    [["perf", "--bs", "0"], ["perf", "--bs", "257"], ["build", "--bs", "72"], ["perf", "--bs", "72", "--extra-bs"]],
+)
+def test_invalid_explicit_batch_rejected_before_launch(args):
+    with pytest.raises(SystemExit):
+        launcher.main(args)

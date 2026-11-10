@@ -203,6 +203,8 @@ def trace_events(
             display_name = f"{family}_{task['phase']}_{task['kind']}_peer{task['peer_rank']}_{task['bytes']}B"
             # Progress can run inside a compute tile. Use its own lane to avoid
             # overlapping X events on the compute track; clocks stay unchanged.
+            if task.get("qp"):
+                display_name += f"_qp{task['qp']}"
             lane += "/RDMA"
             category = "rdma_wait" if "WAIT" in family else "rdma_post"
             wave_metadata["display_index_semantics"] = "per_core_rdma_operation"
@@ -210,7 +212,7 @@ def trace_events(
             lane += "/STARTUP"
             category = "startup_wait" if "WAIT" in family else "startup"
             display_name = family
-            if granularity == "startup_dependency":
+            if granularity == "startup_dependency" and "source_rank" in task:
                 display_name += f"_source{task['source_rank']}_gateway{task['gateway_rank']}_seq{task['sequence']}"
             wave_metadata["display_index_semantics"] = "per_core_startup_phase_or_dependency"
         if granularity == "relay_step":
@@ -290,6 +292,10 @@ def event_family(name: str) -> str:
 def write_startup_breakdown(raw_by_rank, path: Path):
     """Retain WAIT and parent envelopes; overlapping rows must not be summed."""
     detail_fields = [
+        "initial_missing_mask",
+        "initial_missing_lanes",
+        "poll_rounds",
+        "lane_count",
         "relay_step",
         "first_expert",
         "expert_count",
@@ -335,6 +341,7 @@ def write_startup_breakdown(raw_by_rank, path: Path):
                 if family not in STARTUP_FIXED_NAMES and family not in (
                     "AIC_WAIT_INPUT_PREP",
                     "AIV_GATEWAY_PAYLOAD_WAIT",
+                    "AIV_PAYLOAD_ALL_LANES_WAIT",
                     "AIV_RELAY_STEP",
                 ):
                     continue

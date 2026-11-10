@@ -583,7 +583,7 @@ def test_sixteen_rank_single_host_keeps_mte(backend):
         b.destroy()
 
 
-@pytest.mark.parametrize("protocol", [5, 6, 7, 8, 9, 10, 11])
+@pytest.mark.parametrize("protocol", [5, 6, 7, 8, 9, 10, 11, 12])
 def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypatch, protocol):
     api._extension.cache_clear()
     core = SimpleNamespace(create_megamoe_runtime=lambda: None)
@@ -591,7 +591,7 @@ def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypa
     monkeypatch.setattr(api, "require_native", lambda _: core)
     monkeypatch.setattr(api.importlib, "import_module", lambda _: extension)
     try:
-        if protocol != 11:
+        if protocol != 12:
             with pytest.raises(RuntimeError, match="versions differ"):
                 api._extension()
         else:
