@@ -11,7 +11,7 @@ import statistics
 
 # 整批开始前的计算，让 Host 有时间排入后续算子；不计入 kernel Duration。
 DEFAULT_ALIGNMENT = dict(rows=100000, cols=30000, repeats=20)
-PERF_METHODS = ("legacy", "shmem")
+PERF_METHODS = ("legacy", "legacy-read", "legacy-zero", "shmem")
 # Match DeepGEMM-Ascend bench_msprof's device delay (system counter ticks).
 SLEEP_CYCLES = 20_000_000
 
@@ -35,17 +35,22 @@ def enqueue_batch(
     barrier=None,
     sleep=None,
     flush_buffer=None,
+    sum_out=None,
 ):
     """No host barriers, synchronize, or D2H between collective launches."""
     if method not in PERF_METHODS:
         raise ValueError(f"Unknown performance method: {method}")
     if method == "shmem" and (barrier is None or sleep is None or flush_buffer is None):
         raise ValueError("shmem method requires a device barrier, sleep and L2 flush buffer")
-    if method == "legacy":
+    if method.startswith("legacy"):
         for _ in range(alignment["repeats"]):
             torch.exp(prefix, out=prefix)
     for iteration in range(iterations):
-        if method == "shmem":
+        if method == "legacy-read":
+            torch.sum(flush_buffer, dim=(0,), dtype=torch.int32, out=sum_out)
+        elif method == "legacy-zero":
+            flush_buffer.zero_()
+        elif method == "shmem":
             flush_buffer.zero_()
             sleep(SLEEP_CYCLES)
             barrier()
@@ -53,9 +58,10 @@ def enqueue_batch(
         call(timer if iteration + 1 == iterations else None)
 
 
-def read_kernel_samples(directory, iterations):
+def read_kernel_samples(directory, iterations, *, require_read_sum=False):
     """Read only this rank/case's fresh profiler export; never subtract device clocks."""
     samples = []
+    read_sequence = []
     paths = sorted(Path(directory).rglob("kernel_details*.csv"))
     for path in paths:
         with path.open(newline="", encoding="utf-8-sig") as stream:
@@ -63,7 +69,9 @@ def read_kernel_samples(directory, iterations):
             for index, row in enumerate(reader):
                 row = {key.strip(): value for key, value in row.items() if key is not None}
                 name = " ".join(row.get(key, "") for key in ("Name", "Type", "Kernel Name"))
-                if "megamoe" not in name.replace("_", "").lower():
+                normalized = name.replace("_", "").lower()
+                is_moe = "megamoe" in normalized
+                if not is_moe and not (require_read_sum and "reducesum" in normalized):
                     continue
                 try:
                     start, duration = (float(row[key]) for key in ("Start Time(us)", "Duration(us)"))
@@ -71,6 +79,10 @@ def read_kernel_samples(directory, iterations):
                     raise ValueError(f"Invalid MegaMoE profiler row {path}:{index + 2}: {row}") from error
                 if not math.isfinite(start) or not math.isfinite(duration) or duration <= 0:
                     raise ValueError(f"Nonfinite/nonpositive MegaMoE timing: {path}:{index + 2}")
+                if require_read_sum:
+                    read_sequence.append((start, is_moe, (row.get("Device_id"), row.get("Stream ID"))))
+                if not is_moe:
+                    continue
                 samples.append(
                     dict(
                         start_us=start,
@@ -91,6 +103,14 @@ def read_kernel_samples(directory, iterations):
             f"{directory}: expected {iterations} MegaMoE kernels, found {len(samples)} "
             f"in {len(paths)} kernel_details CSV files; inspect the raw profiler export"
         )
+    if require_read_sum:
+        pairs = sorted(read_sequence)
+        if [is_moe for _, is_moe, _ in pairs] != [False, True] * iterations or len(
+            {stream for _, _, stream in pairs}
+        ) != 1:
+            raise ValueError(
+                f"{directory}: expected {iterations} alternating ReduceSum/MegaMoE pairs on one device stream"
+            )
     return samples
 
 
@@ -118,6 +138,8 @@ def summarize_rounds(per_rank, ranks_per_node=None):
         median_us=statistics.median(minimum),
         min_us=min(minimum),
         max_us=max(minimum),
+        rank0_mean_us=statistics.mean(per_rank[0]),
+        all_rank_mean_us=statistics.mean(value for row in per_rank for value in row),
         rank_max_mean_us=statistics.mean(maximum),
         rank_min_rounds_us=minimum,
         rank_max_rounds_us=maximum,
@@ -167,4 +189,6 @@ def collect_profile(call, group, torch, config, prefix, directory, bs, **batch_o
         torch.npu.synchronize()
         print(f"[PROFILE] BS={bs} batch complete; exporting {directory}", flush=True)
         prof.step()
+    if batch_options.get("method") == "legacy-read":
+        return read_kernel_samples(directory, config["iters"], require_read_sum=True)
     return read_kernel_samples(directory, config["iters"])

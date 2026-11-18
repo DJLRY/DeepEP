@@ -24,6 +24,7 @@
 #include "mega_moe_token_quant.hpp"
 #include "mega_moe_count_arrival.hpp"
 #include "mega_moe_gateway_readiness.hpp"
+#include "mega_moe_route_histogram.hpp"
 
 namespace MegaMoeImpl {
 
@@ -44,6 +45,7 @@ struct TokenDispatchConfig {
 
 template <typename ActivationType>
 struct TokenDispatchScratch {
+    uint32_t gatewayReady = 0;
     PeerRowLimitsCache peerRowLimitsCache{};  // 标量对象状态；与可复用的 UB Tensor 内容分离。
     GlobalTensor<int32_t> expertRevNumsGlobalTensor;
     GlobalTensor<int32_t> cumsumInfoGlobalTensor;
@@ -56,6 +58,33 @@ struct TokenDispatchScratch {
     int64_t revTokenElemCnt;
     int64_t revScaleElemCnt;
 };
+
+template <typename ActivationType>
+__aicore__ inline void LoadGatheredRouteCounts(const MoeStageCommonConfig& common, const Params& params,
+                                               TokenDispatchScratch<ActivationType>& scratch)
+{
+    const uint32_t items = common.tokenNum * common.topK;
+    const uint32_t packets = (items + RAIL_PACKET_DATA_WORDS - 1U) / RAIL_PACKET_DATA_WORDS;
+    const uint32_t bytes = packets * RAIL_PACKET_BYTES;
+    LocalTensor<uint32_t> ids(TPosition::VECCALC, scratch.copyTmpBaseAddr, bytes / 4U);
+    LocalTensor<uint16_t> bins(TPosition::VECCALC, scratch.copyTmpBaseAddr + bytes, 128U);
+    GlobalTensor<uint32_t> records;
+    records.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(params.peermemInfo.gatherPtr));
+    for (uint32_t i = 0; i < common.worldSize; ++i) {
+        const uint32_t source = (i + 16U * HierarchicalHost(common.rankId)) % common.worldSize;
+        DataCopyPad<uint32_t, PaddingMode::Compact>(
+            ids, records[RouteGatherSlot(source) * bytes / 4U],
+            {static_cast<uint16_t>(packets), RAIL_PACKET_DATA_WORDS * 4U, 4U, 0U, 0U}, {false, 0U, 0U, 0U});
+        SyncFuncStatic<HardEvent::MTE2_V, SYNC_EVENT_ID2>();
+        asc_vf_call<CountRouteSourceVF>(reinterpret_cast<__ubuf__ uint32_t*>(ids.GetPhyAddr()),
+                                        reinterpret_cast<__ubuf__ uint16_t*>(bins.GetPhyAddr()), items,
+                                        common.rankId * common.moeExpertPerRank);
+        SyncFuncStatic<HardEvent::V_S, SYNC_EVENT_ID2>();
+        for (uint32_t expert = 0; expert < common.moeExpertPerRank; ++expert)
+            scratch.cumsumInfoTensor.SetValue(expert * common.worldSize + source, bins.GetValue(expert));
+        SyncFuncStatic<HardEvent::S_MTE2, SYNC_EVENT_ID2>();
+    }
+}
 
 // 当前物理 AIV1 在单个专家内负责的左闭右开 row 区间。
 struct ExpertDispatchCoreRange {
@@ -106,15 +135,16 @@ __aicore__ inline LocalTensor<ActivationType> GetDispatchCopyBuffer(const TokenD
 {
     return LocalTensor<ActivationType>(
         TPosition::VECCALC,
-        scratch.copyTmpBaseAddr + static_cast<uint32_t>(bufferIdx) * context.quantTokenScaleAlignBytes,
-        context.quantTokenScaleAlignBytes / sizeof(ActivationType));
+        scratch.copyTmpBaseAddr + static_cast<uint32_t>(bufferIdx) * context.bufferConfig.copyBufferBytes,
+        context.bufferConfig.copyBufferBytes / sizeof(ActivationType));
 }
 
 template <bool IsBufferReuse, bool TopkWeightsPrefetch, typename ActivationType>
 __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& context, const Params& params,
                                                      TokenDispatchScratch<ActivationType>& scratch, int32_t bufferIdx,
                                                      int32_t topkIndex, int32_t remoteRankIdx,
-                                                     GlobalTensor<ActivationType>& remoteRankGlobalTensor)
+                                                     GlobalTensor<ActivationType>& remoteRankGlobalTensor,
+                                                     GM_ADDR packetPayload)
 {
     TEventID eventId = static_cast<TEventID>(bufferIdx);
     LocalTensor<ActivationType> copyTmpTensor = GetDispatchCopyBuffer(context, scratch, bufferIdx);
@@ -124,7 +154,14 @@ __aicore__ inline void FetchDispatchTokenAndMetaInfo(const TokenDispatchConfig& 
     if constexpr (IsBufferReuse) {
         WaitFlag<AscendC::HardEvent::MTE3_MTE2>(eventId);
     }
-    DataCopy(copyTmpTensor, remoteRankGlobalTensor[remoteCopyOffset], context.quantTokenScaleAlignBytes);
+    if (packetPayload != nullptr) {
+        const uint32_t packets = DispatchPacketCount(context.quantTokenScaleAlignBytes);
+        const uint32_t rowOffset = tokenIndex * packets * RAIL_PACKET_BYTES;
+        DataCopy(copyTmpTensor, remoteRankGlobalTensor[rowOffset],
+                 DataCopyParams{static_cast<uint16_t>(packets), 15U, 1U, 0U});
+    } else {
+        DataCopy(copyTmpTensor, remoteRankGlobalTensor[remoteCopyOffset], context.quantTokenScaleAlignBytes);
+    }
     SetFlag<AscendC::HardEvent::MTE2_MTE3>(eventId);
 
     if constexpr (IsBufferReuse) {
@@ -192,35 +229,80 @@ __aicore__ inline void CopyTokensAndMetaForDispatch(const TokenDispatchConfig& c
 
     GlobalTensor<ActivationType> remoteRankGlobalTensor;
     GM_ADDR payload;
+    GM_ADDR packetPayload = nullptr;
     if (UseHierarchicalRoce(params.tilingData) && winRankAddr[remoteRankIdx] == nullptr) {
         const uint64_t relayOffset = params.peermemInfo.relayPayloadPtr - params.peermemInfo.rankSyncInWorldPtr;
         payload = winRankAddr[HierarchicalGateway(remoteRankIdx)] + relayOffset;
+        packetPayload = payload;
     } else {
         payload = winRankAddr[remoteRankIdx] + context.quantWinOffset;
     }
     remoteRankGlobalTensor.SetGlobalBuffer(reinterpret_cast<__gm__ ActivationType*>(payload));
-    for (int32_t issueIdx = 0; issueIdx < copyNum; ++issueIdx) {
-        // 单槽没有读写重叠空间，必须先写出；否则 reuse 会等一个尚未发布的 MTE3 事件。
-        if (bufferCount == 1 && progress.pendingRow >= 0) {
-            StoreDispatchTokenAndMetaInfo<ActivationType, QuantScaleType, TopkWeightsPrefetch>(context, params, scratch,
-                                                                                               0, progress.pendingRow);
-            progress.pendingRow = -1;
+    const uint32_t slot = static_cast<uint32_t>(remoteRankIdx) % HIERARCHICAL_RANKS_PER_HOST;
+    for (int32_t begin = 0; begin < copyNum; begin += 8) {
+        const int32_t count = Min(8, copyNum - begin);
+        uint32_t pending = (1U << count) - 1U;
+        while (pending) {
+            uint32_t ready = pending;
+            if (packetPayload && !(scratch.gatewayReady & (1U << slot))) {
+                auto* hint = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.gatewayPayloadReadyPtr +
+                                                               slot * HIERARCHICAL_FLAG_BYTES);
+                if (static_cast<uint32_t>(ReadGmByPassDCache(hint)) == params.tilingData->hierarchicalSequence) {
+                    scratch.gatewayReady |= 1U << slot;
+                } else {
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+                    const uint32_t packets = DispatchPacketCount(context.quantTokenScaleAlignBytes);
+                    for (int32_t t = 0; t < count; ++t) {
+                        if (!(pending & (1U << t))) continue;
+                        const uint32_t index = scratch.validTopkIndexTensor.GetValue(copyStartIdx + begin + t);
+                        const uint32_t token = index / params.tilingData->topK;
+                        auto* tails = reinterpret_cast<__gm__ int32_t*>(packetPayload +
+                                                                        (token * packets + 1U) * RAIL_PACKET_BYTES) -
+                                      1;
+                        for (uint32_t p = 0; p < packets; ++p) {
+                            if (static_cast<uint32_t>(ReadGmByPassDCache(tails + p * RAIL_PACKET_WORDS)) !=
+                                params.tilingData->hierarchicalSequence) {
+                                ready &= ~(1U << t);
+                                break;
+                            }
+                        }
+                    }
+#else
+                    // XSCALE requires the lane commits acquired by the gateway helper.
+                    ready = 0U;
+#endif
+                }
+                SyncFuncStatic<HardEvent::S_MTE2, SYNC_EVENT_ID5>();
+            }
+            pending &= ~ready;
+            for (int32_t t = 0; t < count; ++t) {
+                if (!(ready & (1U << t))) continue;
+                const int32_t issueIdx = begin + t;
+                // 单槽没有读写重叠空间，必须先写出；否则 reuse 会等一个尚未发布的 MTE3 事件。
+                if (bufferCount == 1 && progress.pendingRow >= 0) {
+                    StoreDispatchTokenAndMetaInfo<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+                        context, params, scratch, 0, progress.pendingRow);
+                    progress.pendingRow = -1;
+                }
+                int32_t issueBufferIdx = progress.issuedRows % bufferCount;
+                int32_t topkIndex = scratch.validTopkIndexTensor.GetValue(copyStartIdx + issueIdx);
+                if (progress.issuedRows < static_cast<uint32_t>(bufferCount)) {
+                    FetchDispatchTokenAndMetaInfo<false, TopkWeightsPrefetch>(context, params, scratch, issueBufferIdx,
+                                                                              topkIndex, remoteRankIdx,
+                                                                              remoteRankGlobalTensor, packetPayload);
+                } else {
+                    FetchDispatchTokenAndMetaInfo<true, TopkWeightsPrefetch>(context, params, scratch, issueBufferIdx,
+                                                                             topkIndex, remoteRankIdx,
+                                                                             remoteRankGlobalTensor, packetPayload);
+                }
+                if (progress.pendingRow >= 0) {
+                    StoreDispatchTokenAndMetaInfo<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
+                        context, params, scratch, (progress.issuedRows - 1U) % bufferCount, progress.pendingRow);
+                }
+                progress.pendingRow = rowDstOffset + issueIdx;
+                ++progress.issuedRows;
+            }
         }
-        int32_t issueBufferIdx = progress.issuedRows % bufferCount;
-        int32_t topkIndex = scratch.validTopkIndexTensor.GetValue(copyStartIdx + issueIdx);
-        if (progress.issuedRows < static_cast<uint32_t>(bufferCount)) {
-            FetchDispatchTokenAndMetaInfo<false, TopkWeightsPrefetch>(context, params, scratch, issueBufferIdx,
-                                                                      topkIndex, remoteRankIdx, remoteRankGlobalTensor);
-        } else {
-            FetchDispatchTokenAndMetaInfo<true, TopkWeightsPrefetch>(context, params, scratch, issueBufferIdx,
-                                                                     topkIndex, remoteRankIdx, remoteRankGlobalTensor);
-        }
-        if (progress.pendingRow >= 0) {
-            StoreDispatchTokenAndMetaInfo<ActivationType, QuantScaleType, TopkWeightsPrefetch>(
-                context, params, scratch, (progress.issuedRows - 1U) % bufferCount, progress.pendingRow);
-        }
-        progress.pendingRow = rowDstOffset + issueIdx;
-        ++progress.issuedRows;
     }
 }
 
@@ -702,13 +784,19 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
     }
 
     AscendTimerFixedScope preparation(timer, AscendTimer::AIV_COUNT_TABLE_PREPARE);
+    if (countWorkspace.shared && countWorkspace.blockIdx != 0U) {
+        WaitForMoeExpertTokenCountReady(params.workspaceInfo.flagSendCntCalToUpdParamsPtr, countWorkspace, 0U);
+        return;
+    }
     uint32_t rawCountElementCount = common.worldSize * common.moeExpertPerRank;
     // 每次重新准备输入路由都失效缓存。不能仅靠 expertId，否则重复 launch 可能复用旧计数。
     scratch.peerRowLimitsCache = {};
     __gm__ int32_t* launchCountSlot0 =
         reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.rankSyncInWorldPtr + RANK_SYNC_COUNTER_OFFSET_BYTES);
     int32_t expectEpoch = (ReadGmByPassDCache(launchCountSlot0) & 0x7F) | 0x80;
-    if (UseDecodeRailRouting(params.tilingData)) {
+    if (countWorkspace.shared) {
+        LoadGatheredRouteCounts(common, params, scratch);
+    } else if (UseDecodeRailRouting(params.tilingData)) {
         {
             // Includes DMA snapshots, epoch validation and any poll/backoff;
             // it is readiness acquisition time, not pure network latency.
@@ -773,12 +861,6 @@ __aicore__ inline void PrepareMoeExpertTokenCountTable(const MoeStageCommonConfi
             reinterpret_cast<__gm__ int32_t*>(params.workspaceInfo.flagSendCntCalToUpdParamsPtr) +
             static_cast<uint64_t>(countWorkspace.blockIdx) * INT_CACHELINE;
         WriteGmByPassDCache(countTableReady, static_cast<int32_t>(1));
-    }
-    // AIC/AIV0 can prepare GMM state and weights using the completed count table
-    // while AIV1 acquires payload. Dispatch still starts only after this wait.
-    if (UseHierarchicalRoce(params.tilingData)) {
-        AscendTimerFixedScope payload(timer, AscendTimer::AIV_GATEWAY_PAYLOAD_CHECK);
-        AcquireHierarchicalGatewayPayload(countWorkspace, params);
     }
 }
 

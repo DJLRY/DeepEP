@@ -1048,10 +1048,10 @@ __aicore__ inline void UpdateSharedExpertGmm2GlobalBuffer(const MoeStageCommonCo
     gmmAddrInfo.aScaleGlobal = workspace.sharedExpertActivationScalePtr +
                                sharedExpertTokenStartIndex * activationScaleWidth * sizeof(QuantScaleType);
     gmmAddrInfo.bGlobal = GetExpertWeightAddr<WeightType>(
-        weights.weight2, gmmConfig.isPerExpertWeightTensor, sharedExpertIdx,
+        weights.weight2, gmmConfig.sharedWeightList, sharedExpertIdx,
         static_cast<uint64_t>(sharedExpertIdx) * tokenHiddenDim * activationOutputWidth / weightElementsPerByte);
     gmmAddrInfo.bScaleGlobal = GetExpertWeightAddr<QuantScaleType>(
-        weights.weightScales2, gmmConfig.isPerExpertWeightTensor, sharedExpertIdx,
+        weights.weightScales2, gmmConfig.sharedWeightList, sharedExpertIdx,
         static_cast<uint64_t>(sharedExpertIdx) * tokenHiddenDim * activationScaleWidth);
     uint32_t tokenGroupCount = Ops::Base::CeilDiv(commonConfig.tokenNum, Gmm1TileM);
     gmmAddrInfo.sharedExpertGmm2TileCounter =

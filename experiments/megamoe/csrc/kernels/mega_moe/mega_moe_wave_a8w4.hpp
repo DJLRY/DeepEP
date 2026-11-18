@@ -169,7 +169,12 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Dispatc
         // expert, in addition to the wave rotation above; AIC/activation ownership
         // and the complete-row readiness threshold must remain unchanged.
         if (UseHierarchicalRoce(params_.tilingData)) {
-            constexpr uint32_t workers = HIERARCHICAL_DISPATCH_WORKERS;
+            const auto* t = params_.tilingData;
+            const bool half = (t->bs == 32U || t->bs == 48U || t->bs == 64U || t->bs == 72U) && t->h == 3584U &&
+                              t->hiddenDim == 2560U && t->moeExpertPerRank == 12U && t->topK == 8U &&
+                              t->sharedExpertNum == 0U && t->epWorldSize == 32U &&
+                              t->combineQuantMode == COMBINE_NO_QUANT;
+            const uint32_t workers = half ? HIERARCHICAL_DISPATCH_WORKERS : dispatchJob.totalJobs;
             dispatchJob.jobIndex =
                 GetDispatchSubsetJobIndex(dispatchJob.jobIndex, dispatchJob.totalJobs, workers, range.begin.expertIdx);
             dispatchJob.totalJobs = workers;
@@ -344,13 +349,17 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
     int32_t& readySequence)
 {
     AivTaskCursor activation{}, combine{};
+    ExpertTokenPosition dispatch{};
+    uint32_t dispatchGroups = 0U;
+    uint64_t dispatchWave = 0U;
+    DispatchNextExpertSlice(dispatch, dispatchGroups, dispatchWave);
+    const bool early = params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData);
+    bool readersDone = dispatch.expertIdx >= commonConfig_.moeExpertPerRank;
+    if (early && readersDone) PublishCoreClosure(params_, countWorkspace_.blockIdx, false);
     bool hasActivation = NextAivSlice(activation, true);
     bool hasCombine = NextAivSlice(combine, false);
     SharedActivationCursor shared{};
     shared.done = sharedExpertNum_ == 0U;
-    ExpertTokenPosition dispatch{};
-    uint32_t dispatchGroups = 0U;
-    uint64_t dispatchWave = 0U;
     while (hasActivation || hasCombine || !shared.done || dispatch.expertIdx < commonConfig_.moeExpertPerRank) {
         if (hasActivation && IsActivationReady(activation, readySequence)) {
             combinePipeline_.Drain(timer_);
@@ -368,6 +377,10 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
             }
             combinePipeline_.Drain(timer_);
             DispatchNextExpertSlice(dispatch, dispatchGroups, dispatchWave);
+            if (early && !readersDone && dispatch.expertIdx >= commonConfig_.moeExpertPerRank) {
+                PublishCoreClosure(params_, countWorkspace_.blockIdx, false);
+                readersDone = true;
+            }
             continue;
         }
         if (!shared.done && TryRunSharedExpertActivation(shared, &combinePipeline_)) {
@@ -378,6 +391,15 @@ __aicore__ inline void MegaMoeA8W4Wave<TemplateMegaMoeA8W4WaveTypeFunc>::Process
             continue;
         }
 
+        if (!UseAiv0CombineOwners(params_.tilingData) &&
+            IsHierarchicalCombineOwner(params_.tilingData, this->aivJob_.jobIndex)) {
+            combinePipeline_.Drain(timer_);
+            if (TryProgressHierarchicalReducedCombine(
+                    commonConfig_, params_, this->hierarchicalCombine_,
+                    HierarchicalCombineLane(params_.tilingData, this->aivJob_.jobIndex),
+                    HierarchicalRoceScratch(params_), timer_.Enabled() ? &timer_ : nullptr))
+                continue;
+        }
         // 没有可执行任务才退避；不能进入 Combine 的阻塞等待，否则可能挡住 GMM2 所需的 SwiGLU。
         int64_t start = AscendC::GetSystemCycle();
         while (AscendC::GetSystemCycle() - start < GM_FLAG_POLL_BACKOFF_CYCLES) {

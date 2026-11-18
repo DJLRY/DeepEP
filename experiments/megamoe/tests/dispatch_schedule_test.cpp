@@ -53,6 +53,8 @@ struct MoeSyncWorkspaceLayout {
 };
 struct Tiling {
     bool hierarchical = true;
+    uint32_t bs = 32, h = 3584, hiddenDim = 2560, moeExpertPerRank = 12, topK = 8, sharedExpertNum = 0;
+    uint32_t epWorldSize = 32, combineQuantMode = 0;
 };
 constexpr uint32_t HIERARCHICAL_DISPATCH_WORKERS = 14U;
 bool UseHierarchicalRoce(const Tiling* t)
@@ -260,6 +262,7 @@ Result Run(bool hierarchical, uint32_t bs, uint32_t capacity)
         auto f = std::make_unique<Fixture>();
         f->commonConfig_ = {static_cast<uint32_t>(counts.size()), 4, bs};
         f->tiling = {hierarchical};
+        f->tiling.bs = bs;
         f->params_.workspaceInfo = {&counts, reinterpret_cast<uintptr_t>(readyCounts.data())};
         f->gmmExecutionConfig_.blockJob = {worker, 28};
         f->tokenDispatchConfig_.maxOutputSize = capacity;

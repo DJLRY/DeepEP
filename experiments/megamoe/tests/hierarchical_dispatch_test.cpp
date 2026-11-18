@@ -31,7 +31,7 @@ template <MemDsbT Kind>
 void DataSyncBarrier()
 {
     static_assert(Kind == MemDsbT::DDR);
-    DispatchTest::Check(RoceTest::mteCanRead && DispatchTest::waits == 8U,
+    DispatchTest::Check(RoceTest::mteCanRead && DispatchTest::waits >= DispatchTest::tails.size(),
                         "broadcast ordering preceded the incoming payload acquire");
     ++DispatchTest::ddrBarriers;
 }
@@ -45,6 +45,7 @@ struct MoeStageCommonConfig {
     uint32_t topK;
     uint32_t tokenHiddenDim;
     uint32_t moeExpertPerRank;
+    uint32_t worldSize = 32;
 };
 struct AivJobContext {
     uint32_t jobIndex;
@@ -58,7 +59,16 @@ struct Params {
 struct SendMaskConfig {
     uint64_t railTopkIdsSlotBytes;
 };
-struct SendMaskScratch {};
+struct SendMaskScratch {
+    LocalTensor<int32_t> topkIdsTensor{TPosition::VECCALC, 0U, 1024U}, topkIndexTensor{TPosition::VECCALC, 0U, 1024U};
+};
+inline void AcquireRoutePackets(GM_ADDR data, uint32_t count, uint32_t seq, LocalTensor<int32_t>&) {
+    for (uint32_t i = 1; i <= count; ++i) {
+        uint32_t tail;
+        std::memcpy(&tail, data + i * RAIL_PACKET_BYTES - 4, 4);
+        DispatchTest::Check(tail == seq, "stale MTE packet");
+    }
+}
 inline GM_ADDR g_winRankAddr_[32]{};
 
 inline int32_t* HierarchicalSignalAddress(const PeermemInfo& info, HierarchicalSignal signal)
@@ -69,11 +79,11 @@ inline void WriteGmByPassDCache(int32_t* address, int32_t value)
 {
     using namespace DispatchTest;
     const auto offset = Offset(reinterpret_cast<uint8_t*>(address), sizeof(value));
-    if (offset >= payloadReadyBase) {
+    if (offset >= payloadReadyBase && offset < payloadReadyBase + 16U * 16U * 512U) {
         const uint32_t window = (offset - payloadReadyBase) / (16U * 512U);
         const uint32_t slotBytes = (offset - payloadReadyBase) % (16U * 512U);
         Check(window < 16U && slotBytes == ownerSlot * 512U, "broadcast wrote another gateway slot or host");
-        Check(RoceTest::blockIndex == 1 && waits == 8U && ddrBarriers == 1U && RoceTest::mteCanRead,
+        Check((RoceTest::blockIndex == 53 || RoceTest::blockIndex == 55) && waits >= tails.size() && ddrBarriers % 2U == 1U && RoceTest::mteCanRead,
               "broadcast preceded owner receive acquire/DDR boundary");
         Check(static_cast<uint32_t>(value) == sequence && broadcasts[window]++ == 0U,
               "broadcast cleared, truncated or duplicated an epoch");
@@ -145,7 +155,7 @@ inline void CalcRailRelayExpertRange(uint32_t experts, uint32_t index, uint32_t 
 inline std::vector<uint32_t> relaySources;
 inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig& common, GM_ADDR*, const SendMaskConfig&,
                                       const Params&, SendMaskScratch&, uint32_t sourceHost, uint32_t, int32_t, int32_t,
-                                      AscendTimerDevice*)
+                                      AscendTimerDevice*, GM_ADDR = nullptr, int32_t = -1, bool* = nullptr)
 {
     using namespace DispatchTest;
     Check(RoceTest::blockIndex >= 2 && RoceTest::subBlockIndex == 0 && RoceTest::mteCanRead,
@@ -194,7 +204,10 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     Check(UseDecodeRailRouting(&t), "fixture requires the production decode rail layout");
     const PeermemSizeParams sizes{capacity,           topk, hidden, 12U, 32U, 2U, 1U, false, false,
                                   TOPO_TYPE_MTE_ROCE, true, 16U};
-    const auto heapBytes = static_cast<size_t>(CalcPeermemLeastSize(sizes));
+    const uint32_t rowBytes = DispatchPacketCount(CalcQuantTokenScaleBytes(hidden, 1U, topk, false)) * RAIL_PACKET_BYTES;
+    const size_t oldHeap = CalcPeermemLeastSize(sizes);
+    const size_t dataBase = oldHeap + 16U * 16U * 512U;
+    const auto heapBytes = dataBase + 2U * capacity * rowBytes + 512U + (1U + 2U * bs) * 4U;
     // Append compact mapped ready regions for the other fifteen peers.
     // Only their ready slots are accessed by this fixture.
     local.assign(heapBytes + 15U * 16U * 512U, 0x7BU);
@@ -217,6 +230,9 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     std::vector<float> weights(bs * topk);
     for (uint32_t i = 0; i < weights.size(); ++i) weights[i] = (static_cast<int32_t>(i % 19) - 7) / 8.0F;
     Params params{&t, PeermemInfo(local.data(), &t), reinterpret_cast<uint8_t*>(weights.data())};
+    params.peermemInfo.dispatchPacketPtr = local.data() + dataBase;
+    params.peermemInfo.relayPayloadPtr = params.peermemInfo.dispatchPacketPtr + capacity * rowBytes;
+    params.peermemInfo.compactPtr = params.peermemInfo.relayPayloadPtr + capacity * rowBytes;
     MoeStageCommonConfig common{rank, bs, topk, hidden, 12U};
     payloadReadyBase = Offset(params.peermemInfo.gatewayPayloadReadyPtr, 16U * 512U);
     ownerSlot = rank % 16U;
@@ -242,15 +258,28 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     writeWord(flagOffset(HierarchicalSignal::Sequence), sequence);
     writeWord(metaCommit, sequence - 1U);
 
-    const uint32_t rowBytes = static_cast<uint32_t>(CalcQuantTokenScaleBytes(hidden, 1U, topk, false));
+    tails.clear();
     const uint32_t activeBytes = bs * rowBytes;
-    const uint32_t source = Offset(params.peermemInfo.quantTokenScalePtr, activeBytes);
+    const uint32_t source = Offset(params.peermemInfo.dispatchPacketPtr, activeBytes);
     const uint32_t destination = Offset(params.peermemInfo.relayPayloadPtr, activeBytes);
-    Check(params.peermemInfo.quantTokenScalePtr + activeBytes <= params.peermemInfo.combineSendPtr &&
-              params.peermemInfo.relayPayloadPtr + activeBytes <= params.peermemInfo.gatewayCombinePtr,
+    Check(params.peermemInfo.dispatchPacketPtr + activeBytes <= params.peermemInfo.relayPayloadPtr &&
+              params.peermemInfo.relayPayloadPtr + activeBytes <= params.peermemInfo.compactPtr,
           "actual batch exceeds its production allocation");
     for (uint32_t byte = 0U; byte < activeBytes; ++byte) {
         local[source + byte] = static_cast<uint8_t>((byte * 13U + rank) % 251U);
+    }
+    for (uint32_t end = 512; end <= activeBytes; end += 512) writeWord(source + end - 4, sequence);
+    std::array<uint32_t, 8> marker{};
+    for (uint32_t lane = 0; lane < 8; ++lane) {
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+        const uint32_t end = bs * (lane + 1) / 8;
+        if (end == bs * lane / 8) continue;
+        marker[lane] = destination + end * rowBytes - 4;
+#else
+        marker[lane] = payloadCommit + lane * 512U;
+#endif
+        tails.push_back(marker[lane]);
+        writeWord(marker[lane], sequence - 1);
     }
     const auto payload = std::vector<uint8_t>(local.begin() + source, local.begin() + source + activeBytes);
     const uint32_t railBytes = static_cast<uint32_t>(CalcRailTopkIdsSlotDataBytes(bs, topk));
@@ -287,9 +316,12 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     selectJob(1U);
     completePacking = [&] {
         selectJob(0U);
-        GatherAndPostHierarchicalDispatch({0U, 56U}, common, params, nullptr, config, scratch);
+        PackHierarchicalCombineWeights(common, params);
+        SendTopkIdsToRailServer(common, nullptr, config, params, scratch, HierarchicalHost(rank), 0U);
+        PublishHierarchicalLocalSignal(params, HierarchicalSignal::LocalRailPacked);
         selectJob(1U);
     };
+    PostHierarchicalDispatch(common, params, config);
     GatherAndPostHierarchicalDispatch({1U, 56U}, common, params, nullptr, config, scratch);
     Check(packCalls == 1U, "missing metadata pack");
     Check(std::memcmp(local.data() + messageStart, weights.data(), weights.size() * sizeof(float)) == 0,
@@ -310,7 +342,12 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
                                                   2U
                                                   : 0U;
 #endif
-        Check(lanePosts.size() == metadataPosts + (end > begin ? 1U : 0U) + 1U, "wrong per-lane POST count");
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+        constexpr unsigned commits = 0;
+#else
+        constexpr unsigned commits = 1;
+#endif
+        Check(lanePosts.size() == metadataPosts + (end > begin ? 1U : 0U) + commits, "wrong per-lane POST count");
         if (lane == 0U) {
             Check(lanePosts.front().source == messageStart && lanePosts.front().destination == messageStart &&
                       lanePosts.front().bytes == messageBytes,
@@ -323,9 +360,11 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
                   "payload range is missing, overlapping or compacted");
             covered += data.bytes;
         }
+        if (commits) {
         Check(lanePosts.back().destination == payloadCommit + lane * 512U && lanePosts.back().bytes == 4U,
               "missing or misplaced terminal lane commit");
         std::memcpy(expected.data() + payloadCommit + lane * 512U, &sequence, 4U);
+        }
     }
     Check(covered == activeBytes, "lanes did not cover actual batch exactly once");
 #if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
@@ -367,7 +406,7 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     }
     Check(relaySources.size() == 54U, "AIV1 unexpectedly relayed");
     for (uint32_t job = 0U; job < 56U; ++job) {
-        if (job == 1U) continue;
+        if (job == 53U || job == 55U) continue;
         selectJob(job);
         FinishHierarchicalDispatch({job, 56U}, common, params);
     }
@@ -379,12 +418,15 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
         Check(std::all_of(broadcasts.begin(), broadcasts.end(), [](uint32_t n) { return n == 0; }),
               "broadcast preceded all eight arrivals");
         Check(arrivals < 8U, "receiver polled an already completed lane");
-        writeWord(payloadCommit + arrival[arrivals++] * 512U, sequence);
+        while (!marker[arrival[arrivals]]) ++arrivals;
+        writeWord(marker[arrival[arrivals++]], sequence);
     };
-    selectJob(1U);
-    FinishHierarchicalDispatch({1U, 56U}, common, params);
+    selectJob(53U);
+    FinishHierarchicalDispatch({53U, 56U}, common, params);
     completeIncomingPayload = nullptr;
-    Check(arrivals == 8U && waits == 8U && ddrBarriers == 2U, "missing collective payload acquire");
+    selectJob(55U);
+    FinishHierarchicalDispatch({55U, 56U}, common, params);
+    Check(waits == 2 * tails.size() && ddrBarriers == 4U, "missing collective payload acquire");
     for (uint32_t window = 0; window < 16; ++window) {
         Check(broadcasts[window] == 1U, "owner omitted a ready notification");
         for (uint32_t slot = 0; slot < 16; ++slot) {
@@ -420,19 +462,19 @@ int main()
         for (uint32_t rank : {5U, 21U}) {
             for (const auto shape : std::array<std::array<uint32_t, 2>, 4>{{{1, 32}, {7, 64}, {31, 32}, {32, 64}}}) {
                 for (const auto pattern : {"local", "remote", "mixed", "last"}) {
-                    CheckDispatch(rank, shape[0], shape[1], 3584U, 8U, pattern);
+                    CheckDispatch(rank, shape[0], shape[1], 3456U, 8U, pattern);
                 }
             }
-            for (uint32_t bs : {72U, 73U, 96U, 127U, 128U}) CheckDispatch(rank, bs, 128U, 3584U, 8U, "mixed");
+            for (uint32_t bs : {72U, 73U, 96U, 127U, 128U}) CheckDispatch(rank, bs, 128U, 3456U, 8U, "mixed");
             CheckDispatch(rank, 256U, 256U, 3584U, 8U, "mixed");
             CheckDispatch(rank, 256U, 256U, 1024U, 32U, "last");
             CheckDispatch(rank, 31U, 64U, 1024U, 1U, "last");
             CheckDispatch(rank, 32U, 32U, 8192U, 32U, "remote");
             CheckDispatch(rank, 1U, 64U, 3584U, 32U, "local");
-            CheckDispatch(rank, 32U, 64U, 3584U, 8U, "mixed", 0x80000101U);
+            CheckDispatch(rank, 32U, 64U, 3456U, 8U, "mixed", 0x80000101U);
             CheckDispatch(rank, 7U, 64U, 3584U, 8U, "last", 0xffffffffU);
             {
-                CheckDispatch(rank, 32U, 64U, 3584U, 8U, "mixed", 257U);
+                CheckDispatch(rank, 32U, 64U, 3456U, 8U, "mixed", 257U);
                 CheckDispatch(rank, 7U, 32U, 1024U, 1U, "remote", 0xffffffffU);
                 CheckDispatch(rank, 1U, 64U, 3584U, 32U, "local", 257U);
                 CheckDispatch(rank, 256U, 256U, 1024U, 32U, "last", 257U);

@@ -1,5 +1,10 @@
 // Copyright (c) 2026, Lu Lu
 #include <algorithm>
+#include "../csrc/arena.hpp"
+#ifndef __aicore__
+#define __aicore__
+#endif
+#include "../csrc/kernels/mega_moe/catlass_gmm/a8w4_k_plan.hpp"
 #include <array>
 #include <cassert>
 #include <cstddef>
@@ -11,7 +16,76 @@
 
 using namespace MegaMoeImpl;
 
-static_assert(sizeof(MegaMoeTilingData) == 232);
+using GmmKernel::MakeA8W4KPlan;
+static_assert(MakeA8W4KPlan(128, 256, true).kb == 512);
+static_assert(MakeA8W4KPlan(129, 256, true).kb == 256);
+static_assert(MakeA8W4KPlan(16, 256, true).ka == 4096);
+static_assert(MakeA8W4KPlan(64, 256, true).ka == 1024);
+static_assert(MakeA8W4KPlan(96, 128, true).ka == 512);
+static_assert(MakeA8W4KPlan(64, 256, false).kb == 256);
+static_assert(sizeof(MegaMoeArenaOffsets) == 136);
+static_assert(sizeof(MegaMoeTilingData) == 368);
+void checkPlanDomains()
+{
+    // Every rank receives one stripe per lane, containing the four source meshes in order.
+    for (uint32_t host = 0; host < 2; ++host) {
+        uint32_t slot = 16U * host;
+        for (uint32_t lane = 0; lane < 4; ++lane)
+            for (uint32_t mesh = 0; mesh < 4; ++mesh) {
+                const uint32_t source = 16U * host + 4U * mesh + lane;
+                assert(RouteGatherSlot(source) == slot++);
+            }
+    }
+    for (uint32_t bits : {0U, 4U, 12U}) {
+        uint32_t domain = (1U << bits) - 1U;
+        for (uint32_t epoch : {0U, 1U, 127U, 128U, 259U}) {
+            uint32_t seq = NextDomainSequence(epoch, domain, bits);
+            assert((seq >> bits) == epoch + 1U && (seq & domain) == domain);
+        }
+        assert(NextDomainSequence((0x7fffffffU >> bits) - 1U, domain, bits) == 0U);
+    }
+    for (uint32_t bs : {32U, 48U, 64U, 72U, 96U, 128U}) {
+        MegaMoeTilingData t{};
+        t.topoType = TOPO_TYPE_MTE_ROCE;
+        t.epWorldSize = 32;
+        t.aicNum = 28;
+        t.blockAivNum = 56;
+        t.groupedMatmulMode = GROUPED_MATMUL_MODE_A8W4;
+        t.combineQuantMode = COMBINE_NO_QUANT;
+        t.bs = bs;
+        bool dsv = bs >= 96;
+        t.h = dsv ? 5120 : 3584;
+        t.hiddenDim = dsv ? 4608 : 2560;
+        t.topK = dsv ? 6 : 8;
+        t.moeExpertPerRank = dsv ? 13 : 12;
+        t.sharedExpertNum = dsv ? 1 : 0;
+        t.sharedFp8 = dsv;
+        assert(UseSharedRouteTable(&t));
+        assert(UseEarlyClosure(&t) == (bs == 32 || dsv));
+        assert(UseAiv0CombineOwners(&t) == (bs != 96));
+        for (uint32_t count = 1; count <= bs; ++count)
+            for (uint32_t lane = 0; lane < 16; ++lane)
+                for (uint32_t j = 0; j < count; ++j) {
+                    bool owns = bs == 96 ? j % 16 == lane : j >= count * lane / 16 && j < count * (lane + 1) / 16;
+                    assert((CompactOwner(&t, j, count) == lane) == owns);
+                }
+    }
+    constexpr uint32_t configs = 17;
+    MegaMoeArenaOffsets root{};
+    const auto capacity = LayoutArena(32, 13, 128, 8, 5120, 16, 0, configs, root);
+    for (uint32_t i = 0; i < configs; ++i) {
+        MegaMoeArenaOffsets view{};
+        assert(LayoutArena(32, 13, 128, 8, 5120, 16, i, configs, view) == capacity);
+        assert(view.domain == i && view.domainBits == 5);
+        const int64_t base = root.route - view.route;
+        for (auto member : {&MegaMoeArenaOffsets::route, &MegaMoeArenaOffsets::quant, &MegaMoeArenaOffsets::combine,
+                            &MegaMoeArenaOffsets::packetSend, &MegaMoeArenaOffsets::relay, &MegaMoeArenaOffsets::gateway,
+                            &MegaMoeArenaOffsets::partialSend, &MegaMoeArenaOffsets::partialRecv})
+            assert(base + view.*member == root.*member && root.*member < capacity);
+        assert(view.counts == root.counts && view.closure == root.closure);
+        assert(i == 0 || base >= root.closure + 98 * 512);
+    }
+}
 static_assert(offsetof(MegaMoeTilingData, dispatchRanksPerNode) == 216);
 static_assert(offsetof(MegaMoeTilingData, roceScratchUbOffset) == 220);
 static_assert(offsetof(MegaMoeTilingData, hierarchicalSequence) == 224);
@@ -76,7 +150,7 @@ void check_hybrid(uint32_t capacity, uint32_t h, uint32_t topk, bool prefetch, u
     assert(hybrid.gatewayPayloadReadyPtr - hybrid.hierarchicalControlPtr ==
            static_cast<int64_t>(HierarchicalSignal::Count) * 512);
     assert(hybrid.combinePartialSendPtr - hybrid.gatewayPayloadReadyPtr == 16 * 512);
-    assert(base + size - hybrid.combineReduceCommitPtr == 8 * 512);
+    assert(base + size - hybrid.combineReduceCommitPtr == 16 * 512);
     assert(hybrid.quantTokenScalePtr - routeBase == 2 * CalcRailTopkIdsSlotBytes(&t));
     assert(routeBase - hybrid.expertCountRecvPtr == CalcMteExpertCountRecvSize(t.moeExpertPerRank, 32));
     assert(CalcSendMaskExpertCapacity(&t, 46) >= 16 * t.moeExpertPerRank);
@@ -199,7 +273,7 @@ void check_packet_gateway_layout(uint8_t mode)
             for (uint64_t row = 0; row < rows; ++row)
                 assert(reinterpret_cast<uintptr_t>(info.gatewayCombinePtr + row * rowBytes) % 512U == 0U);
 
-            auto* end = info.combineReduceCommitPtr + 8U * 512U;
+            auto* end = info.combineReduceCommitPtr + 16U * 512U;
             assert(end == base + bytes);
             for (uint32_t bs : {1U, 32U, 64U}) {
                 t.bs = bs;
@@ -237,6 +311,7 @@ int main(int argc, char** argv)
     auto legacy = make_tiling(31, 1024, 6, true, mode);
     legacy.topoType = TOPO_TYPE_MTE;
     legacy.dispatchRanksPerNode = 8;
+    checkPlanDomains();
     assert(RailServerSize(&legacy) == 8);
     assert(CalcServerNum(32, RailServerSize(&legacy)) == 4);
     // Frozen EP32 legacy layout: catches accidental size/offset ABI changes.

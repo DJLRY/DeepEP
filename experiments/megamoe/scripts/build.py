@@ -28,7 +28,7 @@ def build(root=ROOT, *, rebuild_shmem=False, rdma_backend=None):
     env = dict(os.environ)
     env.setdefault("DEEPEP_NPU_ARCH", lock["target"])
     env.setdefault("DEEPEP_BUILD_MEGAMOE", "ON")
-    env.setdefault("DEEPEP_MEGAMOE_TIMER", env["DEEPEP_BUILD_MEGAMOE"])
+    env.setdefault("DEEPEP_MEGAMOE_TIMER", "OFF")
     beta, timer = env["DEEPEP_BUILD_MEGAMOE"], env["DEEPEP_MEGAMOE_TIMER"]
     if beta not in {"ON", "OFF"} or timer not in {"ON", "OFF"} or (beta == "OFF" and timer == "ON"):
         raise ValueError("Build options must be ON/OFF; timer requires MegaMoE")

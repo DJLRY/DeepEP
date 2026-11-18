@@ -244,7 +244,7 @@ import torch, torch_npu, deep_ep
 from deep_ep._native import require_native
 import deep_ep_experimental.megamoe._C as megamoe
 require_native('BS32 preflight')
-if getattr(megamoe, 'api_protocol', None) != 12:
+if getattr(megamoe, 'api_protocol', None) != 17:
     raise RuntimeError('Installed MegaMoE protocol is outdated; run run_bs32.sh build on both hosts first')
 info = json.loads(files('deep_ep').joinpath('_build_info.json').read_text())
 if Path(deep_ep.__file__).resolve().is_relative_to(Path(sys.argv[1]).resolve()):
@@ -257,6 +257,7 @@ if int(sys.argv[4]) > getattr(megamoe, 'hierarchical_max_tokens', 32):
     raise RuntimeError('Installed wheel does not support requested BS; run run_bs32.sh build on both hosts first')
 if torch.npu.device_count() != 16:
     raise RuntimeError('BS32 requires sixteen visible NPUs on each host')
+print('[CHECK] SHMEM:', [line.split()[-1] for line in Path('/proc/self/maps').read_text().splitlines() if 'libshmem.so' in line][:1], 'MegaMoE:', getattr(megamoe, '__file__', None), flush=True)
 print('[CHECK] Python:', sys.executable, 'deep_ep:', deep_ep.__file__, flush=True)
 """
     execute(
@@ -517,7 +518,7 @@ def dispatch(
                 include_wait=include_wait,
                 perf_method=perf_method,
                 extra_bs=extra_bs,
-                implementation="qp8_cross_expert",
+                implementation="dispatch_qp8_combine_qp16",
                 bs_values=case["bs_values"],
             ),
             indent=2,
@@ -622,7 +623,7 @@ def main(argv=None, *, print_text=True):
     parser.add_argument("--warmup", type=int, help="perf/trace only: warmup calls (default: perf 20, trace 2)")
     parser.add_argument(
         "--perf-method",
-        choices=("legacy", "shmem"),
+        choices=("legacy", "legacy-read", "legacy-zero", "shmem"),
         default=None,
         help="perf/trace only: legacy Exp20 batch (default) or per-round SHMEM alignment",
     )

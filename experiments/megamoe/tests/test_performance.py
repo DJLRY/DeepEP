@@ -66,6 +66,16 @@ def test_bad_profiler_export_is_never_a_success(tmp_path, rows, iterations, mess
         read_kernel_samples(tmp_path, iterations)
 
 
+def test_read_only_profile_requires_one_sum_before_each_kernel(tmp_path):
+    directory = tmp_path / "profile"
+    csv_path = directory / "kernel_details.csv"
+    write_samples(csv_path, [kernel(1, 2, "ReduceSum"), kernel(4, 2), kernel(7, 2, "ReduceSum"), kernel(10, 2)])
+    assert len(read_kernel_samples(directory, 2, require_read_sum=True)) == 2
+    write_samples(csv_path, [kernel(1, 2, "ReduceSum"), kernel(4, 2, "ReduceSum"), kernel(7, 2), kernel(10, 2)])
+    with pytest.raises(ValueError, match="alternating"):
+        read_kernel_samples(directory, 2, require_read_sum=True)
+
+
 def test_round_policy_node_scope_and_no_device_timestamp_subtraction():
     per_rank = [[1000, 900, 3, 9], [1100, 800, 8, 4], [1200, 700, 20, 2], [1300, 600, 12, 15]]
     report = summarize_rounds(per_rank, 2)

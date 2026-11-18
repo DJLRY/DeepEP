@@ -26,6 +26,8 @@ struct HierarchicalCombineProgress {
     uint32_t expectedRows = 0U;
     uint32_t sentRows = 0U;
     uint32_t nextRow = 0U;
+    uint32_t owned = 0U;
+    uint32_t tokens[HIERARCHICAL_MAX_TOKENS]{};
     bool initialized = false;
 };
 

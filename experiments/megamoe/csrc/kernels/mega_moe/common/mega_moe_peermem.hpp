@@ -62,7 +62,7 @@ HOST_DEVICE bool UseHierarchicalCombineReduction(const MegaMoeTilingData* t)
 
 constexpr uint32_t HIERARCHICAL_COMBINE_QPS = deepep::megamoe_config::COMBINE_QPS;
 constexpr uint32_t HIERARCHICAL_DISPATCH_QPS = deepep::megamoe_config::DISPATCH_QPS;
-static_assert(HIERARCHICAL_DISPATCH_QPS == HIERARCHICAL_COMBINE_QPS);
+static_assert(HIERARCHICAL_DISPATCH_QPS <= HIERARCHICAL_COMBINE_QPS);
 constexpr uint32_t HIERARCHICAL_DISPATCH_WORKERS = deepep::megamoe_config::DISPATCH_WORKERS;
 constexpr uint32_t HIERARCHICAL_RANKS_PER_HOST = 16U;
 constexpr uint32_t HIERARCHICAL_WORLD_SIZE = 32U;
@@ -87,6 +87,37 @@ enum class HierarchicalSignal : uint32_t {
     RelayPayloadReady,
     Count
 };
+
+constexpr uint32_t DISPATCH_PACKET_DATA = 480U;
+HOST_DEVICE uint32_t DispatchPacketCount(uint32_t bytes)
+{
+    return (bytes + DISPATCH_PACKET_DATA - 1U) / DISPATCH_PACKET_DATA;
+}
+HOST_DEVICE bool UseRouteAllGather(const MegaMoeTilingData* t)
+{
+    const bool common = (t->bs == 32U || t->bs == 48U || t->bs == 64U || t->bs == 72U) && t->h == 3584U &&
+                        t->topK == 8U && t->moeExpertPerRank == 12U;
+    const bool dsv = (t->bs == 96U || t->bs == 128U) && t->h == 5120U && t->topK == 6U && t->moeExpertPerRank == 13U &&
+                     t->sharedExpertNum <= 1U;
+    return UseHierarchicalRoce(t) && t->blockAivNum >= 8U && (common || dsv);
+}
+
+HOST_DEVICE uint32_t NextDomainSequence(uint32_t previous, uint32_t domain, uint32_t bits)
+{
+    if (previous > (0x7fffffffU >> bits) - 2U) return 0U;
+    return ((previous + 1U) << bits) | domain;
+}
+
+HOST_DEVICE uint32_t RouteGatherSlot(uint32_t rank)
+{
+    return rank / 16U * 16U + rank % 4U * 4U + rank % 16U / 4U;
+}
+
+HOST_DEVICE bool UseSharedRouteTable(const MegaMoeTilingData* t)
+{
+    return UseRouteAllGather(t) && t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 &&
+           t->combineQuantMode == COMBINE_NO_QUANT && (t->sharedExpertNum == 0U || t->h == 5120U);
+}
 
 HOST_DEVICE uint32_t HierarchicalHost(uint32_t rank)
 {
@@ -123,22 +154,38 @@ HOST_DEVICE uint32_t HierarchicalPayloadTokenBegin(uint32_t tokens, uint32_t lan
 
 HOST_DEVICE uint32_t HierarchicalCombineOwnerCount(const MegaMoeTilingData* t)
 {
-    (void)t;
-    return HIERARCHICAL_COMBINE_QPS;
+    return t->aicNum != 0U && t->aicNum < HIERARCHICAL_COMBINE_QPS ? t->aicNum : HIERARCHICAL_COMBINE_QPS;
 }
 
 HOST_DEVICE bool UseAiv0CombineOwners(const MegaMoeTilingData* t)
 {
-    return UseHierarchicalRoce(t);
+    const bool dsv96 = t->bs == 96U && t->h == 5120U && t->hiddenDim == 4608U && t->moeExpertPerRank == 13U &&
+                       t->topK == 6U && t->sharedExpertNum <= 1U && t->groupedMatmulMode == GROUPED_MATMUL_MODE_A8W4 &&
+                       t->combineQuantMode == COMBINE_NO_QUANT && t->topkWeightsPrefetch == 0 &&
+                       t->epWorldSize == 32U && t->aicNum >= 16U && t->aicNum <= 32U &&
+                       t->blockAivNum == 2U * t->aicNum;
+    return UseHierarchicalRoce(t) && !dsv96;
 }
 
-// QP=8 uses g0..g7 AIV0 only after all of each owner's prologues have drained.
-// The input barrier transfers QP1..8 from g0..g7 AIV1 to these owners.
+// Each active Combine QP has one physical owner. The input barrier closes Dispatch's use of QP1..8.
 HOST_DEVICE uint32_t HierarchicalCombineLane(const MegaMoeTilingData* t, uint32_t physicalJob)
 {
     const uint32_t count = HierarchicalCombineOwnerCount(t);
     const uint32_t lane = physicalJob / 2U;
-    return (physicalJob & 1U) == 0U && lane < count ? lane : count;
+    return (physicalJob & 1U) == (UseAiv0CombineOwners(t) ? 0U : 1U) && lane < count ? lane : count;
+}
+
+HOST_DEVICE uint32_t CompactOwner(const MegaMoeTilingData* t, uint32_t index, uint32_t count)
+{
+    const uint32_t qps = HierarchicalCombineOwnerCount(t);
+    return UseAiv0CombineOwners(t) ? ((index + 1U) * qps - 1U) / count : index % qps;
+}
+HOST_DEVICE bool UseEarlyClosure(const MegaMoeTilingData* t)
+{
+    return UseSharedRouteTable(t) && t->epWorldSize == 32 && t->aicNum == 28 && t->blockAivNum == 56 &&
+           !t->topkWeightsPrefetch &&
+           ((t->bs == 32 && t->hiddenDim == 2560 && !t->sharedExpertNum) ||
+            ((t->bs == 96 || t->bs == 128) && t->hiddenDim == 4608 && t->sharedFp8));
 }
 
 HOST_DEVICE bool IsHierarchicalCombineOwner(const MegaMoeTilingData* t, uint32_t physicalJob)
@@ -165,7 +212,7 @@ HOST_DEVICE uint32_t UnpermuteJobIndex(const MegaMoeTilingData* t, uint32_t phys
     }
     // For a nonowner this counts preceding owners for either even or odd
     // physical jobs; owner jobs themselves returned above.
-    const uint32_t before = (physicalJob + 1U) / 2U;
+    const uint32_t before = (physicalJob + (UseAiv0CombineOwners(t) ? 1U : 0U)) / 2U;
     const uint32_t count = HierarchicalCombineOwnerCount(t);
     return physicalJob - (before < count ? before : count);
 }
@@ -483,12 +530,35 @@ struct PeermemInfo {
     GM_ADDR combinePartialSendPtr{nullptr};
     GM_ADDR combinePartialRecvPtr{nullptr};
     GM_ADDR combineReduceCommitPtr{nullptr};
+    GM_ADDR dispatchPacketPtr{nullptr};
+    GM_ADDR compactPtr{nullptr};
+    GM_ADDR gatherPtr{nullptr};
+    GM_ADDR closurePtr{nullptr};
 
     HOST_DEVICE PeermemInfo() = default;
     HOST_DEVICE PeermemInfo(GM_ADDR base, const MegaMoeTilingData* tilingData, uint32_t elemsPerByte = 1,
                             uint32_t serverNum = 1)
     {
         rankSyncInWorldPtr = base;
+        if (tilingData->arena.route != 0) {
+            maskRecvPtr = base + tilingData->arena.route;
+            expertCountRecvPtr = base + tilingData->arena.counts;
+            railTopkIdsRecvPtr = base + tilingData->arena.rail + HierarchicalMetadataPrefixBytes(tilingData);
+            quantTokenScalePtr = base + tilingData->arena.quant;
+            combineSendPtr = base + tilingData->arena.combine;
+            relayPayloadPtr = base + tilingData->arena.relay;
+            dispatchPacketPtr = base + tilingData->arena.packetSend;
+            gatewayCombinePtr = base + tilingData->arena.gateway;
+            combinePartialSendPtr = base + tilingData->arena.partialSend;
+            combinePartialRecvPtr = base + tilingData->arena.partialRecv;
+            hierarchicalControlPtr = base + tilingData->arena.control;
+            gatewayPayloadReadyPtr = base + tilingData->arena.ready;
+            combineReduceCommitPtr = base + tilingData->arena.commit;
+            compactPtr = base + tilingData->arena.compact;
+            gatherPtr = base + tilingData->arena.gather;
+            closurePtr = base + tilingData->arena.closure;
+            return;
+        }
         int64_t offset = PEERMEM_DATA_OFFSET;
         maskRecvPtr = base + offset;
         if (UsesMteLayout(tilingData->topoType)) {

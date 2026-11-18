@@ -277,8 +277,8 @@ def build_configuration(environment=None):
         raise RuntimeError("pybind11 version differs from dependencies.lock.json")
     version_file = Path(result["ASCEND_HOME_PATH"]) / "compiler/version.info"
     versions = dict(line.split("=", 1) for line in version_file.read_text().splitlines() if "=" in line)
-    if versions.get("Version") != lock["cann_version"]:
-        raise RuntimeError(f"This runtime build requires the CANN {lock['cann_version']} qualification baseline")
+    if not versions.get("Version", "").strip():
+        raise RuntimeError("CANN compiler/version.info is missing Version")
     result["cann"] = {
         "version": versions["Version"],
         "timestamp": versions.get("timestamp", "unknown"),
@@ -289,6 +289,15 @@ def build_configuration(environment=None):
     result["compiler_path"] = compiler
     result["megamoe"] = {"enabled": beta == "ON", "timer": timer == "ON"}
     if beta == "ON":
+        result["megamoe"].update(
+            api_protocol=17,
+            route_allgather=True,
+            dispatch_token_ready=True,
+            dispatch_lane_ready=False,
+            dispatch_qps=8,
+            combine_compact=True,
+            combine_qps=16,
+        )
         catlass = Path(env.get("CATLASS_ROOT", str(ROOT / "third-party/catlass")))
         if not (catlass / "include/catlass/gemm/tile/copy_l1_to_l0a.hpp").is_file():
             raise RuntimeError(

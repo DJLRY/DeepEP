@@ -4,6 +4,7 @@
 """Installed-package accuracy/performance/trace runner. Launch with torchrun, not st/run.sh."""
 
 import argparse
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from importlib.resources import files
 import json
@@ -14,13 +15,35 @@ from .timer.__main__ import parse_ranks
 from .performance import PERF_METHODS, SLEEP_CYCLES, alignment_config, collect_profile, enqueue_batch, summarize_rounds
 
 
+def loaded_libraries():
+    import hashlib
+    from . import _C
+
+    paths = {Path(_C.__file__).resolve()}
+    for line in Path("/proc/self/maps").read_text().splitlines():
+        fields = line.split(maxsplit=5)
+        if len(fields) == 6 and fields[-1].startswith("/"):
+            path = Path(fields[-1])
+            if (
+                path.is_file()
+                and ".so" in path.name
+                and any(key in path.name.lower() for key in ("shmem", "megamoe", "mega_moe", "deep_ep"))
+            ):
+                paths.add(path)
+    return {str(path): hashlib.sha256(path.read_bytes()).hexdigest() for path in sorted(paths)}
+
+
 def load_config(name, bs_values=None):
     path = Path(name)
     if not path.is_file():
         path = files(__package__).joinpath("configs", name + ".json")
     config = json.loads(path.read_text(encoding="utf-8"))
     required = {"schema_version", "model", "bs_values", "warmup", "iters", "seed"}
-    if not required <= set(config) or set(config) - required - {"alignment"} or config["schema_version"] != 1:
+    if (
+        not required <= set(config)
+        or set(config) - required - {"alignment", "activation_clamp", "shared_dtype", "weight_mode"}
+        or config["schema_version"] != 1
+    ):
         raise ValueError("Invalid config schema; see the packaged smoke.json")
     if set(config["model"]) != {"hidden", "intermediate_hidden", "num_experts", "num_topk", "num_shared_experts"}:
         raise ValueError("Model must specify H, intermediate width, global experts, top-k and shared experts")
@@ -36,6 +59,11 @@ def load_config(name, bs_values=None):
     for name, minimum in (("warmup", 0), ("iters", 1), ("seed", 0)):
         if type(config[name]) is not int or config[name] < minimum:
             raise ValueError(f"Invalid {name}")
+    if config.get("shared_dtype", "fp4") not in ("fp4", "fp8") or config.get("weight_mode", "tensor") not in (
+        "tensor",
+        "list",
+    ):
+        raise ValueError("Unknown shared_dtype or weight_mode")
     config["alignment"] = alignment_config(config)
     return config
 
@@ -122,8 +150,14 @@ def main():
         "--perf-method",
         choices=PERF_METHODS,
         default="legacy",
-        help="legacy: one Exp prefix; shmem: per-round L2 flush, device sleep and SHMEM barrier",
+        help="legacy uses an Exp prefix; legacy-read adds a read-only L2 sum; legacy-zero clears L2; shmem uses a per-round device barrier",
     )
+    parser.add_argument("--waves", help="Comma-separated overrides or all for 0..64 (perf mode)")
+    parser.add_argument("--retest-top", type=int, default=0, help="Repeat the fastest N wave settings")
+    parser.add_argument(
+        "--wave", type=int, choices=range(65), default=0, metavar="0..64", help="0 selects the native default"
+    )
+    parser.add_argument("--check-graph", action="store_true", help="Compare changed-input graph replays against eager")
     parser.add_argument("--input", choices=("bf16", "fp8"), default="bf16")
     parser.add_argument(
         "--routing",
@@ -143,6 +177,21 @@ def main():
     args.timer = args.timer or args.mode == "trace"
     if args.perf_method != "legacy" and args.mode == "accuracy" and not args.timer:
         parser.error("--perf-method shmem requires perf, trace, or --timer")
+    if args.waves:
+        try:
+            args.waves = list(range(65)) if args.waves == "all" else [int(n) for n in args.waves.split(",")]
+        except ValueError:
+            parser.error("--waves accepts integers or all")
+        if (
+            args.mode != "perf"
+            or args.timer
+            or args.wave
+            or len(set(args.waves)) != len(args.waves)
+            or any(not 0 <= n <= 64 for n in args.waves)
+        ):
+            parser.error("wave sweeps require distinct values 0..64 and timer-off perf")
+    if not 0 <= args.retest_top <= len(args.waves or []) or (args.check_graph and args.mode != "accuracy"):
+        parser.error("invalid retest count or graph mode")
     config = load_config(args.config, args.bs_values)
     if args.check_tokens < 0 or not 0 < args.relative_rmse < 1:
         parser.error("Invalid accuracy sample count or tolerance")
@@ -184,6 +233,10 @@ def run(args, config, group):
             args.timer_ranks,
             args.check_tokens,
             args.relative_rmse,
+            args.wave,
+            args.waves,
+            args.retest_top,
+            args.check_graph,
         ),
     )
     timer_ranks = args.timer_ranks if args.timer_ranks is not None else list(range(min(world, 8)))
@@ -233,7 +286,7 @@ def run(args, config, group):
         numerical_contract=(
             "ascend_post_gmm2_host_reduce_fp32_v1" if hierarchical else "ascend_post_gmm2_route_weight_v1"
         ),
-        implementation="qp8_cross_expert" if hierarchical else "mte",
+        implementation="dispatch_qp8_combine_qp16" if hierarchical else "mte",
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
     )
@@ -243,25 +296,47 @@ def run(args, config, group):
         group,
         num_max_tokens_per_rank=max(config["bs_values"]),
         ranks_per_node=int(os.environ["LOCAL_WORLD_SIZE"]),
+        num_max_configs=max(16, len(config["bs_values"])) if hierarchical else 1,
         **model,
     )
 
-    def device_pair(pair):
+    if buffer._domains.configs > 1:
+        for bs in config["bs_values"]:
+            buffer.prepare(bs)
+
+    def device_pair(pair, fp8=False):
         data, scale = pair
-        return (torch.from_numpy(data).npu(), torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
+        if fp8:
+            from .reference import fp4_to_fp8
+
+            data = torch.from_numpy(fp4_to_fp8(data)).npu().view(torch.float8_e4m3fn)
+        else:
+            data = torch.from_numpy(data).npu()
+        return (data, torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
 
     if args.timer and not buffer.timer_enabled:
         raise RuntimeError("Timer requires a W4A8 wheel built with DEEPEP_MEGAMOE_TIMER=ON")
     raw = make_weights(
         model["num_experts"] // world, model["hidden"], model["intermediate_hidden"], config["seed"] + rank
     )
-    prepared = transform_weights_for_mega_moe(*map(device_pair, raw))
+
+    def prepare(raw, shared=False):
+        from .weights import prepare_weights_for_mega_moe
+
+        pairs = tuple(device_pair(pair, shared and config.get("shared_dtype") == "fp8") for pair in raw)
+        if config.get("weight_mode") == "list":
+            groups = [[(w[i].clone(), s[i].clone()) for i in range(w.shape[0])] for w, s in pairs]
+            owner = prepare_weights_for_mega_moe(*groups, shared=shared)
+            return owner.l1, owner.l2
+        return transform_weights_for_mega_moe(*pairs, shared=shared)
+
+    prepared = prepare(raw)
     shared_raw, shared_kwargs = None, {}
     if model["num_shared_experts"]:
         shared_raw = make_weights(
             model["num_shared_experts"], model["hidden"], model["intermediate_hidden"], config["seed"] + 100000
         )
-        shared = transform_weights_for_mega_moe(*map(device_pair, shared_raw), shared=True)
+        shared = prepare(shared_raw, shared=True)
         shared_kwargs = dict(shared_l1_weights=shared[0], shared_l2_weights=shared[1])
     for bs in config["bs_values"]:
         case = rank_dir / f"bs_{bs}"
@@ -278,6 +353,7 @@ def run(args, config, group):
         buffer.topk_weights[:bs].copy_(torch.from_numpy(weights))
         buffer.validate_inputs(bs, x=activation)
         buffer.prepare(bs)
+        buffer._plan.set_wave(args.wave)
         (case / "resources.json").write_text(
             json.dumps(
                 dict(
@@ -300,6 +376,7 @@ def run(args, config, group):
                 cumulative_local_expert_recv_stats=stats,
                 x=activation,
                 timer=timer,
+                activation_clamp=config.get("activation_clamp"),
                 **shared_kwargs,
             )
 
@@ -316,10 +393,19 @@ def run(args, config, group):
         if args.mode == "perf" or args.timer:
             error = None
             try:
-                if args.perf_method == "legacy":
+                if args.perf_method.startswith("legacy"):
                     alignment = config["alignment"]
                     prefix = torch.zeros((alignment["rows"], alignment["cols"]), dtype=torch.float32, device="npu")
                     torch.exp(prefix, out=prefix)  # 预热 Exp，不能把懒初始化带入采集批次。
+                    if args.perf_method in ("legacy-read", "legacy-zero"):
+                        l2 = int(torch.npu.get_device_properties(torch.npu.current_device()).L2_cache_size)
+                        if l2 <= 0:
+                            raise ValueError("Missing L2_cache_size")
+                        flush_buffer = torch.zeros((2 * l2 + 3) // 4, dtype=torch.int32, device="npu")
+                        batch_options.update(
+                            flush_buffer=flush_buffer, sum_out=torch.empty((), dtype=torch.int32, device="npu")
+                        )
+                        measurement["l2_flush_bytes"] = flush_buffer.numel() * 4
                 else:
                     properties = torch.npu.get_device_properties(torch.npu.current_device())
                     l2_bytes = int(properties.L2_cache_size)
@@ -368,6 +454,40 @@ def run(args, config, group):
             counts = stats - 7
             call(stats=stats)  # 非零初值和重复累加，验证公开接口而非内部 forward。
             torch.npu.synchronize()
+            if args.check_graph:
+                static_stats = torch.zeros_like(stats)
+                graph = torch.npu.NPUGraph()
+                with torch.npu.graph(graph):
+                    call(stats=static_stats)
+                for replay in range(8):
+                    variant = dict(config, seed=config["seed"] + 1 + replay)
+                    vx, vi, vw = inputs(variant, rank, bs, "random" if replay % 2 == 0 else "skewed", world=world)
+                    if activation is None:
+                        vd, vs = quantize_input(vx)
+                        buffer.x[:bs].copy_(torch.from_numpy(vd).npu().view(torch.float8_e4m3fn))
+                        buffer.x_sf[:bs].copy_(torch.from_numpy(vs).npu().view(torch.float8_e8m0fnu))
+                    else:
+                        activation.copy_(torch.from_numpy(vx))
+                    buffer.topk_idx[:bs].copy_(torch.from_numpy(vi))
+                    buffer.topk_weights[:bs].copy_(torch.from_numpy(vw))
+                    eager_stats = torch.zeros_like(stats)
+                    call(stats=eager_stats)
+                    expected_y = result.clone()
+                    static_stats.zero_()
+                    graph.replay()
+                    torch.npu.synchronize()
+                    ok = torch.equal(expected_y, result) and torch.equal(eager_stats, static_stats)
+                    collective_check(group, f"changed input replay {replay}", None if ok else "output/count mismatch")
+                # Restore the original case for the independent CPU golden.
+                if activation is None:
+                    buffer.x[:bs].copy_(torch.from_numpy(data).npu().view(torch.float8_e4m3fn))
+                    buffer.x_sf[:bs].copy_(torch.from_numpy(scale).npu().view(torch.float8_e8m0fnu))
+                else:
+                    activation.copy_(torch.from_numpy(x))
+                buffer.topk_idx[:bs].copy_(torch.from_numpy(ids))
+                buffer.topk_weights[:bs].copy_(torch.from_numpy(weights))
+                call()
+                torch.npu.synchronize()
             reports = accuracy(
                 config,
                 rank,
@@ -391,23 +511,41 @@ def run(args, config, group):
                     flush=True,
                 )
         elif args.mode == "perf":
-            samples = collect_profile(call, group, torch, config, prefix, case / "profiler", bs, **batch_options)
-            (case / "kernel_samples.json").write_text(json.dumps(samples, indent=2), encoding="utf-8")
-            timings = [sample["duration_us"] for sample in samples]
-            per_rank = group.all_gather(timings, f"profiling BS={bs}")
-            report = summarize_rounds(per_rank, int(os.environ["LOCAL_WORLD_SIZE"]))
-            report.update(measurement)
-            report["implementation"] = manifest["implementation"]
-            (case / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-            if rank == 0:
-                print(
-                    f"[PERF] BS={bs} MegaMoe E2E={report['mean_us']:.3f}us "
-                    f"rank-max-mean={report['rank_max_mean_us']:.3f}us "
-                    f"implementation={report['implementation']} "
-                    f"rounds={report['rounds']}/{report['recorded_rounds']} "
-                    f"(last ceil(iters/2); kernel Duration; rank-min mean; timer off; method={args.perf_method})",
-                    flush=True,
+
+            def profile_wave(wave, target, warmup):
+                target.mkdir(exist_ok=True)
+                buffer._plan.set_wave(wave)
+                for _ in range(warmup):
+                    call()
+                torch.npu.synchronize()
+                with torch.npu.stream(buffer._runtime.stream) if args.perf_method == "legacy-read" else nullcontext():
+                    samples = collect_profile(
+                        call, group, torch, config, prefix, target / "profiler", bs, **batch_options
+                    )
+                (target / "kernel_samples.json").write_text(json.dumps(samples, indent=2), encoding="utf-8")
+                timings = [sample["duration_us"] for sample in samples]
+                per_rank = group.all_gather(timings, f"profiling BS={bs} wave={wave}")
+                actual = buffer._plan.effective_wave
+                collective_check(group, "effective wave", None, actual)
+                report = summarize_rounds(per_rank, int(os.environ["LOCAL_WORLD_SIZE"]))
+                report.update(
+                    measurement, effective_wave=actual, requested_wave=wave, implementation=manifest["implementation"]
                 )
+                (target / "profiling.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
+                if rank == 0:
+                    print(
+                        f"[PERF] BS={bs} wave={actual} rank-min={report['mean_us']:.3f}us rank-max={report['rank_max_mean_us']:.3f}us",
+                        flush=True,
+                    )
+                return report
+
+            if args.waves:
+                reports = [profile_wave(wave, case / f"wave_{wave}", config["warmup"]) for wave in args.waves]
+                for report in sorted(reports, key=lambda item: item["mean_us"])[: args.retest_top]:
+                    wave = report["requested_wave"]
+                    profile_wave(wave, case / f"retest_{wave}", config["warmup"])
+            else:
+                profile_wave(args.wave, case, 0)
         if args.timer:
             uninstrumented = result.float().cpu().numpy() if args.mode == "accuracy" else None
             timer, error = None, None
@@ -422,7 +560,8 @@ def run(args, config, group):
                 call()
             torch.npu.synchronize()
             group.barrier(f"timer batch BS={bs}")
-            enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], timer, **batch_options)
+            with torch.npu.stream(buffer._runtime.stream) if args.perf_method == "legacy-read" else nullcontext():
+                enqueue_batch(call, torch, prefix, config["alignment"], config["iters"], timer, **batch_options)
             torch.npu.synchronize()
             if uninstrumented is not None:
                 from .reference import error_metrics
@@ -450,7 +589,13 @@ def run(args, config, group):
                 timer_dir.mkdir(parents=True, exist_ok=True)
                 write_breakdown([r for r in records if r is not None], timer_dir, f"BS={bs}")
             del timer
-        del prefix, flush_buffer, batch_options
+        effective = buffer._plan.effective_wave
+        collective_check(group, f"final effective wave BS={bs}", None, effective)
+        manifest.setdefault("effective_waves", {})[str(bs)] = effective
+        manifest["loaded_libraries"] = loaded_libraries()
+        (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
+        batch_options.clear()
+        prefix = flush_buffer = None
         group.barrier(f"case complete BS={bs}")
     group.barrier("before SHMEM teardown")
     buffer.destroy()

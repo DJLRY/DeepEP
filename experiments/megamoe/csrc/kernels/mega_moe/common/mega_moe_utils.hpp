@@ -396,7 +396,7 @@ __aicore__ inline uint64_t GetExpertCountWorkspaceOffset(const BlockWorkspaceCon
 {
     if (useBlockMajorLayout) {
         uint32_t blockMajorStride = Ops::Base::CeilAlign(expertCount, static_cast<uint32_t>(INT_CACHELINE));
-        return static_cast<uint64_t>(workspace.blockIdx) * blockMajorStride + expertIdx;
+        return static_cast<uint64_t>(workspace.shared ? 0U : workspace.blockIdx) * blockMajorStride + expertIdx;
     }
     return static_cast<uint64_t>(expertIdx) * INT32_PER_256B * workspace.blockNum +
            static_cast<uint64_t>(INT32_PER_256B) * workspace.blockIdx;
@@ -441,6 +441,15 @@ template <typename ElementType>
 __aicore__ inline GM_ADDR GetExpertWeightAddr(GM_ADDR tensorListAddr, bool isPerExpertWeightTensor, uint32_t expertIdx,
                                               uint64_t elementOffset)
 {
+#if defined(ASCEND_DEEPEP_DIRECT_TENSOR_INPUT)
+    if (isPerExpertWeightTensor) {
+        auto* entry = reinterpret_cast<__gm__ uint64_t*>(tensorListAddr) + expertIdx;
+        GlobalTensor<uint8_t> line;
+        line.SetGlobalBuffer(reinterpret_cast<__gm__ uint8_t*>(entry));
+        DataCacheCleanAndInvalid<uint8_t, CacheLine::SINGLE_CACHE_LINE, DcciDst::CACHELINE_OUT>(line);
+        return reinterpret_cast<GM_ADDR>(*entry);
+    }
+#endif
     uint16_t tensorIdx = isPerExpertWeightTensor ? static_cast<uint16_t>(expertIdx) : 0U;
     GM_ADDR tensorAddr = GetTensorAddr(tensorIdx, tensorListAddr);
     if (isPerExpertWeightTensor) {
@@ -515,9 +524,10 @@ __aicore__ inline void WaitUntilGmFlagIsNonZero(__gm__ int32_t* flagAddr)
 __aicore__ inline void WaitForMoeExpertTokenCountReady(GM_ADDR tokenCountReadyFlagWorkspace,
                                                        const BlockWorkspaceContext& countWorkspace, uint32_t expertIdx)
 {
-    __gm__ int32_t* tokenCountReadyFlag = reinterpret_cast<__gm__ int32_t*>(tokenCountReadyFlagWorkspace) +
-                                          static_cast<uint64_t>(expertIdx) * countWorkspace.blockNum * INT_CACHELINE +
-                                          static_cast<uint64_t>(countWorkspace.blockIdx) * INT_CACHELINE;
+    __gm__ int32_t* tokenCountReadyFlag =
+        reinterpret_cast<__gm__ int32_t*>(tokenCountReadyFlagWorkspace) +
+        static_cast<uint64_t>(expertIdx) * countWorkspace.blockNum * INT_CACHELINE +
+        static_cast<uint64_t>(countWorkspace.shared ? 0U : countWorkspace.blockIdx) * INT_CACHELINE;
     WaitUntilGmFlagIsNonZero(tokenCountReadyFlag);
 }
 

@@ -107,12 +107,14 @@ class A8W4MatmulPipeline {
     } addr_;
     GM_ADDR output_ = nullptr;
     bool active_ = false;
+    bool bypassWeight_ = false;
 
     template <class Element, class Layout>
-    __aicore__ inline auto Tensor(GM_ADDR address, const Layout& layout)
+    __aicore__ inline auto Tensor(GM_ADDR address, const Layout& layout, bool bypass = false)
     {
         AscendC::GlobalTensor<Element> gm;
         gm.SetGlobalBuffer(reinterpret_cast<__gm__ Element*>(address));
+        if (bypass) gm.SetL2CacheHint(AscendC::CacheMode::CACHE_MODE_DISABLE);
         return tla::MakeTensor(gm, layout, Catlass::Arch::PositionGM{});
     }
 
@@ -144,6 +146,9 @@ public:
                           std::is_same_v<SA, typename Next::ElementMxScaleAType> &&
                           std::is_same_v<SB, typename Next::ElementMxScaleBType>,
                       "Cannot change GMM element types");
+        bypassWeight_ = !Next::IS_SHARED && config.m <= 128U &&
+                        ((config.k == 3584U && config.n == 2560U) || (config.k == 1280U && config.n == 3584U) ||
+                         (config.k == 5120U && config.n == 4608U) || (config.k == 2304U && config.n == 5120U));
         config_.m = config.m;
         config_.n = config.n;
         config_.k = config.k;
@@ -197,7 +202,7 @@ protected:
 
     __aicore__ inline void DequantizeWeight(uint32_t weightN, uint32_t rows, uint32_t cols)
     {
-        auto b = Tensor<W>(addr_.bGlobal, block_.params.layoutPrologueB);
+        auto b = Tensor<W>(addr_.bGlobal, block_.params.layoutPrologueB, bypassWeight_);
         auto tileB = tla::GetTile(b, tla::MakeCoord(0, weightN), tla::MakeShape(config_.k, cols));
         block_.op(tileB, Catlass::GemmCoord{rows, cols, config_.k}, block_.params, config_.m < 256U);
     }

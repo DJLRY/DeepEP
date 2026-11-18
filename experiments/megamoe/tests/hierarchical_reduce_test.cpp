@@ -499,6 +499,7 @@ struct Params {
         GM_ADDR sharedExpertGmm2TileCounterPtr = nullptr;
         GM_ADDR sharedExpertResultPtr = nullptr;
     } workspaceInfo{};
+    GM_ADDR inputScaleGmAddr = nullptr;
 };
 template <HardEvent E, uint32_t Id>
 void SyncFuncStatic()
@@ -506,6 +507,8 @@ void SyncFuncStatic()
     SetFlag<E>(Id);
     WaitFlag<E>(Id);
 }
+inline int32_t ReadGmByPassDCache(const int32_t* p) { return *p; }
+template <class... T> void RoceWaitCommit(T&&...) { throw std::runtime_error("unexpected early commit"); }
 struct RoceWaitState {};
 enum class RoceWaitKind { CombineRows };
 inline void RoceCheckWait(RoceWaitState&, uint32_t, uint8_t*, RoceWaitKind, uint32_t, uint32_t, int32_t* = nullptr,
@@ -546,6 +549,7 @@ inline void WaitUntilGmFlagEquals(int32_t* address, int32_t expected)
 }
 }  // namespace MegaMoeImpl
 #include "../csrc/kernels/mega_moe/stage/mega_moe_hierarchical_reduce.hpp"
+#include "../csrc/kernels/mega_moe/stage/mega_moe_route_histogram.hpp"
 #include "../csrc/kernels/mega_moe/stage/mega_moe_unpermute.hpp"
 
 namespace MegaMoeImpl {
@@ -557,7 +561,7 @@ void CheckCase(uint32_t sourceRank, uint32_t bs, uint32_t capacity, uint32_t top
                uint32_t sequence, bool shared)
 {
     using namespace ReduceTest;
-    constexpr uint32_t qps = 8U;
+    constexpr uint32_t qps = 16U;
     ub.fill(0);
     events = {};
     posts.clear();
@@ -670,7 +674,7 @@ void CheckCase(uint32_t sourceRank, uint32_t bs, uint32_t capacity, uint32_t top
     Check(std::memcmp(gateway.railTopkIdsRecvPtr + slot - prefix, weights.data(), weights.size() * 4U) == 0,
           "packed weights differ");
     Params params{&t, gateway};
-    std::array<HierarchicalCombineProgress, 8> state{};
+    std::array<HierarchicalCombineProgress, qps> state{};
     AscendTimerDevice timer;
     auto* scratch = reinterpret_cast<uint8_t*>(static_cast<uintptr_t>(t.roceScratchUbOffset));
     for (activeLane = 0; activeLane < qps; ++activeLane) {
@@ -870,6 +874,31 @@ void CheckBatchSnapshots()
     flagSourceBegin = nullptr;
 }
 
+void CheckRouteHistograms()
+{
+    using namespace ReduceTest;
+    auto* ids = reinterpret_cast<uint32_t*>(ub.data());
+    auto* bins = reinterpret_cast<uint16_t*>(ub.data() + 8192);
+    for (uint32_t experts : {12U, 13U}) {
+        for (uint32_t count : {0U, 63U, 64U, 65U, 576U, 768U}) {
+            for (uint32_t rank : {0U, 17U, 31U}) {
+                const uint32_t first = experts * rank;
+                for (uint32_t source = 0; source < 32U; ++source) {
+                    std::fill_n(ids, 1024U, first);
+                    std::array<uint16_t, 13> expected{};
+                    for (uint32_t i = 0; i < count; ++i) {
+                        ids[i] = i % 7U == 0U ? 0xffffffffU :
+                                 (source == rank ? first + (i % experts) : (31U - rank) * experts);
+                        if (ids[i] >= first && ids[i] < first + experts) ++expected[ids[i] - first];
+                    }
+                    CountRouteSourceVF(ids, bins, count, first);
+                    Check(std::equal(bins, bins + experts, expected.begin()), "incorrect per-source route bins");
+                }
+            }
+        }
+    }
+}
+
 void CheckFusedRowNumerics()
 {
     using namespace ReduceTest;
@@ -918,6 +947,7 @@ void CheckFusedRowNumerics()
 int main()
 {
     try {
+        CheckRouteHistograms();
         CheckBatchSnapshots();
         CheckFusedRowNumerics();
         for (uint32_t rank : {0U, 21U})

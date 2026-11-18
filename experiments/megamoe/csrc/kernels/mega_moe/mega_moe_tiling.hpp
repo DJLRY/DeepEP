@@ -159,6 +159,27 @@ struct MegaMoeSendMaskBufferConfig {
     int32_t bufferCount;
     uint32_t bufferBytes;
 };
+struct MegaMoeArenaOffsets {
+    int64_t route;
+    int64_t counts;
+    int64_t rail;
+    int64_t quant;
+    int64_t combine;
+    int64_t relay;
+    int64_t packetSend;
+    int64_t gateway;
+    int64_t partialSend;
+    int64_t partialRecv;
+    int64_t control;
+    int64_t ready;
+    int64_t commit;
+    int64_t compact;
+    int64_t gather;
+    int64_t closure;
+    uint32_t domain;
+    uint32_t domainBits;
+};
+
 struct MegaMoeTilingData {
     uint32_t moeExpertPerRank;  // 本卡参与 topK 路由的 MoE 专家数，与 weight1 表达的专家数一致
     uint32_t bs;
@@ -201,6 +222,8 @@ struct MegaMoeTilingData {
     uint32_t mGroupsPerWave;     // 每个 routed expert Wave 消费的 256-row M 分组数
     // MoE 和共享专家使用相同布局：true 表示每个专家一个二维 tensor，false 表示单个三维堆叠 tensor。
     bool isPerExpertWeightTensor;
+    bool sharedFp8;
+    bool sharedWeightList;
     // 全卡一致的单卡 token 数上界（attr num_max_tokens_per_rank；attr=0 时 host 置为 bs）。
     // 跨卡窗口布局、mask 槽几何与收发批网格一律用该上界，bs 仅描述本卡真实 token 数。
     uint32_t numMaxTokensPerRank;
@@ -213,5 +236,6 @@ struct MegaMoeTilingData {
     // Nonzero invocation ID owned by SymmBuffer, independent of BS-specific Plans
     // and of the original 7-bit route/count epoch. Never wrap in a live buffer.
     uint32_t hierarchicalSequence;
+    MegaMoeArenaOffsets arena;
 };
 #endif

@@ -114,7 +114,9 @@ struct MoeStageCommonConfig {
 };
 struct BlockWorkspaceContext {
     uint32_t blockIdx = 1U, blockNum = 2U;
+    bool shared = false;
 };
+inline void WaitForMoeExpertTokenCountReady(GM_ADDR, const BlockWorkspaceContext&, uint32_t) { assert(false); }
 struct Tiling {
     bool hierarchical = true, decode = true;
     uint32_t maxOutputSize = 32U;
@@ -133,6 +135,7 @@ struct TokenDispatchScratch {
     int peerRowLimitsCache = 7;
     Tensor cumsumInfoTensor, expertTokenNumsOutTensor, expertRevNumsGlobalTensor, cumsumInfoGlobalTensor;
 };
+template <class... T> void LoadGatheredRouteCounts(T&&...) { assert(false); }
 inline bool UseHierarchicalRoce(const Tiling* t)
 {
     return t->hierarchical;
@@ -238,7 +241,7 @@ void Run(bool decode, bool hierarchical, uint32_t subblock)
         assert(!published && !acquired && maskBuilds == 0U && scratch.peerRowLimitsCache == 7);
         return;
     }
-    assert(published && acquired == hierarchical && scratch.peerRowLimitsCache == 0);
+    assert(published && !acquired && scratch.peerRowLimitsCache == 0);
     assert(maskBuilds == 0U);
     assert(totalsGm[0] == -1 && totalsGm[1] == -1 && flags[0] == 0);
     assert(Reload || prefixGm[0] == -1);

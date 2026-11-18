@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from functools import lru_cache
 import importlib
+import numbers
+import struct
 import threading
 from typing import TYPE_CHECKING
 
@@ -31,13 +33,24 @@ def _extension():
         extension = importlib.import_module(__package__ + "._C")
     except ImportError as error:
         raise ImportError("Cannot load MegaMoE Beta: check matching Torch, torch_npu, CANN and SHMEM") from error
-    if getattr(extension, "api_protocol", None) != 12:
+    if getattr(extension, "api_protocol", None) != 17:
         raise RuntimeError("MegaMoE Python/native versions differ; rebuild and reinstall the complete Beta wheel")
     return extension
 
 
 class _MegaRuntime(Runtime):
     _megamoe = True
+
+
+def _activation_clamp(value):
+    maximum = float.fromhex("0x1.fffffep127")
+    if value is None:
+        return maximum
+    if isinstance(value, bool) or not isinstance(value, numbers.Real):
+        raise TypeError("activation_clamp must be a nonnegative finite host real")
+    if not 0 <= value <= maximum:
+        raise ValueError("activation_clamp must be finite and in the FP32 range")
+    return struct.unpack("f", struct.pack("f", value))[0]
 
 
 def _pair(value, name):
@@ -58,6 +71,18 @@ def _check_fp4_weight_format(weight, name):
             f"got format={actual}, dtype={weight.dtype}, shape={tuple(weight.shape)}; "
             "call transform_weights_for_mega_moe on raw ND weights once"
         )
+
+
+class _PlanDomains:
+    def __init__(self, envelope, configs):
+        self.envelope = envelope
+        self.configs = configs
+        self.lock = threading.RLock()
+        self.next_domain = 0
+        self.views = 1
+        self.next_view = 1
+        self.frozen = False
+        self.failed = False
 
 
 class SymmBuffer:
@@ -81,6 +106,8 @@ class SymmBuffer:
         *,
         ranks_per_node: int = 0,
         timeout: int = 120,
+        base: SymmBuffer | None = None,
+        num_max_configs: int | None = None,
     ):
         import torch
         import torch.distributed as dist
@@ -90,6 +117,30 @@ class SymmBuffer:
         size = group.size() if isinstance(group, StoreGroup) else dist.get_world_size(group)
         error = None
         try:
+            if num_max_configs is None:
+                num_max_configs = (
+                    base._domains.configs
+                    if base is not None
+                    else (16 if size == 32 and ranks_per_node == 16 and num_max_tokens_per_rank <= 256 else 1)
+                )
+            integer("num_max_configs", num_max_configs, 1, 4096)
+            if base is not None:
+                base._ensure_alive()
+                if base._device != torch.device(f"npu:{npu_api().current_device()}"):
+                    raise ValueError("Shared views must use the same NPU device")
+                if (
+                    base.group is not group
+                    or base.ranks_per_node != ranks_per_node
+                    or base.mma_type != mma_type
+                    or base._timeout != timeout
+                    or base._domains.configs != num_max_configs
+                    or base._domains.frozen
+                    or num_max_configs == 1
+                ):
+                    raise ValueError("Shared views require matching runtime options and an open multi-config setup")
+                dims = (num_experts // size, num_max_tokens_per_rank, num_topk, hidden)
+                if any(v > limit for v, limit in zip(dims, base._domains.envelope)):
+                    raise ValueError("view exceeds the root envelope")
             integer("num_experts", num_experts, 1, 16384)
             integer("num_max_tokens_per_rank", num_max_tokens_per_rank, 1, 65536)
             integer("num_topk", num_topk, 1, min(32, num_experts))
@@ -114,7 +165,7 @@ class SymmBuffer:
                     raise ValueError("MTE+RoCE MegaMoE requires FP8xFP4 weights")
                 if size != 32:
                     raise ValueError("MTE+RoCE MegaMoE requires EP32 on two 16-rank hosts")
-        except (TypeError, ValueError) as failure:
+        except (AttributeError, RuntimeError, TypeError, ValueError) as failure:
             error = str(failure)
         # 在进入 SHMEM 之前共同校验布局，不能各 rank 各自选择通信偏移。
         config = (
@@ -128,13 +179,23 @@ class SymmBuffer:
             activation,
             ranks_per_node,
             timeout,
+            num_max_configs,
+            None if base is None else base._view_id,
         )
         collective_check(group, "configuration", error, config)
         ext = _extension()
-        capacity = int(
-            ext.buffer_size(size, num_experts // size, num_max_tokens_per_rank, num_topk, hidden, ranks_per_node)
+        self._domains = (
+            base._domains
+            if base is not None
+            else _PlanDomains((num_experts // size, num_max_tokens_per_rank, num_topk, hidden), num_max_configs)
         )
-        self._lock = threading.Lock()
+        capacity = int(ext.buffer_size(size, *self._domains.envelope, ranks_per_node, num_max_configs))
+        self._lock = self._domains.lock
+        self._timeout = timeout
+        self._view_id = 0 if base is None else self._domains.next_view
+        self._closed = False
+        self._plans = {}
+        self._owners = set()
         self._device = torch.device(f"npu:{npu_api().current_device()}")
         self._plan = self._plan_bs = None
         self.group, self.num_experts = group, num_experts
@@ -147,7 +208,7 @@ class SymmBuffer:
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
         try:
-            if self._hierarchical_roce and getattr(require_native("MegaMoE"), "megamoe_combine_reduce_version", 0) != 2:
+            if self._hierarchical_roce and getattr(require_native("MegaMoE"), "megamoe_combine_reduce_version", 0) != 3:
                 raise RuntimeError("Rebuild the complete wheel for MegaMoE weighted reduction and owned QPs")
             self.allocate_inputs()
         except Exception as failure:
@@ -155,14 +216,26 @@ class SymmBuffer:
         # 输入分配失败先通知所有 rank，再进入 SHMEM，避免其他 rank 已在建链等待。
         collective_check(group, "input allocation", error)
         runtime_options = dict(ranks_per_node=ranks_per_node)
-        self._runtime = _MegaRuntime(group, capacity, timeout, **runtime_options)
+        with self._lock:
+            if base is None:
+                self._runtime = _MegaRuntime(group, capacity, timeout, **runtime_options)
+            else:
+                base._ensure_alive()
+                self._runtime = base._runtime
+                self._domains.views += 1
+                self._domains.next_view += 1
+
+    def _ensure_alive(self):
+        if self._closed or self._domains.failed:
+            raise RuntimeError("SymmBuffer view was destroyed or its collective setup failed")
+        self._runtime.ensure_alive()
 
     def allocate_inputs(self):
         """Legacy idempotent helper. Inputs are already allocated by the constructor."""
         import torch
 
         if hasattr(self, "_runtime"):
-            self._runtime.ensure_alive()
+            self._ensure_alive()
         if self.x is not None:
             return self
         self.x = torch.empty(
@@ -185,7 +258,17 @@ class SymmBuffer:
             raise ValueError(f"MTE+RoCE MegaMoE currently supports decode BS in [1,{limit}]; rebuild for larger BS")
         if self._plan_bs == bs:
             return
-        # 只保留当前 BS 的计划，不让不同 BS 的最坏容量 workspace 累积占满 HBM。
+        shared = self._domains
+        if bs in self._plans:
+            self._plan, self._plan_bs = self._plans[bs], bs
+            return
+        domain = 0
+        if shared.configs > 1:
+            if shared.frozen or shared.next_domain >= shared.configs:
+                raise ValueError("plan configuration is frozen or num_max_configs exhausted")
+            domain = shared.next_domain
+            shared.next_domain += 1
+        # Single-domain plans replace the previous workspace. Multi-domain plans retain their addresses.
         self._plan = self._plan_bs = None
         runtime = self._runtime
         address = require_native("MegaMoE").megamoe_workspace_address(runtime.native)
@@ -203,7 +286,12 @@ class SymmBuffer:
             ext.ffts_config(),
             address,
             runtime.native.capacity,
+            shared.envelope,
+            domain,
+            shared.configs,
         )
+        if shared.configs > 1:
+            self._plans[bs] = self._plan
         self._plan_bs = bs
 
     def prepare(self, bs: int) -> SymmBuffer:
@@ -211,11 +299,16 @@ class SymmBuffer:
         error = None
         with self._lock:
             try:
-                self._runtime.ensure_alive()
+                self._ensure_alive()
                 integer("BS", bs, 1, self.num_max_tokens_per_rank)
             except Exception as failure:
                 error = str(failure)
-            collective_check(self.group, "prepare", error, bs)
+            try:
+                collective_check(self.group, "prepare", error, (self._view_id, bs))
+            except Exception:
+                if self._domains.configs > 1:
+                    self._domains.failed = True
+                raise
             try:
                 runtime = self._runtime
                 runtime.stream.wait_stream(npu_api().current_stream(runtime.device))
@@ -223,7 +316,12 @@ class SymmBuffer:
                     self._prepare(bs)
             except Exception as failure:
                 error = str(failure)
-            collective_check(self.group, f"prepare BS={bs}", error)
+            try:
+                collective_check(self.group, f"prepare BS={bs}", error)
+            except Exception:
+                if self._domains.configs > 1:
+                    self._domains.failed = True
+                raise
         return self
 
     @property
@@ -243,7 +341,7 @@ class SymmBuffer:
         """Fresh zeroed device trace; pass only to a separate diagnostic invocation."""
         import torch
 
-        self._runtime.ensure_alive()
+        self._ensure_alive()
         if not self.timer_enabled:
             raise RuntimeError("W4A8 timer requires DEEPEP_MEGAMOE_TIMER=ON")
         return torch.zeros(_extension().timer_numel, dtype=torch.int64, device=self._device)
@@ -254,7 +352,7 @@ class SymmBuffer:
         try:
             import torch
 
-            self._runtime.ensure_alive()
+            self._ensure_alive()
             integer("BS", bs, 1, self.num_max_tokens_per_rank)
             for name, tensor, dtype, shape in (
                 ("topk_idx", self.topk_idx, torch.int32, (self.num_max_tokens_per_rank, self.num_topk)),
@@ -291,7 +389,7 @@ class SymmBuffer:
     def benchmark_sleep(self, cycles):
         """Queue a profiling delay on the current stream; no host synchronization."""
         with self._lock:
-            self._runtime.ensure_alive()
+            self._ensure_alive()
             extension = _extension()
             if not hasattr(extension, "benchmark_sleep") or not hasattr(extension, "benchmark_barrier"):
                 raise RuntimeError("SHMEM profiling requires rebuilding and reinstalling the MegaMoE wheel")
@@ -304,17 +402,27 @@ class SymmBuffer:
         stream. Every rank must enqueue the same number of barriers in order.
         """
         with self._lock:
-            self._runtime.ensure_alive()
+            self._ensure_alive()
             _extension().benchmark_barrier(self._hierarchical_roce)
 
     def destroy(self):
         with self._lock:
-            self._runtime.close()
+            if self._closed:
+                return
+            if self._domains.views == 1:
+                self._runtime.close()
+            else:
+                self._runtime.stream.synchronize()
+            self._domains.views -= 1
+            self._closed = True
+            self._plans.clear()
+            self._owners.clear()
             self._plan = self._plan_bs = None
             self.x = self.x_sf = self.topk_idx = self.topk_weights = None
 
     def __del__(self):
-        warn_unclosed(self)
+        if not getattr(self, "_closed", True):
+            warn_unclosed(self)
 
 
 def _interleave_gate_up_128(tensor):
@@ -326,6 +434,10 @@ def _interleave_gate_up_128(tensor):
         .contiguous()
         .reshape((experts, columns, *tail))
     )
+
+
+class _SharedFp8Pair(tuple):
+    """Prepared ND GMM1 with matching interleaved weight and scale rows."""
 
 
 class _RoutedWeightPair(tuple):
@@ -351,7 +463,7 @@ def transform_weights_for_mega_moe(
     Raw inputs use [gate | up]. Routed FP4 GMM1 prepares both planar Prefill and
     [gate128, up128] Decode layouts. Keep the returned l1 pair intact and immutable;
     the API selects its layout by actual BS without a timed conversion. Pass shared=True for
-    shared experts, whose GMM1 remains planar. FP8 and GMM2 keep their layout.
+    shared experts. Shared FP4 GMM1 stays planar and shared FP8 GMM1 interleaves gate/up with their scales.
     This is not the CUDA UTCCP transform. Old prepared FP4 routed weights must
     be regenerated from raw ND inputs; do not transform prepared NZ twice.
     """
@@ -377,6 +489,8 @@ def transform_weights_for_mega_moe(
         expected = (*weight.shape[:2], k // 64, 2)
         if k % 64:
             raise ValueError(f"{name}: K must be divisible by 64")
+        if scale.dtype == torch.uint8:
+            scale = scale.view(torch.float8_e8m0fnu)
         if scale.dtype == torch.int32 and tuple(scale.shape) == (*weight.shape[:2], k // 128) and k % 128 == 0:
             # 仅接受逻辑行优先、尚未做 CUDA UTCCP 重排的 packed E8M0。
             scale = scale.contiguous().view(torch.uint8).view(torch.float8_e8m0fnu).reshape(expected)
@@ -410,7 +524,16 @@ def transform_weights_for_mega_moe(
                 input_dtype=torch_npu.float4_e2m1fn_x2,
             )
             _check_fp4_weight_format(weight, name)
-        transformed.append((weight, scale))
+        if shared and weight.dtype == torch.float8_e4m3fn and name == "l1_weights":
+            if weight.shape[1] % 256:
+                raise ValueError("shared FP8 GMM1 requires 128-column gate/up blocks")
+            weight = _interleave_gate_up_128(weight.view(torch.uint8)).view(torch.float8_e4m3fn)
+            scale = _interleave_gate_up_128(scale.view(torch.uint8)).view(torch.float8_e8m0fnu)
+            transformed.append(_SharedFp8Pair((weight, scale)))
+        else:
+            transformed.append((weight, scale))
+    if transformed[0][0].dtype != transformed[1][0].dtype:
+        raise ValueError("Both projections must have the same weight dtype")
     return tuple(transformed)
 
 
@@ -425,6 +548,7 @@ def mega_moe(
     shared_l1_weights=None,
     shared_l2_weights=None,
     out=None,
+    activation_clamp=None,
     timer=None,
 ):
     """Explicit-input convenience API; prefer fp8_fp4_mega_moe for DeepGEMM-style use.
@@ -432,7 +556,7 @@ def mega_moe(
     x: BF16 [B,H], or (FP8 E4M3 [B,H], E8M0 [B,H/32]).
     FP8 is copied into the original communication record, never dequantized/requantized.
     Routed work uses the prefill scheduler; W4 shared strategy switches at B=256.
-    No backward or graph guarantee yet.
+    For graph replay, prepare each view and batch size before capturing the forward.
     """
     return _run(
         x,
@@ -444,6 +568,7 @@ def mega_moe(
         shared_l1_weights=shared_l1_weights,
         shared_l2_weights=shared_l2_weights,
         out=out,
+        activation_clamp=activation_clamp,
         timer=timer,
     )
 
@@ -459,6 +584,7 @@ def _run(
     shared_l1_weights=None,
     shared_l2_weights=None,
     out=None,
+    activation_clamp=None,
     timer=None,
     cumulative_stats=None,
 ):
@@ -466,7 +592,36 @@ def _run(
 
     if not isinstance(sym_buffer, SymmBuffer):
         raise TypeError("sym_buffer must be this installation's MegaMoE SymmBuffer")
+    clamp = _activation_clamp(activation_clamp)
     data, scales = _pair(x, "x") if isinstance(x, tuple) else (x, None)
+    from .weights import WeightHandle
+
+    managed_routed = isinstance(l1_weights, WeightHandle)
+    owners = []
+    tables = []
+
+    def resolve(l1, l2, shared):
+        if not isinstance(l1, WeightHandle) and not isinstance(l2, WeightHandle):
+            tables.append(None)
+            return l1, l2
+        if (
+            not isinstance(l1, WeightHandle)
+            or l1 is not l1.owner.l1
+            or l2 is not l1.owner.l2
+            or l1.owner.shared != shared
+        ):
+            raise ValueError("Supply both prepared handles from the same owner")
+        owner = l1.owner
+        size = sym_buffer.num_shared_experts if shared else sym_buffer.num_experts // sym_buffer.group.size()
+        if size != owner.count:
+            raise ValueError("Expert count differs from prepared owner")
+        pair1, pair2, table = owner.select(data.shape[0] <= _extension().small_batch_max_tokens)
+        tables.append(table)
+        owners.append(owner)
+        return pair1, pair2
+
+    l1_weights, l2_weights = resolve(l1_weights, l2_weights, False)
+    shared_l1_weights, shared_l2_weights = resolve(shared_l1_weights, shared_l2_weights, True)
     w1, s1 = _pair(l1_weights, "l1_weights")
     w2, s2 = _pair(l2_weights, "l2_weights")
     shared = (None, None, None, None)
@@ -475,6 +630,8 @@ def _run(
     if shared_l1_weights is not None:
         sw1, ss1 = _pair(shared_l1_weights, "shared_l1_weights")
         sw2, ss2 = _pair(shared_l2_weights, "shared_l2_weights")
+        if sw1.dtype == torch.float8_e4m3fn and not isinstance(shared_l1_weights, _SharedFp8Pair):
+            raise ValueError("shared FP8 GMM1 needs a prepared interleaved weight and scale pair")
         shared = (sw1, sw2, ss1, ss2)
     b = sym_buffer
     if data.ndim != 2 or not 0 < data.shape[0] <= b.num_max_tokens_per_rank or data.shape[1] != b.hidden:
@@ -482,9 +639,11 @@ def _run(
     if data.device != b._device:
         raise ValueError("x must be on the buffer's creating device")
     expected = (b.num_experts // b.group.size(), b.intermediate_hidden * 2)
+    if tables[0] is not None:
+        expected = (1, expected[1])
     if tuple(w1.shape[:2]) != expected or tuple(topk_idx.shape) != (data.shape[0], b.num_topk):
         raise ValueError("Weight/routing shapes do not match the buffer configuration")
-    if (shared[0].shape[0] if shared[0] is not None else 0) != b.num_shared_experts:
+    if tables[1] is None and (shared[0].shape[0] if shared[0] is not None else 0) != b.num_shared_experts:
         raise ValueError("Shared expert count does not match the buffer configuration")
     expected_dtype = torch.uint8 if b.mma_type == "fp8xfp4" else torch.float8_e4m3fn
     if w1.dtype != expected_dtype:
@@ -495,7 +654,7 @@ def _run(
         if isinstance(l1_weights, _RoutedWeightPair):
             prepared_inputs = (*l1_weights, *l1_weights._planar)
             w1, s1 = l1_weights.select(fused)
-        elif not fused:
+        elif not fused and not managed_routed:
             raise ValueError(
                 "Prefill requires both prepared GMM1 layouts; call transform_weights_for_mega_moe "
                 "on raw ND weights and keep its returned l1 pair intact"
@@ -517,7 +676,7 @@ def _run(
             ("shared_l1_weights", shared[0]),
             ("shared_l2_weights", shared[1]),
         ):
-            if weight is not None:
+            if weight is not None and weight.dtype == torch.uint8:
                 _check_fp4_weight_format(weight, name)
     if cumulative_stats is not None:
         stats = cumulative_stats
@@ -536,25 +695,31 @@ def _run(
             raise ValueError("Cumulative stats must not alias inputs, output or timer")
     runtime = b._runtime
     with b._lock:
-        runtime.ensure_alive()
+        b._ensure_alive()
         caller = npu_api().current_stream(runtime.device)
-        runtime.stream.wait_stream(caller)
+        if caller != runtime.stream:
+            runtime.stream.wait_stream(caller)
         # 同一 owner 的调用串行进入专属流，禁止不同流覆盖仍在使用的对称空间。
         with npu_api().stream(runtime.stream):
+            if b._domains.configs > 1 and data.shape[0] not in b._plans:
+                raise RuntimeError("Collectively prepare this view and BS before its first forward")
             b._prepare(data.shape[0])
             sequence = b._sequence + 1 if b._hierarchical_roce else 0
             if sequence > 0xFFFFFFFF:
                 raise RuntimeError("RoCE invocation sequence exhausted; recreate SymmBuffer collectively")
+            b._owners.update(owners)
             result = b._plan.forward(
-                data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, sequence, out
+                data, scales, topk_idx, topk_weights, w1, w2, s1, s2, timer, *shared, *tables, clamp, sequence, out
             )
             # Keep the sequence in the buffer, not the BS-specific Plan. Failed
             # pre-launch validation does not consume an invocation ID.
             b._sequence = sequence
+            b._domains.frozen = True
             if cumulative_stats is not None:
                 cumulative_stats.add_(result[1])
                 cumulative_stats.record_stream(runtime.stream)
-        caller.wait_stream(runtime.stream)
+        if caller != runtime.stream:
+            caller.wait_stream(runtime.stream)
         for tensor in result:
             tensor.record_stream(caller)
         return result
@@ -570,9 +735,9 @@ def fp8_fp4_mega_moe(
     cumulative_local_expert_recv_stats: Tensor | None = None,
     recipe: tuple[int, int, int] = (1, 1, 32),
     activation: str = "swiglu",
-    activation_clamp: float | None = None,
     fast_math: bool = True,
     *,
+    activation_clamp: float | None = None,
     x: Tensor | None = None,
     timer: Tensor | None = None,
 ) -> None:
@@ -583,13 +748,13 @@ def fp8_fp4_mega_moe(
     timer is a fresh buffer.allocate_timer() for a separate diagnostic call.
     Routed weights are applied after GMM2; see README numerical compatibility.
     """
-    if recipe != (1, 1, 32) or activation != "swiglu" or activation_clamp is not None or fast_math is not True:
-        raise NotImplementedError("Beta supports recipe=(1,1,32), SwiGLU, no clamp, default math only")
+    if recipe != (1, 1, 32) or activation != "swiglu" or fast_math is not True:
+        raise NotImplementedError("Beta supports recipe=(1,1,32), SwiGLU, default math only")
     if not isinstance(sym_buffer, SymmBuffer):
         raise TypeError("sym_buffer must be this installation's MegaMoE SymmBuffer")
     import torch
 
-    sym_buffer._runtime.ensure_alive()
+    sym_buffer._ensure_alive()
     if y.ndim != 2 or y.dtype != torch.bfloat16:
         raise ValueError("y must be BF16 [BS,H]")
     bs = y.shape[0]
@@ -605,6 +770,7 @@ def fp8_fp4_mega_moe(
         shared_l1_weights=shared_l1_weights,
         shared_l2_weights=shared_l2_weights,
         out=y,
+        activation_clamp=activation_clamp,
         timer=timer,
         cumulative_stats=cumulative_local_expert_recv_stats,
     )

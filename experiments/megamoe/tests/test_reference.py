@@ -172,3 +172,27 @@ def test_balanced_routes_require_valid_ep_and_rank(world, rank):
     config = dict(seed=13, model=dict(hidden=32, num_experts=384, num_topk=6))
     with pytest.raises(ValueError):
         inputs(config, rank, 96, world=world)
+
+
+def test_mixed_shared_fp8_uses_the_same_logical_values_and_scales():
+    from deep_ep_experimental.megamoe.reference import FP4, fp4_to_fp8, fp8_decode
+
+    packed = np.arange(256, dtype=np.uint8)
+    values = fp8_decode(fp4_to_fp8(packed))
+    np.testing.assert_array_equal(values[::2], FP4[packed & 15])
+    np.testing.assert_array_equal(values[1::2], FP4[packed >> 4])
+
+
+@pytest.mark.parametrize("limit", [None, 0, 2, 5, 10])
+def test_activation_clamp_applies_asymmetrically_before_swiglu(limit):
+    from deep_ep_experimental.megamoe.reference import bf16, dequantize_input, expert_forward, quantize_input
+
+    x = np.eye(32, dtype=np.float32)
+    gate = np.resize(np.array([-12, -4, 4, 12], np.float32), (32, 32))
+    up = np.resize(np.array([-15, 9, -6, 20], np.float32), (32, 32))
+    w1 = np.concatenate((gate, up), axis=1).T
+    w2 = np.eye(32, dtype=np.float32)
+    g = gate if limit is None else np.minimum(gate, limit)
+    u = up if limit is None else np.clip(up, -limit, limit)
+    golden = bf16(dequantize_input(*quantize_input(bf16(u * (g / (1 + np.exp(-g)))))))
+    np.testing.assert_array_equal(expert_forward(x, w1, w2, limit), golden)

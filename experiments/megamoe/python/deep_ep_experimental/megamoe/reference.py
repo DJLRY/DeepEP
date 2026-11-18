@@ -59,6 +59,15 @@ def dequantize_input(codes, scales):
     return fp8_decode(codes) * np.repeat(scale, 32, axis=-1)
 
 
+def fp4_to_fp8(packed):
+    """Represent the same finite FP4 values as E4M3 bytes using the original E8M0 scales."""
+    lut = fp8_encode(FP4)
+    codes = np.empty((*packed.shape[:-1], packed.shape[-1] * 2), dtype=np.uint8)
+    codes[..., ::2] = lut[packed & 15]
+    codes[..., 1::2] = lut[packed >> 4]
+    return codes
+
+
 def unpack_weight(pair):
     packed, scales = pair
     packed = np.asarray(packed, dtype=np.uint8)
@@ -81,21 +90,24 @@ def make_weights(experts, hidden, intermediate, seed):
     return tuple(result)
 
 
-def expert_forward(x, w1, w2):
+def expert_forward(x, w1, w2, activation_clamp=None):
     first = bf16(x @ w1.T)
     gate, up = np.split(first, 2, axis=-1)
+    if activation_clamp is not None:
+        gate = np.minimum(gate, np.float32(activation_clamp))
+        up = np.clip(up, -np.float32(activation_clamp), np.float32(activation_clamp))
     activated = bf16(gate / (1 + np.exp(np.clip(-gate, -80, 80))) * up)
     quantized = dequantize_input(*quantize_input(activated))
     return bf16(quantized @ w2.T)
 
 
-def local_reference(x, indices, weights, l1, l2, first_expert):
+def local_reference(x, indices, weights, l1, l2, first_expert, activation_clamp=None):
     """One rank's contribution to one source rank. l1/l2 contain local experts only."""
     result = np.zeros_like(x, dtype=np.float32)
     for local in range(len(l1)):
         token, slot = np.where(indices == first_expert + local)
         if token.size:
-            contribution = expert_forward(x[token], l1[local], l2[local])
+            contribution = expert_forward(x[token], l1[local], l2[local], activation_clamp)
             np.add.at(result, token, contribution * weights[token, slot, None])
     return result
 

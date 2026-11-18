@@ -15,6 +15,8 @@ enum class CMPMODE { EQ, NE };
 namespace Reg {
 enum class MaskPattern { ALL };
 enum class MaskMergeMode { ZEROING, MERGING };
+enum class HistogramsBinType { BIN0 };
+enum class HistogramsType { FREQUENCY };
 enum class ReduceType { SUM };
 enum class PostLiteral { POST_MODE_UPDATE };
 enum class LoadDist { DIST_BRC_B32, DIST_UNPACK_B16 };
@@ -72,6 +74,18 @@ void Adds(RegTensor<T>& dst, const RegTensor<T>& src, T value, const MaskReg& ma
 {
     for (size_t i = 0; i < dst.lanes.size(); ++i)
         if (mask.lanes[i]) dst.lanes[i] = src.lanes[i] + value;
+}
+template <typename T>
+void Mins(RegTensor<T>& dst, const RegTensor<T>& src, T limit, const MaskReg& mask)
+{
+    for (size_t i = 0; i < dst.lanes.size(); ++i)
+        if (mask.lanes[i]) dst.lanes[i] = std::min(src.lanes[i], limit);
+}
+template <typename S, typename D, HistogramsBinType, HistogramsType>
+void Histograms(RegTensor<D>& dst, const RegTensor<S>& src, const MaskReg& mask)
+{
+    for (size_t i = 0; i < src.lanes.size(); ++i)
+        if (mask.lanes[i] && src.lanes[i] < dst.lanes.size()) ++dst.lanes[src.lanes[i]];
 }
 template <typename T>
 void Gather(RegTensor<T>& dst, T* src, const RegTensor<uint32_t>& offsets, const MaskReg& mask)

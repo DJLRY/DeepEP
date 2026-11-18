@@ -131,23 +131,15 @@ int main(int argc, char** argv)
         assert(session.udma() && qp_count == 32);
         session.close();
         assert(!deepep::Session::busy());
-    } else if (mode == "megamoe-roce" || mode == "megamoe-roce-close-fault" || mode == "megamoe-roce-qp4" ||
-               mode == "megamoe-roce-qp8") {
-        const unsigned appQps = mode == "megamoe-roce-qp8" ? 8U : mode == "megamoe-roce-qp4" ? 4U : 1U;
-        expected_roce_qps = 1U + appQps;
+    } else if (mode == "megamoe-roce" || mode == "megamoe-roce-close-fault") {
+        expected_roce_qps = 17U;  // QP0 is reserved; compact Combine owns QP1..16.
         fails(
             []() { deepep::Session s(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, false, false, false, true); });
         fails(
             []() { deepep::Session s(0, 16, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true); });
-        for (unsigned invalid : {0U, 2U, 3U, 5U, 9U}) {
-            fails([invalid]() {
-                deepep::Session s(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true,
-                                  invalid);
-            });
-        }
 #ifdef DEEPEP_MEGAMOE_ROCE
         expected_world = 32;
-        deepep::Session session(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true, appQps);
+        deepep::Session session(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true);
         assert(qp_engine == ACLSHMEM_DATA_OP_ROCE && qp_count == static_cast<int>(expected_roce_qps) &&
                !session.udma());
         assert(workspace_alignment == 512);
@@ -169,8 +161,8 @@ int main(int argc, char** argv)
         assert(barriers == 0);
         assert(!deepep::Session::busy() && frees == 1 && finalized == 1);
 #else
-        fails([appQps]() {
-            deepep::Session s(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true, appQps);
+        fails([]() {
+            deepep::Session s(0, 32, 2 << 20, "tcp://127.0.0.1:19091", 30, false, true, false, false, true);
         });
         assert(!deepep::Session::busy() && allocations == 0);
 #endif

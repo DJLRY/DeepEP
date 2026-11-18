@@ -130,6 +130,7 @@ struct BlockJobContext {
 struct BlockWorkspaceContext {
     uint32_t blockIdx;
     uint32_t blockNum;
+    bool shared = false;
 };
 
 template <typename T>
@@ -158,6 +159,7 @@ struct GmmExecutionConfig {
     BlockJobContext blockJob;
     int32_t groupedMatmulMode;
     bool isPerExpertWeightTensor;
+    bool sharedWeightList = false;
 };
 
 // 各流水阶段在同步 workspace 中为每个专家预留的 slot 数量。

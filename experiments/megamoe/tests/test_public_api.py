@@ -49,7 +49,9 @@ class Tensor:
         return self.data.ndim
 
     def __getitem__(self, index):
-        return Tensor(self.data[index], self.dtype, self.device)
+        result = Tensor(self.data[index], self.dtype, self.device)
+        result.npu_format = self.npu_format
+        return result
 
     def view(self, dtype):
         return Tensor(self.data.view(DTYPES[dtype]), dtype, self.device)
@@ -74,6 +76,28 @@ class Tensor:
         while isinstance(base.base, np.ndarray):
             base = base.base
         return SimpleNamespace(data_ptr=lambda: base.ctypes.data)
+
+    def data_ptr(self):
+        return self.data.ctypes.data
+
+    def storage_offset(self):
+        return (self.data_ptr() - self.untyped_storage().data_ptr()) // self.data.itemsize
+
+    def stride(self):
+        return tuple(n // self.data.itemsize for n in self.data.strides)
+
+    def unsqueeze(self, axis):
+        result = Tensor(np.expand_dims(self.data, axis), self.dtype, self.device)
+        result.npu_format = self.npu_format
+        return result
+
+    def is_inference(self):
+        return False
+
+    def copy_(self, other, non_blocking=False):
+        np.copyto(self.data, other.data)
+        self._version += 1
+        return self
 
     def record_stream(self, stream):
         self.streams.append(stream)
@@ -107,7 +131,10 @@ def backend(monkeypatch):
         device=Device,
         empty=lambda shape, dtype, device: Tensor(np.empty(shape, dtype=DTYPES[dtype]), dtype, device),
         zeros=lambda shape, dtype, device: Tensor(np.zeros(shape), dtype, device),
-        empty_like=lambda t, dtype: Tensor(np.empty(t.shape, dtype=DTYPES[dtype]), dtype, t.device),
+        empty_like=lambda t, dtype=None, device=None: Tensor(
+            np.empty(t.shape, dtype=DTYPES[dtype or t.dtype]), dtype or t.dtype, device or t.device
+        ),
+        tensor=lambda data, dtype, device, pin_memory=False: Tensor(data, dtype, device),
         distributed=dist,
         inference_mode=lambda _: contextlib.nullcontext(),
     )
@@ -116,11 +143,13 @@ def backend(monkeypatch):
 
     def format_cast(t, acl_format, *, customize_dtype, input_dtype):
         # 检查实际传入的协议，不能把所有 format_cast 参数都静默忽略。
-        assert t.dtype == "uint8" and acl_format == 29
+        assert t.dtype == "uint8" and acl_format in (2, 29)
+        if acl_format == 2:
+            assert t.npu_format == 50
         assert customize_dtype == "float8_e4m3fn" and input_dtype == "float4_e2m1fn_x2"
         events.append(("format_cast", t))
         t = Tensor(t.data.copy(), t.dtype, t.device)
-        t.npu_format = 50  # FP4 打包成 uint8 后，输出码与请求的29不同。
+        t.npu_format = 2 if acl_format == 2 else 50  # FP4 打包成 uint8 后，输出码与请求的29不同。
         return t
 
     monkeypatch.setitem(
@@ -130,7 +159,7 @@ def backend(monkeypatch):
             get_npu_format=lambda t: t.npu_format, npu_format_cast=format_cast, float4_e2m1fn_x2="float4_e2m1fn_x2"
         ),
     )
-    stream = SimpleNamespace(wait_stream=lambda _: events.append("wait"))
+    stream = SimpleNamespace(wait_stream=lambda _: events.append("wait"), synchronize=lambda: events.append("sync"))
     npu = SimpleNamespace(
         current_device=lambda: 0, current_stream=lambda _: stream, stream=lambda _: contextlib.nullcontext()
     )
@@ -138,7 +167,7 @@ def backend(monkeypatch):
     monkeypatch.setattr(
         api,
         "require_native",
-        lambda _: SimpleNamespace(megamoe_workspace_address=lambda _: 4096, megamoe_combine_reduce_version=2),
+        lambda _: SimpleNamespace(megamoe_workspace_address=lambda _: 4096, megamoe_combine_reduce_version=3),
     )
 
     class Runtime:
@@ -583,7 +612,7 @@ def test_sixteen_rank_single_host_keeps_mte(backend):
         b.destroy()
 
 
-@pytest.mark.parametrize("protocol", [5, 6, 7, 8, 9, 10, 11, 12])
+@pytest.mark.parametrize("protocol", list(range(5, 18)))
 def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypatch, protocol):
     api._extension.cache_clear()
     core = SimpleNamespace(create_megamoe_runtime=lambda: None)
@@ -591,7 +620,7 @@ def test_extension_rejects_native_without_expanded_hierarchical_support(monkeypa
     monkeypatch.setattr(api, "require_native", lambda _: core)
     monkeypatch.setattr(api.importlib, "import_module", lambda _: extension)
     try:
-        if protocol != 12:
+        if protocol != 17:
             with pytest.raises(RuntimeError, match="versions differ"):
                 api._extension()
         else:
@@ -607,9 +636,9 @@ def test_hierarchical_plan_has_no_selectable_algorithm_arguments(backend):
     try:
         for bs in (1, 32, 256):
             b.prepare(bs)
-            assert len(b._plan.options) == 11
-            assert b._plan.options[-2:] == (4096, 2 << 20)
-        assert sizes == [(32, 2, 257, 2, 1024, 16)]
+            assert len(b._plan.options) == 14
+            assert b._plan.options[-5:] == (4096, 2 << 20, (2, 257, 2, 1024), 0, 1)
+        assert sizes == [(32, 2, 257, 2, 1024, 16, 1)]
         assert b._runtime.ranks_per_node == 16
     finally:
         b.destroy()
@@ -644,3 +673,104 @@ def test_qp8_rejects_incompatible_mode_or_old_runtime_before_shmem(backend, monk
         monkeypatch.setattr(api, "require_native", lambda _: SimpleNamespace(megamoe_combine_reduce_version=1))
     with pytest.raises(ValueError, match="FP8xFP4|Rebuild"):
         hierarchical_buffer(backend, mma_type="fp8xfp8" if case == "fp8" else "fp8xfp4")
+
+
+@pytest.mark.parametrize("clamp", [None, 0, 2, 5, 10, 1 / 3])
+def test_public_clamp_is_a_captured_fp32_scalar(backend, clamp):
+    b = backend.buffer
+    y = Tensor(np.zeros((17, 1024)), "bfloat16")
+    api.fp8_fp4_mega_moe(y, *weights(), b, activation_clamp=clamp)
+    args = next(item[1] for item in backend.events if isinstance(item, tuple) and item[0] == "launch")
+    assert args[-3] == (np.finfo(np.float32).max if clamp is None else float(np.float32(clamp)))
+
+
+@pytest.mark.parametrize("bad", [True, -1, float("inf"), float("nan"), 2**129, Tensor([1], "float32")])
+def test_clamp_rejects_invalid_or_device_values(bad):
+    with pytest.raises((ValueError, TypeError)):
+        api._activation_clamp(bad)
+
+
+def test_views_cache_separate_domains_freeze_and_close_independently(backend):
+    root = hierarchical_buffer(backend, capacity=64, num_max_configs=3)
+    child = api.SymmBuffer(root.group, 64, 32, 2, 1024, 256, ranks_per_node=16, base=root)
+    root.prepare(32)
+    child.prepare(32)
+    child.prepare(16)
+    plans = [root._plans[32], child._plans[32], child._plans[16]]
+    assert [p.options[-2] for p in plans] == [0, 1, 2]
+    api.fp8_fp4_mega_moe(Tensor(np.zeros((32, 1024)), "bfloat16"), *weights(), root)
+    assert root._domains.frozen and child._domains is root._domains
+    root.destroy()
+    assert not child._runtime.closed
+    child.prepare(32)
+    assert child._plan is plans[1]
+    with pytest.raises(ValueError, match="frozen"):
+        child.prepare(31)
+    assert child._domains.failed
+    child.destroy()
+    assert child._runtime.closed
+
+
+def test_list_replacement_preserves_both_captured_tables_and_unchanged_experts(backend):
+    from deep_ep_experimental.megamoe import prepare_weights_for_mega_moe
+
+    def raw_groups():
+        return [[(w[i].clone(), s[i].clone()) for i in range(2)] for w, s in weights()]
+
+    l1, l2 = raw_groups()
+    owner = prepare_weights_for_mega_moe(l1, l2)
+    tables = [owner.select(f)[2] for f in (True, False)]
+    old = [t.data.copy() for t in tables]
+    l1, l2 = raw_groups()
+    owner.update_experts([1], l1[1:], l2[1:], replace=True)
+    for fused, table, previous in zip((True, False), tables, old):
+        assert table is owner.select(fused)[2]
+        assert np.array_equal(table.data[:, 0], previous[:, 0])
+        assert np.all(table.data[:, 1] != previous[:, 1])
+    api.fp8_fp4_mega_moe(Tensor(np.zeros((17, 1024)), "bfloat16"), owner.l1, owner.l2, backend.buffer)
+    assert owner in backend.buffer._owners
+    assert owner.check_versions()
+    owner.release_retired()
+
+
+def test_list_failed_table_copy_requires_full_recovery(backend, monkeypatch):
+    from deep_ep_experimental.megamoe import prepare_weights_for_mega_moe
+
+    groups = [[(w[i].clone(), s[i].clone()) for i in range(2)] for w, s in weights()]
+    owner = prepare_weights_for_mega_moe(*groups)
+    table = owner.select(False)[2]
+    with monkeypatch.context() as patch:
+
+        def fail(*args, **kwargs):
+            raise RuntimeError("table copy failed")
+
+        patch.setattr(table, "copy_", fail)
+        with pytest.raises(RuntimeError, match="copy failed"):
+            owner.update_experts([1], *(pairs[1:] for pairs in groups), replace=True)
+    with pytest.raises(RuntimeError, match="incomplete"):
+        owner.select(True)
+    with pytest.raises(RuntimeError, match="retry all"):
+        owner.update_experts([0], *(pairs[:1] for pairs in groups))
+    owner.update_experts([1], *(pairs[1:] for pairs in groups))
+    assert owner.select(False)[2] is table
+    assert table.data[0, 1] == owner.expert_views(1)["planar_l1"][0].data_ptr()
+
+
+def test_external_eplb_refresh_updates_both_layouts_in_place(backend):
+    from deep_ep_experimental.megamoe import prepare_weights_for_mega_moe
+
+    owner = prepare_weights_for_mega_moe(*weights(), input_layout="planar_nz")
+    views = owner.expert_views(1)
+    planar, fused = views["planar_l1"], views["l1"]
+    addresses = [t.data_ptr() for pair in (planar, fused) for t in pair]
+    for target, inverse in (("planar", False), ("fused", True)):
+        src, dst = (fused, planar) if inverse else (planar, fused)
+        for t in src:
+            for block, values in enumerate(np.split(t.data, 4)):
+                values.fill(8 + 2 * block + inverse)
+        owner.refresh_gmm1(target, [1])
+        for source, result in zip(src, dst):
+            expected = np.concatenate([np.split(source.data, 4)[i] for i in (0, 2, 1, 3)])
+            np.testing.assert_array_equal(result.data, expected)
+        assert addresses == [t.data_ptr() for pair in (planar, fused) for t in pair]
+        assert owner.check_versions()

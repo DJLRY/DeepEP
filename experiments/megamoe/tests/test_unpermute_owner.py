@@ -47,12 +47,12 @@ int main() {
         t.h = 3584U;
         SetUnpermuteConfigs(t, 192U * 1024U - 256U);
         const uint32_t jobs = UnpermuteJobCount(&t);
-        assert(jobs == physical - (topology == TOPO_TYPE_MTE_ROCE ? 8U : 0U));
+        assert(jobs == physical - (topology == TOPO_TYPE_MTE_ROCE ? 16U : 0U));
         std::vector<unsigned> owners(bs, 0U);
         for (uint32_t p = 0; p < physical; ++p) {
             const uint32_t logical = UnpermuteJobIndex(&t, p);
             const bool expectedOwner = topology == TOPO_TYPE_MTE_ROCE &&
-                p % 2U == 0U && p / 2U < 8U;
+                p % 2U == 0U && p / 2U < 16U;
             assert(IsHierarchicalCombineOwner(&t, p) == expectedOwner);
             if (expectedOwner) assert(HierarchicalCombineLane(&t, p) == p / 2U);
             if (IsHierarchicalCombineOwner(&t, p)) {

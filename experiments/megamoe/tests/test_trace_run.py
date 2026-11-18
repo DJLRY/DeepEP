@@ -78,6 +78,9 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
 
     monkeypatch.setattr(validation, "collective_check", check)
     buffer = MagicMock(timer_enabled=True, workspace_bytes=64, symmetric_buffer_bytes=128, num_max_tokens_per_rank=2)
+    buffer._domains.configs = 16
+    buffer._plan.effective_wave = 6
+    monkeypatch.setattr(benchmark, "loaded_libraries", lambda: {})
     raw = np.array([11, 22, 33, 44], dtype="<i8")
     timer = buffer.allocate_timer.return_value
     timer.cpu.return_value.numpy.return_value = raw
@@ -100,9 +103,9 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
 
     # --mode trace must enable timers itself; no --timer flag is passed.
     benchmark.main()
-    assert set(buffer_options[0]) == {"num_max_tokens_per_rank", "ranks_per_node", *config["model"]}
+    assert set(buffer_options[0]) == {"num_max_tokens_per_rank", "ranks_per_node", "num_max_configs", *config["model"]}
     manifest = json.loads((output / f"rank_{rank}" / "manifest.json").read_text())
-    assert manifest["implementation"] == "qp8_cross_expert"
+    assert manifest["implementation"] == "dispatch_qp8_combine_qp16"
 
     selected = mode == "trace" and rank in (0, 16)
     assert len(calls) == warmup + iters
@@ -121,7 +124,7 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
         assert not list(output.rglob(name))
     if mode == "perf":
         report = json.loads((output / f"rank_{rank}" / "bs_2" / "profiling.json").read_text())
-        assert report["implementation"] == "qp8_cross_expert"
+        assert report["implementation"] == "dispatch_qp8_combine_qp16"
         assert report["iteration_sync"] == ("none" if method == "legacy" else "shmem_world_on_stream")
         assert report["alignment_scope"] == ("once_before_batch" if method == "legacy" else "before_each_iteration")
         assert report["perf_method"] == method

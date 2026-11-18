@@ -326,7 +326,7 @@ def test_sampling_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, 
                 (report_dir / "profiling.json").write_text(
                     json.dumps(
                         dict(
-                            implementation="qp8_cross_expert",
+                            implementation="dispatch_qp8_combine_qp16",
                             rounds=50,
                             recorded_rounds=100,
                             mean_us=12.5,
@@ -346,7 +346,7 @@ def test_sampling_workflow_reuses_settings_and_skips_golden(saved, monkeypatch, 
     for _ in range(2):
         launcher.main([action, "--config", str(path), "--perf-method", method])
     assert json.loads((outputs[-1] / "run.json").read_text())["perf_method"] == method
-    assert json.loads((outputs[-1] / "run.json").read_text())["implementation"] == "qp8_cross_expert"
+    assert json.loads((outputs[-1] / "run.json").read_text())["implementation"] == "dispatch_qp8_combine_qp16"
     assert len(calls) == (6 if action == "trace" else 2)
     assert outputs[0] != outputs[1]
     summary = (outputs[-1] / "summary.txt").read_text()
@@ -504,7 +504,7 @@ def test_preflight_checks_installed_timer_support(saved, tmp_path, monkeypatch, 
     modules["deep_ep._native"].require_native = lambda operation: None
     modules["deep_ep_experimental.megamoe._C"].timer_enabled = compiled
     modules["deep_ep_experimental.megamoe._C"].hierarchical_max_tokens = limit
-    modules["deep_ep_experimental.megamoe._C"].api_protocol = 12
+    modules["deep_ep_experimental.megamoe._C"].api_protocol = 17
 
     def execute(command, env):
         monkeypatch.setattr(sys, "argv", ["-c", *command[4:]])
@@ -560,7 +560,7 @@ def test_extra_batches_keep_independent_capacity_and_aggregate_reports(saved, mo
         (report_dir / "profiling.json").write_text(
             json.dumps(
                 dict(
-                    implementation="qp8_cross_expert",
+                    implementation="dispatch_qp8_combine_qp16",
                     perf_method=method,
                     rounds=4,
                     recorded_rounds=8,

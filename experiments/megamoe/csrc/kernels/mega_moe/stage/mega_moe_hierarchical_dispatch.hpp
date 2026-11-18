@@ -100,18 +100,107 @@ __aicore__ inline void PostHierarchicalPayloadLane(const MoeStageCommonConfig& c
     const uint32_t begin = HierarchicalPayloadTokenBegin(common.tokenNum, lane);
     const uint32_t end = HierarchicalPayloadTokenBegin(common.tokenNum, lane + 1U);
     const uint32_t rowBytes =
-        static_cast<uint32_t>(CalcQuantTokenScaleBytes(common.tokenHiddenDim, 1U, common.topK, false));
+        DispatchPacketCount(CalcQuantTokenScaleBytes(common.tokenHiddenDim, 1U, common.topK, false)) *
+        RAIL_PACKET_BYTES;
     const uint32_t gateway = HierarchicalGateway(common.rankId);
     auto* scratch = HierarchicalRoceScratch(params);
     RocePutBytes(params.peermemInfo.relayPayloadPtr + static_cast<uint64_t>(begin) * rowBytes,
-                 params.peermemInfo.quantTokenScalePtr + static_cast<uint64_t>(begin) * rowBytes,
+                 params.peermemInfo.dispatchPacketPtr + static_cast<uint64_t>(begin) * rowBytes,
                  (end - begin) * rowBytes, gateway, scratch, timer, AscendTimer::RdmaPhase::DispatchPayload, false,
                  lane + 1U, begin, end - begin);
+#if !defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
     // Empty lanes still commit. Only this QP can certify its own preceding Put.
     RocePublishCommit(
         reinterpret_cast<GM_ADDR>(HierarchicalPayloadCommit(params, lane)),
         reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::Sequence)), gateway,
         scratch, timer, AscendTimer::RdmaPhase::DispatchPayload, lane + 1U);
+#endif
+}
+
+// Slots are lane-major within each source host. The four same-lane mesh
+// records form a contiguous stripe for the second exchange.
+__aicore__ inline void CopyRoutePackets(GM_ADDR target, GM_ADDR source, uint32_t packets, const Params& params)
+{
+    GlobalTensor<uint8_t> src, dst;
+    src.SetGlobalBuffer(source);
+    dst.SetGlobalBuffer(target);
+    LocalTensor<uint8_t> packet(TPosition::VECCALC, params.tilingData->roceScratchUbOffset, RAIL_PACKET_BYTES);
+    for (uint32_t i = 0; i < packets; ++i) {
+        const uint32_t offset = i * RAIL_PACKET_BYTES;
+        DataCopy(packet, src[offset], RAIL_PACKET_BYTES);
+        SyncFuncStatic<HardEvent::MTE2_MTE3, MEGAMOE_ROCE_EVENT_ID>();
+        DataCopy(dst[offset], packet, RAIL_PACKET_BYTES);
+        SyncFuncStatic<HardEvent::MTE3_MTE2, MEGAMOE_ROCE_EVENT_ID>();
+    }
+}
+
+__aicore__ inline void BuildCompactPlan(const MoeStageCommonConfig& common, const Params& params, GM_ADDR source,
+                                        LocalTensor<int32_t>* compactIds = nullptr)
+{
+    auto* ids = reinterpret_cast<__gm__ int32_t*>(source);
+    auto* plan = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.compactPtr);
+    uint32_t count = 0;
+    for (uint32_t t = 0; t < common.tokenNum; ++t) {
+        uint32_t mask = 0;
+        for (uint32_t slot = 0; slot < common.topK; ++slot) {
+            const uint32_t i = t * common.topK + slot;
+            const int32_t id =
+                compactIds ? compactIds->GetValue(i) : ReadGmByPassDCache(ids + i + i / RAIL_PACKET_DATA_WORDS);
+            if (id >= 0 &&
+                static_cast<uint32_t>(id) / (16U * common.moeExpertPerRank) == HierarchicalHost(common.rankId))
+                mask |= 1U << slot;
+        }
+        WriteGmByPassDCache(plan + 1 + t, static_cast<int32_t>(mask));
+        if (mask) WriteGmByPassDCache(plan + 1 + common.tokenNum + count++, t);
+    }
+    WriteGmByPassDCache(plan, count);
+}
+
+__aicore__ inline void GatherRouteStripes(const AivJobContext& job, const MoeStageCommonConfig& common,
+                                          const Params& params, GM_ADDR* peers, const SendMaskConfig& config,
+                                          SendMaskScratch& scratch, AscendTimerDevice* timer)
+{
+    const uint32_t host = HierarchicalHost(common.rankId);
+    const uint32_t local = common.rankId % 16U, mesh = local / 4U, lane = local % 4U;
+    const uint32_t bytes = CalcRailTopkIdsSlotDataBytes(common.tokenNum, common.topK);
+    const uint64_t offset = params.peermemInfo.gatherPtr - params.peermemInfo.rankSyncInWorldPtr;
+    for (uint32_t pass = 0; pass < 2; ++pass) {
+        const uint32_t sourceHost = pass ^ host;
+        auto* ids = params.peermemInfo.railTopkIdsRecvPtr + sourceHost * config.railTopkIdsSlotBytes;
+        if (job.jobIndex < 4U) {
+            if (pass) {
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+                auto* marker = reinterpret_cast<__gm__ int32_t*>(ids + bytes) - 1;
+#else
+                auto* marker = HierarchicalSignalAddress(params.peermemInfo, HierarchicalSignal::NetMetaCommit);
+#endif
+                RoceWaitCommit(marker, params.tilingData->hierarchicalSequence, timer,
+                               AscendTimer::RdmaPhase::DispatchMeta, HierarchicalGateway(common.rankId));
+            }
+            const uint32_t dst = host * 16U + job.jobIndex * 4U + lane;
+            const uint32_t index = RouteGatherSlot(sourceHost * HIERARCHICAL_RANKS_PER_HOST + local);
+            CopyRoutePackets(peers[dst] + offset + index * bytes, ids, bytes / RAIL_PACKET_BYTES, params);
+        } else if (job.jobIndex < 8U && job.jobIndex - 4U != lane) {
+            const uint32_t dst = host * 16U + mesh * 4U + job.jobIndex - 4U;
+            const uint32_t first = sourceHost * 16U + lane * 4U;
+            AcquireRoutePackets(params.peermemInfo.gatherPtr + first * bytes, 4U * bytes / RAIL_PACKET_BYTES,
+                                params.tilingData->hierarchicalSequence, scratch.topkIndexTensor);
+            CopyRoutePackets(peers[dst] + offset + first * bytes, params.peermemInfo.gatherPtr + first * bytes,
+                             4U * bytes / RAIL_PACKET_BYTES, params);
+        }
+    }
+    for (uint32_t rank = job.jobIndex; rank < common.worldSize; rank += job.totalJobs) {
+        const uint32_t index = RouteGatherSlot(rank);
+        auto* record = params.peermemInfo.gatherPtr + index * bytes;
+        AcquireRoutePackets(record, bytes / RAIL_PACKET_BYTES, params.tilingData->hierarchicalSequence,
+                            scratch.topkIndexTensor);
+        bool compactIds = false;
+        RelayRailTopkIdsToExperts(common, peers, config, params, scratch, rank / 16U, job.jobIndex,
+                                  common.rankId * common.moeExpertPerRank, common.moeExpertPerRank, timer, record, rank,
+                                  &compactIds);
+        if (rank == HierarchicalGateway(common.rankId))
+            BuildCompactPlan(common, params, record, compactIds ? &scratch.topkIdsTensor : nullptr);
+    }
 }
 
 __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& job, const MoeStageCommonConfig& common,
@@ -127,23 +216,15 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
     }
     const uint32_t myHost = HierarchicalHost(common.rankId);
     const uint32_t otherHost = 1U - myHost;
-    if (job.jobIndex == HierarchicalPackJob()) {
-        PackHierarchicalCombineWeights(common, params);
-        SendTopkIdsToRailServer(common, winRankAddr, config, params, scratch, myHost, job.jobIndex);
-        PublishHierarchicalLocalSignal(params, HierarchicalSignal::LocalRailPacked);
-        return;
-    }
     const uint32_t lane = HierarchicalDispatchLane(job.jobIndex);
-    if (lane < HIERARCHICAL_DISPATCH_QPS) {
-        if (lane == 0U) {
-            PostHierarchicalDispatch(common, params, config, timer);
-        }
-        PostHierarchicalPayloadLane(common, params, lane, timer);
+    if (lane < HIERARCHICAL_DISPATCH_QPS) PostHierarchicalPayloadLane(common, params, lane, timer);
+    if (UseRouteAllGather(params.tilingData)) {
+        GatherRouteStripes(job, common, params, winRankAddr, config, scratch, timer);
         return;
     }
     // Only g1..last AIV0 relay. Each keeps its former group's expert range
     // and handles BOTH source hosts, locally packed metadata first.
-    if ((job.jobIndex & 1U) != 0U || job.totalJobs <= 2U) {
+    if (job.jobIndex == 0U || (job.jobIndex & 1U) != 0U || job.totalJobs <= 2U) {
         return;
     }
     const uint32_t relayCore = job.jobIndex / 2U - 1U;
@@ -167,6 +248,8 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
             RoceWaitCommit(marker, params.tilingData->hierarchicalSequence, timer, AscendTimer::RdmaPhase::DispatchMeta,
                            HierarchicalGateway(common.rankId));
             PublishHierarchicalLocalSignal(params, HierarchicalSignal::MetaReady);
+            BuildCompactPlan(common, params,
+                             params.peermemInfo.railTopkIdsRecvPtr + otherHost * config.railTopkIdsSlotBytes);
         }
         WaitHierarchicalLocalSignal(params,
                                     pass == 0U ? HierarchicalSignal::LocalRailPacked : HierarchicalSignal::MetaReady,
@@ -179,18 +262,37 @@ __aicore__ inline void GatherAndPostHierarchicalDispatch(const AivJobContext& jo
     }
 }
 
+__aicore__ inline bool LanePayloadVisible(const MoeStageCommonConfig& common, const Params& params, uint32_t lane)
+{
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+    const uint32_t begin = HierarchicalPayloadTokenBegin(common.tokenNum, lane);
+    const uint32_t end = HierarchicalPayloadTokenBegin(common.tokenNum, lane + 1U);
+    if (begin == end) return true;
+    const uint32_t packets =
+        DispatchPacketCount(CalcQuantTokenScaleBytes(common.tokenHiddenDim, 1U, common.topK, false));
+    auto* tail = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.relayPayloadPtr +
+                                                   static_cast<uint64_t>(end) * packets * RAIL_PACKET_BYTES) -
+                 1;
+    return RoceTestFlagEquals(tail, params.tilingData->hierarchicalSequence);
+#else
+    (void)common;
+    return RoceTestFlagEquals(HierarchicalPayloadCommit(params, lane), params.tilingData->hierarchicalSequence);
+#endif
+}
+
 __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, const MoeStageCommonConfig& common,
                                                   const Params& params, AscendTimerDevice* timer = nullptr)
 {
     if constexpr (g_coreType == AIC) {
         return;
     }
-    if (job.jobIndex != HierarchicalSendJob()) {
+    // Leave the AIV1 count-table builder and the first Dispatch wave free to run.
+    const uint32_t firstHelper = job.totalJobs - 3U;
+    if (job.jobIndex != firstHelper && job.jobIndex != firstHelper + 2U) {
         return;
     }
-    // Each sender commits before entering the input barrier. This owner has
-    // already submitted lane0 and acquires all eight INCOMING lanes without
-    // consuming another owner's CQ or waiting for a local sender barrier.
+    const uint32_t half = (job.jobIndex - firstHelper) / 2U;
+    // Helpers only observe incoming payloads. The sender retains CQ ownership.
     const uint32_t gateway = HierarchicalGateway(common.rankId);
     const bool profile = timer != nullptr && timer->Enabled();
     const int64_t start = profile ? AscendC::GetSystemCycle() : 0;
@@ -201,8 +303,7 @@ __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, cons
     RoceWaitState state;
     do {
         for (uint32_t lane = 0U; lane < HIERARCHICAL_DISPATCH_QPS; ++lane) {
-            if ((readyMask & (1U << lane)) == 0U &&
-                RoceTestFlagEquals(HierarchicalPayloadCommit(params, lane), params.tilingData->hierarchicalSequence)) {
+            if ((readyMask & (1U << lane)) == 0U && LanePayloadVisible(common, params, lane)) {
                 readyMask |= 1U << lane;
             }
         }
@@ -211,10 +312,8 @@ __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, cons
             ++polls;
         }
         if (readyMask != fullMask) {
-            // This core owns only QP1. Remaining QPs belong to other AIV1s
-            // until the input barrier, irrespective of which incoming flag lags.
-            RoceCheckWait(state, gateway, HierarchicalRoceScratch(params), RoceWaitKind::Commit, fullMask, readyMask,
-                          nullptr, 1U);
+            // Combine may already own these queues after the input barrier.
+            RoceCheckWait(state, gateway, nullptr, RoceWaitKind::Commit, fullMask, readyMask);
         }
     } while (readyMask != fullMask);
     SyncFuncStatic<HardEvent::S_MTE2, MEGAMOE_ROCE_EVENT_ID>();
@@ -229,13 +328,43 @@ __aicore__ inline void FinishHierarchicalDispatch(const AivJobContext& job, cons
     const uint32_t slot = common.rankId - firstRank;
     const uint64_t offset = params.peermemInfo.gatewayPayloadReadyPtr - params.peermemInfo.rankSyncInWorldPtr +
                             static_cast<uint64_t>(slot) * HIERARCHICAL_FLAG_BYTES;
-    for (uint32_t localRank = 0U; localRank < HIERARCHICAL_RANKS_PER_HOST; ++localRank) {
+    for (uint32_t localRank = half * 8U; localRank < (half + 1U) * 8U; ++localRank) {
         const uint32_t peer = firstRank + localRank;
         auto* ready = reinterpret_cast<__gm__ int32_t*>(
             (peer == common.rankId ? params.peermemInfo.rankSyncInWorldPtr : g_winRankAddr_[peer]) + offset);
         WriteGmByPassDCache(ready, static_cast<int32_t>(params.tilingData->hierarchicalSequence));
     }
     AscendC::DataSyncBarrier<AscendC::MemDsbT::DDR>();
+}
+
+// [0,32) reader flags, [32,64) producer flags, [64,96) per-rank
+// broadcasts and [96,98) host closure flags. Every line has one writer.
+__aicore__ inline __gm__ int32_t* ClosureSlot(const Params& params, uint32_t slot)
+{
+    return reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.closurePtr + slot * HIERARCHICAL_FLAG_BYTES);
+}
+
+__aicore__ inline void PublishCoreClosure(const Params& params, uint32_t block, bool producers)
+{
+    PipeBarrier<PIPE_ALL>();
+    DataSyncBarrier<MemDsbT::DDR>();
+    WriteGmByPassDCache(ClosureSlot(params, block + (producers ? 32U : 0U)), params.tilingData->hierarchicalSequence);
+}
+
+__aicore__ inline void CloseHost(const Params& params, uint32_t rank, bool producers)
+{
+    const uint32_t seq = params.tilingData->hierarchicalSequence;
+    for (uint32_t block = 0; block < params.tilingData->aicNum; ++block)
+        WaitUntilGmFlagEquals(ClosureSlot(params, block + (producers ? 32U : 0U)), seq);
+    DataSyncBarrier<MemDsbT::DDR>();
+    const uint32_t host = HierarchicalHost(rank) * 16U;
+    const uint32_t first = producers ? 80U : 64U;
+    const uint64_t offset = params.peermemInfo.closurePtr - params.peermemInfo.rankSyncInWorldPtr +
+                            (first + rank - host) * HIERARCHICAL_FLAG_BYTES;
+    for (uint32_t r = host; r < host + 16U; ++r)
+        WriteGmByPassDCache(reinterpret_cast<__gm__ int32_t*>(g_winRankAddr_[r] + offset), seq);
+    for (uint32_t i = 0; i < 16U; ++i) WaitUntilGmFlagEquals(ClosureSlot(params, first + i), seq);
+    WriteGmByPassDCache(ClosureSlot(params, producers ? 97U : 96U), seq);
 }
 
 // Output barrier closes every local reader before the next invocation reuses GM.

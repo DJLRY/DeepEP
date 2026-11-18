@@ -37,7 +37,7 @@ def fp8_fp4_mega_moe(
 | `cumulative_local_expert_recv_stats` | 可选 int32 `[L]`，在原值上累加专家接收 token 数 |
 | `timer` | 可选 `buffer.allocate_timer()`；仅在单独诊断调用中传入 |
 
-`recipe/activation/activation_clamp/fast_math` 当前仅支持签名中的默认值。所有张量在 buffer 所在 NPU 上。
+`activation_clamp` 可传非负有限 host 实数，None 使用 FP32 最大有限值。GMM1 的 BF16 输出转 FP32 后，gate 只裁上限，up 裁到 [−C, C]，随后计算 SwiGLU。C 是每次调用按值捕获的参数。其余 recipe、activation、fast_math 参数使用默认值。所有张量在 buffer 所在 NPU 上。
 FP8 输入仍需打包到通信区，因此流水中的 `AIV_QUANT` 此时表示打包，不是重新量化。
 
 权重在测试/推理前转换一次，转换过程不计入性能测量：
@@ -48,7 +48,7 @@ FP8 输入仍需打包到通信区，因此流水中的 `AIV_QUANT` 此时表示
 | GMM2 | `[L,H,I/2]` | `[L,H,I/64,2]` |
 
 调用 `w1, w2 = transform_weights_for_mega_moe(raw_w1, raw_w2)` 得到 Ascend NZ 权重。FP4 routed GMM1 一次准备两套 weight/scale：实际 B≤256 使用 `[gate128, up128]` 融合布局，B>256 使用 `[gate | up]` 配对布局。转换不进入计时区间，但额外保留一份 GMM1 权重和 scale；GMM2 不复制。
-请完整保留返回的 `w1`，不要解包后重组、原地修改或自行搬运其张量；权重更新或设备变化时从原始 ND 重新转换。共享专家将首维 L 换成 S，并传入 `shared=True`，使用 planar 权重布局。
+请完整保留返回的 `w1`，不要解包后重组、原地修改或自行搬运其张量；权重更新或设备变化时从原始 ND 重新转换。共享专家将首维 L 换成 S，并传入 `shared=True`，FP4 使用 planar；原生 E4M3 的两层保持 ND，第一层同时交织 gate/up 与 E8M0 scale。
 不能直接传入已经做过 CUDA 专用重排的权重。
 
 buffer 的构造参数如下，模型参数含义与测试 JSON 相同：
@@ -75,8 +75,36 @@ buffer = SymmBuffer(
 约束：EP=2～128，E 可整除 EP 且每卡最多 128 个路由专家；S=0～8；B=1～65536；
 H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(32,E)。
 下面的 16 卡跨机路径另限 EP32、W4A8（A8W4）和实际 B=1～256。
-各 rank 必须同序、同 B 调用；仅推理，不支持反向、空/不等长 B 或图捕获。
+各 rank 同序、同 B 推理。图捕获前准备全部计划，保持输入、输出、权重 owner 和 buffer 存活至最后一次 replay 完成。
 `mma_type="fp8xfp8"` 使用 A8W8 路由专家，不支持共享专家/timer；**下文 benchmark 固定测试 W4A8，不提供权重 dtype 开关**。
+
+### 共享计划和权重更新
+
+两机 EP32、每机 16 rank 且最大 BS≤256 时，默认容量为 16 个 (view, BS) 计划。显式 `num_max_configs=1` 沿用单计划工作区。用 `SymmBuffer(group, ..., base=root)` 创建同设备、同组的 view。root 的 E、最大 BS、K、H 需要逐维覆盖每个 view。各 rank 在首次 forward 前按相同顺序调用各 view 的 `prepare(bs)`。不同 view 或图串行使用共享 payload，最后一个 view 的 `destroy()` 关闭通信资源。
+
+`owner = prepare_weights_for_mega_moe(l1, l2, shared=False, input_layout="nd")` 接受连续权重对或两组逐专家的 (weight, scale) 列表。两个投影传 `owner.l1, owner.l2`。routed FP4 也可从 `planar_nz` 生成 fused 布局，或用 `prepared` 和 `planar_l1` 导入两份已有布局。路由 ID 使用 EPLB 映射后的物理专家号。
+
+框架在 capture 外按设备事件先排空旧读者，再更新权重和映射。连续 owner 用 `update`，列表用 `update_experts(indices, l1, l2, replace=True)` 更换存储并保留表地址。通过 `expert_views(i)` 写入一份 GMM1 后调用 `refresh_gmm1(source="planar")` 或 `source="fused"` 同步另一份，全部权重与 scale 已写完时调用 `commit_prepared_update()`。最后一次旧图读取和异步复制完成后可调用 `release_retired()`。
+
+### BS96 双机验收
+
+在两台机器的目标 Python 环境设置 `NODE_RANK`（0 或 1）和同一 `MASTER_ADDR`。以下命令按每机 16 卡运行，输出目录以本轮作业新建的目录为准。
+
+```bash
+python experiments/megamoe/scripts/build.py --rdma-backend HNS_1825
+ranks="$((16 * NODE_RANK))-$((16 * NODE_RANK + 15))"
+launch=(torchrun --nnodes=2 --nproc-per-node=16 --node-rank="$NODE_RANK" --master-addr="$MASTER_ADDR" --master-port=29500)
+for input in fp8 bf16; do
+    python -m deep_ep_experimental.megamoe.golden --config ep32_bs96 --ep-size 32 \
+        --ranks "$ranks" --input "$input" --golden-dir benchmark-golden
+    "${launch[@]}" -m deep_ep_experimental.megamoe.benchmark --config ep32_bs96 --input "$input" \
+        --mode accuracy --check-graph --golden-dir benchmark-golden --output-dir "bs96-$input-accuracy"
+    "${launch[@]}" -m deep_ep_experimental.megamoe.benchmark --config ep32_bs96 --input "$input" \
+        --mode perf --perf-method legacy-read --output-dir "bs96-$input-perf"
+done
+```
+
+`accuracy.json` 包含 CPU golden 的误差和物理专家计数。换输入 replay 逐次与 eager 比较。上述性能配置关闭 timer，预热 20 轮、采集 30 轮，按最后 15 轮计算各轮跨 rank 的最小值、最大值及其均值。每个 rank 的 manifest 记录有效 wave 和已装载库的 SHA-256。性能采样检查同一设备流中的 ReduceSum/MegaMoE 对数与顺序。可在 perf 命令加 `--waves all --retest-top 3` 扫描 0–64 并复测前三项，0 使用自动 wave。
 
 兼容入口 `mega_moe(x, ids, weights, w1, w2, buffer, ...)` 返回 `(y, per_call_counts)`。
 接口签名参照 DeepGEMM `78b6900`。本实现使用 int32 路由 ID、E8M0 输入 scale，
@@ -117,7 +145,7 @@ W4A8 在 B≤256 时使用较小 wave、rail 路由中转和打包 count。
 显式指定 `ranks_per_node=16` 时 rail 使用16卡分组；跨机采用下文的 MTE＋RoCE 路径。
 B>256 保留 Prefill 输入协议，所有路径保留输出跨卡同步。
 
-要求 Linux、Python ≥3.11、Ascend950、CANN 9.2.0 及匹配的 Torch/torch_npu；框架环境由使用者准备。
+要求 Linux、Python ≥3.11、Ascend950 及配套的 CANN、驱动和 Torch/torch_npu。CANN 9.2.0 是资格基线，构建会记录实际 SDK 版本。
 
 ```bash
 git clone https://github.com/lueelu/DeepEP.git
@@ -265,7 +293,7 @@ MegaMoE 的专属流通过已有事件依赖等待它；下一轮预处理也等
 也不代表经过跨设备时钟校准的全局起止跨度。`perf` 不传入设备 timer；安装了支持 timer 的 wheel 也不会打点，
 wheel 的编译配置可在每个 rank 的 `manifest.json` 中核对。需要恢复不支持 timer 的构建时执行普通 `build`。
 
-#### BS32：固定 QP8 实现
+#### EP32 的 Dispatch QP8 与 Combine QP16
 
 启动入口默认BS32；`run`、`golden`、`perf`、`trace`均可用 `--bs` 选择每rank实际token数（1～256）。
 例如两台机器使用相同参数依次运行：
@@ -279,16 +307,16 @@ bash experiments/megamoe/scripts/run_bs32.sh perf --bs 128
 trace需先构建timer版本，再运行 `trace --bs 128 --include-wait`。
 `--bs`与原来的 `--extra-bs`批量性能测量互斥。
 
-`run_bs32.sh run/perf/trace` 统一使用当前 QP8 实现，无需附加算法参数：
+`run_bs32.sh run/perf/trace` 统一使用 Dispatch QP8 和 Combine QP16，无需附加算法参数：
 
-- 8 个 AIV0 网关 owner，各自独占 Combine QP1～8；SDK 保留 QP0。
-- 14 个 Dispatch worker，专家间及 wave 间轮换分工。
+- SDK 使用 QP0，16 个网关 owner 分别负责 Combine QP1～16。BS96 匹配混合专家配置时由 AIV1 负责，其余目标形状使用 AIV0。
+- H3584/K8 默认形状使用 14 个 Dispatch worker、wave 6。BS96/128 的 H5120/K6 混合专家配置使用 28 个 worker、wave 5。
 - 按 lane 初始化路由；网关用两个输入缓冲交替加载专家行并完成 FP32 加权归并。
 - AIV1 使用跨专家两槽 Combine 行环，连续 Combine 任务之间保留在途搬运。
 
 原有 QP 数量、Dispatch worker 数量和流水实验开关，以及 A/B、pipeline suite 入口已移除。
 机器配置、RDMA 后端、采样轮数和 timer 参数仍按下文配置。运行结果标记为
-`implementation=qp8_cross_expert`。两端需完整重新构建并重建 buffer；Python/native 接口协议为11，
+`implementation=dispatch_qp8_combine_qp16`。两端需完整重新构建并重建 buffer；Python/native 接口协议为 17，
 旧 wheel 不兼容本次调用接口和通信窗口布局。同版本 SHMEM SDK 可复用。
 
 ```bash
@@ -530,82 +558,15 @@ python3 experiments/megamoe/scripts/trace_text.py restore part1.txt part2.txt \
 FP8 和内部量化的 BF16 输入均沿用原接口，容量可大于实际 B。更多16卡主机暂不支持。
 A8W8 仅保留单机 MTE 路径。
 
-两台机器的所有 rank 都由 group 0 AIV0 打包本地元数据；group 0～7 AIV1 分别独占
-Dispatch QP1～8。QP1 的 owner 先提交 metadata，再提交本 lane 的 payload 和 commit；
-其他七个 sender 在本卡输入打包屏障之后即可提交，不等待 metadata。运行时共配置9个 QP，QP0保留给 SDK。
-所有 sender 提交完毕后才进入现有全核输入屏障；屏障之后 QP1～8交给 group 0～7 AIV0 的 Combine owner。
+每卡打包 Top-k ID 和权重后先经配对 gateway 发送元数据。目标形状在机内按 4 mesh × 4 lane 分两级交换，转发前检查整条 stripe 的包尾。每个来源按 512 B 分包，每包包含 127 个路由项和一个完整序号。索引核写入逐专家来源行，builder 用逐来源直方图生成共享前缀和专家行数。配对来源同时生成 Compact Combine 的 token 列表和 top-k mask。
 
-每个 lane i 发送实际 token 区间 `[B*i/8, B*(i+1)/8)`，一次连续 Put，随后同一 QP 提交独立4 B commit。
-不扫描路由、不筛选token、不跨 lane 合并。空区间跳过数据 Put，但仍提交 commit。
-接收区保留原 token 编号，专家仍按路由读取；容量尾部不发送。每个 commit 独占512 B行，
-控制区从一个 payload commit 扩展到八个，两端须重建同一版本（Python/native API protocol 12）。
-`Sequence` 由 group 0 AIV0 在输入打包屏障前初始化，本轮不再改写。
+Dispatch 的 8 个 QP 按实际 token 区间 `[B*i/8, B*(i+1)/8)` 分工。每包 480 B 激活或 scale 数据和 32 B trailer，最后一个字保存当前计划域的完整序号。HNS 按行检查所有包，允许先搬就绪 token。两个 AIV1 在配对网关所有非空 lane 的末包到达后，分别通知本机一半 rank。XSCALE 通过每个 lane 的独立 commit 确认可见性。两种后端均由发送 owner 回收自己的 CQ。
 
-28组配置下，group 1～27 AIV0 分别保留原同组的专家区间，先 Relay 本机来源，再 Relay 远端来源。
-group 1 AIV0 在本机 Relay 后确认远端 metadata，并发布本卡 `MetaReady`；其他 AIV0 等待此标记。
-AIV1不再承担输入阶段 Relay。两台机器都遵循本机来源优先，而非固定先处理来源机器0。
-
-两机路径保留每包127个路由项加1个标记的512 B布局，但标记改为完整32位 `hierarchicalSequence`，
-避免变长发送遗留的末包在短 epoch 回绕后被误认为本轮数据。公开接口要求所有 rank 的实际 B、Top-k
-一致，接收端据此定位实际末包，不读取容量末尾，也不再从标记解码长度。普通 MTE 路径仍使用
-原来的 epoch/length 格式并逐包检查；路由 count 的短 epoch 仍取各核原有计数槽，不受此改动影响。
-
-HNS1825 使用已确认的硬件合同：每个对齐512 B包整体可见，WQE最后一个2 KiB分片内部的
-每个512 B包都具有 SO，覆盖此前的数据包及同一 QP 的前序 WQE。接收 leader 因而只需获取
-实际末包的本轮标记，即可确认整个 metadata，并发布本地 `MetaReady`，无需另发 `NetMetaCommit`。
-Relay 通过该通知直接处理 Top-k，不重复扫描包尾标记，也不等待 payload。BS32、Top-8的
-256个路由项仍为1536 B，一次 metadata Put，不补齐2 KiB，不增加网络完成标记。
-
-group 0 AIV1 完成 reset/shared-input 后，轮询配对 rank 发到本卡的八个 payload commit，
-只比较当前完整32位 sequence，接收方不清零。每个 commit 的 SO 只保证同 QP 的前序 payload；
-收齐八个标记后才执行 acquire、向同机其他15卡及自身广播 gateway-ready，最后进入输入屏障。
-双方都先提交每个 lane 的 commit，再汇总入站；汇总核只可推进自己 QP1 的 CQ。
-广播不依赖 Relay、count/prefix 或其他网关的广播；后续消费者仍检查本机全部16个 gateway-ready。
-HNS1825 的 Dispatch、Combine 发送源以及完整32位 `Sequence` 在本轮保持不变；
-Unpermute 只读独立的接收区。输出就绪屏障之后，各 Combine owner 分别 quiet 自己的 QP，
-其他 AIV 同时执行 Unpermute；kernel 完成等待两部分工作全部结束。
-下一轮沿用同一 runtime stream，不能在这个完成边界前覆盖源区或 epoch。
-XSCALE 不使用上述包内/SO合同：metadata 和 payload 各自保留 `quiet → commit → quiet`，
-接收 leader 通过独立 `NetMetaCommit` 放行元数据；发送仍在同一 QP 上先 metadata 后 payload。
-该优化不依赖 PI-on-chip 开关，整体收益以关闭打点的 perf 为准。
-H=3584时每行3712 B；B=72时各 lane 发送33408 B，B=128时各 lane 发送59392 B。
-总流量与原全量发送相同；HNS启动发送共1次metadata、8次payload（非空lane）和8次commit。
-性能验证应比较关闭打点的 rank-max-mean、最晚lane完成、广播结束和首 GMM 时间；不能假定8倍加速。
-
-每卡在对称 peermem 通信窗口末尾增加16×512 B ready 槽，每个同机网关独占一槽。
-这些槽不纳入每轮 workspace reset，提前到达的通知不会被接收卡清零；窗口容量检查同步增加8192 B。
-通知比较完整32位 invocation sequence，旧轮次不可放行新轮次。现有 host 输出屏障保证所有
-Dispatch 消费者已完成，kernel 尾部 quiet 关闭发送源生命周期，随后才允许下一轮复用窗口。
-即使没有远端路由，每个网关也无条件广播，消费者始终等待全部16槽。
-
-数量表及前缀写回完成后立即发布 count-ready，允许 AIC/AIV0 准备 GMM 状态和权重。
-AIV1 随后用一次带 stride 的 DMA 获取本卡16个槽的首32 B，共512 B，再在 UB 中比较序号并生成
-私有16位 ready mask，匹配 `0xFFFF` 后完成 scalar→MTE2 同步，才开始 payload DMA。
-失败时重新批量读取；不计算路由依赖 mask，不使用共享原子 OR，也没有专门的本地汇总核。
-每个 AIV 的尾部保留 UB 从256 B扩展到512 B；RoCE backend 和 Combine 仍复用其中前256 B。
-转发前后保留 DDR 顺序保障，A8W4 使用此协议；单机 MTE/EP16 不进入该路径。
-稀疏路由也等待全部网关，可能等到并不需要的慢来源；当前优化重点是 EP32、BS32 场景。
-
-跨机 Combine 固定使用上文的8QP网关加权归并。28个 AIV1 都参与机内 Combine，
-按各 slice 的全局行前缀及 Combine wave 轮换完整行任务；就绪检查仍使用 GMM2 实际生产核数量。
-同机源卡保留本地BF16专家行，远端源卡收到一次FP32部分和；最终 Unpermute 合并本地加权结果、
-远端部分和和可选共享专家结果，再转为BF16。8个 AIV0 owner 不承担 Unpermute。
-每个 token 的部分和发送源在最终 quiet 之前保持不变，双向 commit 和 host barrier 保护跨轮复用。
-
-网络 commit、Dispatch 本地就绪、host 握手及最终 Combine 行等待加入60秒停滞超时诊断；只有 QP owner
-能在等待期间稀疏检查已 ready 的 CQE，不等待尚未完成的 CQE，不允许接收 leader 并发消费 CQ。
-正常短等待不增加 CQ DMA，最终 quiet 负责统一完成检查和队列回收。硬件 `SyncAll` 本身没有新增
-可取消机制，软件等待超时会打印上下文并 trap；日志 `kind=0/1/2/3` 分别表示 commit、
-Dispatch 本地就绪、host 生产者屏障、Combine 行，另含 peer、expected、observed。设备故障后的清理由 runtime 负责。
-
-归并 owner 以跨步 DMA 收集所选行的全部包尾，通过向量检查得到 ready mask。
-只有一个 token 的全部远端专家行就绪才会归并和发送；两个输入缓冲交替加载，保持 top-k 累加顺序。
-按 lane 的初始化只读取所属 token 区间对应的256 B路由块，并跳过512 B包尾标记。
-更新后两台均需重新构建，按 BS32 流程执行 `run` 校验精度，再执行 `perf`。
+网关将同一 token 的专家行按 top-k 次序用 FP32 加权，16 个 QP owner 将对应 partial 送回源卡。BS96 的专用 AIV1 owner 对 compact 序号按 16 交错分工，BS128 和默认模型的 AIV0 owner 按连续区间分工。空 QP 同样发送 commit。匹配预量化快路径时分别汇总 Dispatch reader 和本地 Combine producer 的完成信号。输出核按 token 获取所依赖的 QP，合并本地贡献、远端 partial 和 shared 结果后写回 BF16。通用形状使用 host 屏障。每轮 kernel 返回前各 owner 排空发送，两端使用相同的协议和窗口布局。
 
 两机 RoCE runtime 的 `barrier()` 和 `destroy()` 先同步本卡全部 stream，再通过现有
 StoreGroup（TCPStore）或 ProcessGroup 交换完成状态；全部 rank 成功后才允许清理 SHMEM。
-当前 kernel 在返回前已等待应用 QP1～8 完成，这一顺序确保释放前没有未完成的通信。
+当前 kernel 在返回前已等待应用 QP1～16 完成，这一顺序确保释放前没有未完成的通信。
 这里不调用直接读取对端 GM 的通用 `aclshmem_barrier_all()`，也不要求机内各 rank 建立 RoCE QP。
 所有 rank 必须按相同顺序调用，调用期间不得并发提交新的算子；任一 rank 同步失败则保留资源并要求重启作业。
 该修复涉及 Python 和原生扩展，两台机器都需重新构建/安装匹配的 wheel；已有 SHMEM SDK 无需为此修改。

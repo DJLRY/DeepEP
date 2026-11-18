@@ -24,6 +24,16 @@ int64_t GetSystemCycle()
 }  // namespace AscendC
 
 struct Fixture {
+    struct { void* inputScaleGmAddr = nullptr; int tilingData = 0; } params_;
+    struct { uint32_t blockIdx = 0; } countWorkspace_;
+    int hierarchicalCombine_ = 0;
+    bool UseEarlyClosure(int) const { return false; }
+    bool UseAiv0CombineOwners(int) const { return true; }
+    bool IsHierarchicalCombineOwner(int, uint32_t) const { return false; }
+    int HierarchicalCombineLane(int, uint32_t) const { return 0; }
+    template <class... T> int HierarchicalRoceScratch(T&&...) { return 0; }
+    template <class... T> void PublishCoreClosure(T&&...) { assert(false); }
+    template <class... T> bool TryProgressHierarchicalReducedCombine(T&&...) { assert(false); return false; }
     struct AivTaskCursor {
         uint32_t nextTile = 0;
         uint32_t tileCount = 0;
@@ -50,6 +60,7 @@ struct Fixture {
         uint32_t tokenNum = 32U;
     } commonConfig_;
     struct {
+        bool Enabled() const { return false; }
         uint32_t clears = 0;
         int64_t finalWave = 999;
         void ClearSlice()
@@ -180,6 +191,7 @@ struct Fixture {
     void DispatchNextExpertSlice(ExpertTokenPosition& position, uint32_t& groups, uint64_t wave)
     {
         Guard();
+        if (position.expertIdx >= commonConfig_.moeExpertPerRank) return;
         assert(combinePipeline_.pending == 0U);
         events.push_back("D" + std::to_string(position.expertIdx) + ":" + std::to_string(wave));
         ++position.expertIdx;
@@ -272,7 +284,7 @@ void ExistingActivationDispatchSharedPriorityIsPreserved()
     f.combineSlices = 1;
     f.ReadyAllCombines();
     f.Run(2);
-    f.Expect({"A0:1", "A0:3", "D0:0", "D1:0", "D2:1", "S0", "S1", "C0"});
+    f.Expect({"D0:0", "A0:1", "A0:3", "D1:0", "D2:1", "S0", "S1", "C0"});
 }
 
 void BackoffCanReleaseActivationAndCombine()

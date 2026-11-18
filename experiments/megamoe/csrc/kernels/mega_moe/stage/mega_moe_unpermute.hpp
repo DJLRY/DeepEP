@@ -14,6 +14,7 @@
 
 #include "../common/mega_moe_mxfp8_utils.hpp"
 #include "../common/mega_moe_utils.hpp"
+#include "../common/mega_moe_roce.hpp"
 
 namespace MegaMoeImpl {
 
@@ -28,6 +29,9 @@ struct TokenUnpermuteConfig {
 };
 
 struct TokenUnpermuteScratch {
+    uint32_t acquiredQps = 0;
+    int32_t incomingQp[4]{};
+    uint32_t firstOutput = 0;
     LocalTensor<bfloat16_t> dataResTensor;
     LocalTensor<float> dataResFp32Tensor;
     LocalTensor<float> topKWeightsTensor;
@@ -195,6 +199,16 @@ __aicore__ inline void AccumulateHierarchicalReducedToken(const TokenUnpermuteCo
     // At least one remote expert exists here. Its received sum already includes
     // every remote weight. The per-QP commit join precedes this whole stage.
     WaitFlag<HardEvent::V_MTE2>(EVENT_ID0);
+    if (params.inputScaleGmAddr && UseEarlyClosure(params.tilingData)) {
+        const uint32_t qp = scratch.incomingQp[tokenIdx - scratch.firstOutput];
+        if ((scratch.acquiredQps & (1U << qp)) == 0) {
+            auto* commit = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.combineReduceCommitPtr +
+                                                             qp * HIERARCHICAL_FLAG_BYTES);
+            RoceWaitCommit(commit, params.tilingData->hierarchicalSequence, nullptr, AscendTimer::RdmaPhase::Combine,
+                           HierarchicalGateway(common.rankId), nullptr, qp + 1U);
+            scratch.acquiredQps |= 1U << qp;
+        }
+    }
     auto partial = scratch.dataResFp32Tensor[bufferConfig.fp32SlotElementCount];
     GlobalTensor<float> partialGm;
     partialGm.SetGlobalBuffer(reinterpret_cast<__gm__ float*>(params.peermemInfo.combinePartialRecvPtr));
@@ -364,6 +378,25 @@ __aicore__ inline void UnpermuteTokens(const TokenUnpermuteConfig& context, cons
     WorkRange tokenRange = TilingByJobContext(common.tokenNum, context.job.jobIndex, context.job.totalJobs, 1U);
     if (tokenRange.count == 0U) {
         return;
+    }
+    if (params.inputScaleGmAddr && UseEarlyClosure(params.tilingData)) {
+        auto* ids = reinterpret_cast<__gm__ int32_t*>(params.expertIdxGmAddr);
+        uint32_t count = 0;
+        scratch.firstOutput = tokenRange.start;
+        for (uint32_t t = 0; t < common.tokenNum; ++t) {
+            bool remote = false;
+            for (uint32_t j = 0; j < common.topK; ++j) {
+                const uint32_t id = ReadGmByPassDCache(ids + t * common.topK + j);
+                remote |= id < common.moeExpertPerRank * HIERARCHICAL_WORLD_SIZE &&
+                          id / (common.moeExpertPerRank * 16U) != HierarchicalHost(common.rankId);
+            }
+            if (t >= tokenRange.start && t < tokenRange.start + tokenRange.count)
+                scratch.incomingQp[t - tokenRange.start] = remote ? static_cast<int32_t>(count) : -1;
+            count += remote;
+        }
+        for (uint32_t i = 0; i < tokenRange.count; ++i)
+            if (scratch.incomingQp[i] >= 0)
+                scratch.incomingQp[i] = CompactOwner(params.tilingData, scratch.incomingQp[i], count);
     }
     int32_t jobLen = static_cast<int32_t>(tokenRange.count);
     int32_t jobOffset = static_cast<int32_t>(tokenRange.start);

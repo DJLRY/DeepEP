@@ -53,10 +53,10 @@ def arguments(argv=None):
         "--rank", type=int, default=0, help="Logical expert-owner rank whose inputs/weights to reproduce"
     )
     ep = parser.add_mutually_exclusive_group()
-    ep.add_argument("--ep-size", type=int, default=32)
+    ep.add_argument("--ep-size", type=int)
     ep.add_argument("--ep-sizes", type=positive_values, help="Sweep logical EP sizes, e.g. 16,32,64")
     bs = parser.add_mutually_exclusive_group()
-    bs.add_argument("--bs", type=int, default=32, help="Original tokens per source rank, NOT the GMM row count")
+    bs.add_argument("--bs", type=int, help="Original tokens per source rank, NOT the GMM row count")
     bs.add_argument("--bs-values", type=positive_values, help="Sweep source BS values, e.g. 1,8,16,32,256")
     parser.add_argument("--hidden", type=int, default=3584)
     parser.add_argument("--intermediate", type=int, default=1280)
@@ -86,6 +86,8 @@ def arguments(argv=None):
         help="Print real routing counts/shapes without importing Torch or allocating weights",
     )
     args = parser.parse_args(argv)
+    args.ep_size = 32 if args.ep_size is None else args.ep_size
+    args.bs = 32 if args.bs is None else args.bs
     ep_sizes = args.ep_sizes or [args.ep_size]
     if args.experts < 1 or any(ep < 1 or args.experts % ep for ep in ep_sizes):
         parser.error("experts must be divisible by a positive ep-size")

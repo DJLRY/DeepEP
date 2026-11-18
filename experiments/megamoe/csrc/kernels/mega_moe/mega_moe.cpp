@@ -69,13 +69,14 @@ __schedmode__(1) __global__
     InitSocState();
     util_set_ffts_config(ffts_addr);
     constexpr int32_t kDispatchE4M3 = 4;
+    MegaMoeTilingData invocation = tiling;
     if constexpr (IsA8W4) {
         MegaMoeImpl::MegaMoeA8W4Wave<bfloat16_t, bfloat16_t, float, fp4x2_e2m1_t, kDispatchE4M3,
                                      MegaMoeImpl::COMBINE_NO_QUANT, false, FuseGateUp>
             op;
         op.Init(context, x, topk_ids, topk_weights, weight1, weight2, nullptr, weight_scales1, weight_scales2, x_scales,
                 shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-                workspace, &tiling, nullptr, timer);
+                workspace, &invocation, nullptr, timer);
         op.Process();
     } else {
         MegaMoeImpl::MegaMoeA8W8Wave<bfloat16_t, bfloat16_t, float, fp8_e4m3fn_t, kDispatchE4M3,
@@ -83,7 +84,7 @@ __schedmode__(1) __global__
             op;
         op.Init(context, x, topk_ids, topk_weights, weight1, weight2, nullptr, weight_scales1, weight_scales2, x_scales,
                 shared_weight1, shared_weight2, shared_weight_scales1, shared_weight_scales2, y, expert_token_nums,
-                workspace, &tiling, nullptr);
+                workspace, &invocation, nullptr);
         op.Process();
     }
 #endif
@@ -97,7 +98,7 @@ extern "C" __attribute__((visibility("default"))) void mega_moe_kernel_do(
     const uint8_t* tiling_host, uint64_t ffts_addr)
 {
     const auto& tiling = *reinterpret_cast<const MegaMoeTilingData*>(tiling_host);
-    static_assert(sizeof(MegaMoeTilingData) == 232, "MegaMoE tiling ABI changed");
+    static_assert(sizeof(MegaMoeTilingData) == 368, "MegaMoE tiling ABI changed");
     // 按本次实际 BS 编译期特化；不改变 wave 预算、Dispatch/Combine 或共享专家策略。
     if (is_a8w4 && tiling.bs <= MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS) {
         mega_moe_kernel<true, true><<<block_dim, ub_bytes, stream>>>(

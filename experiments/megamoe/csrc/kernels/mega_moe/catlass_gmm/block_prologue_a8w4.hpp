@@ -70,7 +70,7 @@ public:
         }
         for (uint32_t i = 0; i < L1B_STAGES; i++) {
             // Assign L1/L0A/L0B space for each stages
-            l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(i * 384U * 1024U);
+            l1BTensorList[i] = params.resource.l1Buf.template GetBufferByByte<ElementOut>(i * 256U * 1024U);
         }
         // Packed inputs occupy [0,64KiB); the four
         // output slots interleave 256-byte vectors throughout [64,192KiB).
@@ -125,7 +125,8 @@ public:
         const auto kPlan =
             MegaMoeImpl::GmmKernel::MakeA8W4KPlan(actualBlockShape.m(), actualBlockShape.n(), allowDynamicB);
         const uint32_t kL1Size = kPlan.kb;
-        const uint32_t halfK = kL1Size / 2U;
+        const uint32_t n16 = CeilDiv(static_cast<uint32_t>(actualBlockShape.n()), 16U) * 16U;
+        const uint32_t chunkK = Min(kL1Size / 2U, 64U * (32768U / (64U * n16)));
         const uint32_t kGmLoop = CeilDiv(kSize, kL1Size);
 
         // AIV1 runs dispatch/epilogue concurrently and must never enter this pipeline.
@@ -136,8 +137,8 @@ public:
             uint32_t actualK = Min(kL1Size, kSize - kLoopIdx * kL1Size);
             auto layout = tla::MakeLayout<ElementOut, LayoutOut>(kL1Size, actualBlockShape.n());
             auto tensorL1B = tla::MakeTensor(l1BTensorList[l1BListId], layout, Arch::PositionL1{});
-            for (uint32_t offset = 0; offset < actualK; offset += halfK) {
-                const uint32_t count = Min(halfK, actualK - offset);
+            for (uint32_t offset = 0; offset < actualK; offset += chunkK) {
+                const uint32_t count = Min(chunkK, actualK - offset);
                 auto gmTile = GetTile(bGlobal, tla::MakeCoord(kLoopIdx * kL1Size + offset, 0),
                                       tla::MakeShape(count, actualBlockShape.n()));
                 auto l1Tile =
@@ -145,7 +146,7 @@ public:
                 ProcessL1Nz(l1Tile, gmTile, offset == 0U);
                 ubListId = (ubListId + 1U) % UB_STAGES;
             }
-            // Publish only after both halves are stored in the same L1 B slot.
+            // Publish only after all chunks are stored in the same L1 B slot.
             AscendC::CrossCoreSetFlag<SYNC_MODE, PIPE_MTE3>(AIV_SYNC_AIC_FLAG + l1BListId);
             l1BListId = (l1BListId + 1) % L1B_STAGES;
         }
@@ -231,9 +232,8 @@ public:
         AscendC::Reg::RegTensor<int8_t> wShlReg;
         AscendC::Reg::RegTensor<int8_t> wAndReg;
         AscendC::Reg::RegTensor<int8_t> wLoad;
-        AscendC::Reg::RegTensor<int8_t> wShl;
-        AscendC::Reg::RegTensor<int8_t> wShr0;
-        AscendC::Reg::RegTensor<int8_t> wShr1;
+        AscendC::Reg::RegTensor<int8_t> shifts;
+        AscendC::Reg::RegTensor<int8_t> noShift;
         AscendC::Reg::RegTensor<int8_t> wSel;
         AscendC::Reg::RegTensor<int8_t> wAnd;
 
@@ -244,6 +244,8 @@ public:
         AscendC::Reg::Duplicate<int8_t, AscendC::Reg::MaskMergeMode::ZEROING>(wShlReg, SHIFT_LEFT_SIZE, preg);
         AscendC::Reg::Duplicate<int8_t, AscendC::Reg::MaskMergeMode::ZEROING>(wAndReg, E2M1_AND_MASK, preg);
 
+        AscendC::Reg::Duplicate<int8_t, AscendC::Reg::MaskMergeMode::ZEROING>(noShift, 0, preg);
+        AscendC::Reg::Select(shifts, wShlReg, noShift, pregVsel);
         for (uint16_t loopKIdx = 0; loopKIdx < params.loopKNum; ++loopKIdx) {
             for (uint16_t innerLoopIdx = 0; innerLoopIdx < params.innerLoopNum; ++innerLoopIdx) {
                 // DIST_US_B8 load mode expands each packed B4 byte into lane-aligned B8 slots.
@@ -254,10 +256,8 @@ public:
                     (AscendC::Reg::RegTensor<uint8_t>&)wLoad, (__ubuf__ uint8_t*&)params.weightInUbAddr,
                     aregWeightB8In);
 
-                AscendC::Reg::ShiftRight(wShr0, wLoad, wShrReg, preg);
-                AscendC::Reg::ShiftLeft(wShl, wLoad, wShlReg, preg);
-                AscendC::Reg::ShiftRight(wShr1, wShl, wShrReg, preg);
-                AscendC::Reg::Select(wSel, wShr1, wShr0, pregVsel);
+                AscendC::Reg::ShiftLeft(wSel, wLoad, shifts, preg);
+                AscendC::Reg::ShiftRight(wSel, wSel, wShrReg, preg);
                 AscendC::Reg::And(wAnd, wSel, wAndReg, preg);
 
                 AscendC::Reg::AddrReg aregWeightB8Out = AscendC::Reg::CreateAddrReg<uint8_t>(

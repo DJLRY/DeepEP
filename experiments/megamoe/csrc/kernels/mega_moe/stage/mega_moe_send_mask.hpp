@@ -7,10 +7,32 @@
 #include "../common/mega_moe_utils.hpp"
 #include "../common/ascend_timer_v2_device.hpp"
 #include "mega_moe_route_compact.hpp"
+#include "mega_moe_combine_vf.hpp"
 
 namespace MegaMoeImpl {
 
 using namespace AscendC;
+
+// Route metadata can arrive out of order over MTE. Sample every 32-byte
+// packet trailer before forwarding a stripe or consuming a source record.
+__aicore__ inline void AcquireRoutePackets(GM_ADDR record, uint32_t packets, uint32_t sequence,
+                                           LocalTensor<int32_t>& storage)
+{
+    auto snapshot = storage.template ReinterpretCast<uint32_t>();
+    GlobalTensor<uint32_t> tails;
+    tails.SetGlobalBuffer(reinterpret_cast<__gm__ uint32_t*>(record + RAIL_PACKET_BYTES - 32U));
+    auto result = snapshot[packets * 8U];
+    do {
+        SyncFuncStatic<HardEvent::S_MTE2, SYNC_EVENT_ID2>();
+        DataCopy(snapshot, tails, DataCopyParams{static_cast<uint16_t>(packets), 1U, 15U, 0U});
+        SyncFuncStatic<HardEvent::MTE2_V, SYNC_EVENT_ID2>();
+        asc_vf_call<CheckGatewayCombinePacketsVF>(reinterpret_cast<__ubuf__ uint32_t*>(snapshot.GetPhyAddr()),
+                                                  reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr()), packets,
+                                                  1U, 1U, sequence);
+        SyncFuncStatic<HardEvent::V_S, SYNC_EVENT_ID2>();
+    } while (result.GetValue(0U) != 1U);
+    SyncFuncStatic<HardEvent::S_MTE2, SYNC_EVENT_ID2>();
+}
 
 struct SendMaskConfig {
     uint64_t expertCountWinOffset;
@@ -569,8 +591,7 @@ __aicore__ inline bool TryRelayCompactRoutes(const MoeStageCommonConfig& common,
     if (realSendTotalNum <= 0 || realSendTotalNum > RailItemsPerBatch(bufferConfig)) {
         return false;
     }
-    const uint32_t routeStrideItems =
-        (static_cast<uint32_t>(srcTokenNum) + INT32_PER_256B - 1U) / INT32_PER_256B * INT32_PER_256B;
+    const uint32_t routeStrideItems = (static_cast<uint32_t>(srcTokenNum) + 31U) / 32U * 32U;
     const uint64_t routeBytes = static_cast<uint64_t>(ownedExpertNum) * routeStrideItems * sizeof(int32_t);
     const uint64_t ringBytes = static_cast<uint64_t>(bufferConfig.bufferCount) * bufferConfig.bufferBytes;
     LocalTensor<int32_t> routeTensor = scratch.routeRingTensor.template ReinterpretCast<int32_t>();
@@ -634,7 +655,8 @@ __aicore__ inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig& com
                                                  const SendMaskConfig& config, const Params& params,
                                                  SendMaskScratch& scratch, uint32_t relayIdx, uint32_t aivCoreIdx,
                                                  int32_t ownedExpertBegin, int32_t ownedExpertNum,
-                                                 AscendTimerDevice* timer = nullptr)
+                                                 AscendTimerDevice* timer = nullptr, GM_ADDR gathered = nullptr,
+                                                 int32_t gatheredRank = -1, bool* compactIds = nullptr)
 {
     const MegaMoeSendMaskBufferConfig& bufferConfig = config.bufferConfig;
     // railTopkIdsRecvPtr 已是本卡 rail 区绝对基址（见 peermem.h PeermemInfo 布局），
@@ -643,6 +665,7 @@ __aicore__ inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig& com
     const uint64_t slotOffset = static_cast<uint64_t>(relayIdx) * config.railTopkIdsSlotBytes;
     __gm__ int32_t* railSlotBase =
         reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.railTopkIdsRecvPtr) + slotOffset / sizeof(int32_t);
+    if (gathered) railSlotBase = reinterpret_cast<__gm__ int32_t*>(gathered);
     // 本轮输入 epoch = 本核计数槽值 +1；与发送核/接收端的预测公式同源。
     // 必须读取本核槽：同源的其他分片核可能已完成并推进了自己的 epoch。
     __gm__ int32_t* launchCountSlot =
@@ -650,7 +673,8 @@ __aicore__ inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig& com
                                           static_cast<uint64_t>(aivCoreIdx) * RANK_SYNC_COUNTER_SLOT_BYTES);
     int32_t expectEpoch = ((ReadGmByPassDCache(launchCountSlot) + 1) & 0x7F) | 0x80;
     const int32_t sourceRank =
-        static_cast<int32_t>(relayIdx * config.ranksPerServer + common.rankId % config.ranksPerServer);
+        gathered ? gatheredRank
+                 : static_cast<int32_t>(relayIdx * config.ranksPerServer + common.rankId % config.ranksPerServer);
     // Hierarchical callers have acquired LocalRailPacked or MetaReady. Their
     // packet markers hold the full 32-bit invocation, not epoch/length. The
     // public API requires the same actual B/top-k on every rank; do not decode
@@ -667,6 +691,7 @@ __aicore__ inline void RelayRailTopkIdsToExperts(const MoeStageCommonConfig& com
     topkIdsGm.SetGlobalBuffer(railSlotBase);
     if (TryRelayCompactRoutes(common, winRankAddr, config, scratch, topkIdsGm, ownedExpertBegin, ownedExpertNum,
                               sourceRank, srcTokenNum, realSendTotalNum, timer)) {
+        if (compactIds) *compactIds = true;
         AscendTimerRelayScope publish(timer, AscendTimer::RelayStep::CountPublish, sourceRank, ownedExpertBegin,
                                       ownedExpertNum);
         PublishRailExpertCounts(common, winRankAddr, config, scratch, ownedExpertBegin, ownedExpertNum, sourceRank,

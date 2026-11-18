@@ -39,6 +39,8 @@ def contract(config, world, bs, input_kind, routing, check_tokens):
         version=1,
         reference_sha256=hashlib.sha256(source.encode()).hexdigest(),
         model=config["model"],
+        activation_clamp=config.get("activation_clamp"),
+        shared_dtype=config.get("shared_dtype", "fp4"),
         seed=config["seed"],
         world=world,
         bs=bs,
@@ -169,7 +171,7 @@ def generate(config, spec, ranks, *, workers=DEFAULT_WORKERS, chunk_tokens=256):
         result = np.empty((len(token), model["hidden"]), dtype=np.float32)
         for start in range(0, len(token), chunk_tokens):
             stop = start + chunk_tokens
-            result[start:stop] = expert_forward(x[token[start:stop]], w1, w2)
+            result[start:stop] = expert_forward(x[token[start:stop]], w1, w2, spec.get("activation_clamp"))
         if route_weight is not None:
             result *= route_weight[:, None]
         return token, result

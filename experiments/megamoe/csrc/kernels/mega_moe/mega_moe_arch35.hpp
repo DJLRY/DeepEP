@@ -107,6 +107,8 @@ protected:
     __aicore__ inline void PrepareGmmExpertState(ExpertLoopState& state, uint32_t expertIdx);
     __aicore__ inline void ProcessSharedExpertGmm1(int32_t& gmm1TileReadySequence);
     __aicore__ inline void ProcessSharedExpertGmm2();
+    __aicore__ inline void SharedFp8Projection(bool first, bool directInput);
+    __aicore__ inline void SharedActivationTile(const ProblemShape& shape, GMMAddrInfo& addr, uint32_t tile);
     __aicore__ inline void ProcessSharedExpertActivation();
     __aicore__ inline void ProcessSharedExpertTail();
     struct SharedActivationCursor {
@@ -208,7 +210,9 @@ template <TemplateMegaMoeTypeClass>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::InitSyncWorkspaceConfigs(int32_t dispatchFlagSlotsPerExpert,
                                                                                   int32_t activationFlagSlotsPerExpert)
 {
-    countWorkspace_ = {.blockIdx = blockIdx_, .blockNum = params_.tilingData->aicNum};
+    countWorkspace_ = {.blockIdx = blockIdx_,
+                       .blockNum = params_.tilingData->aicNum,
+                       .shared = UseSharedRouteTable(params_.tilingData)};
     syncWorkspaceLayout_ = {.dispatchFlagSlotCountPerExpert = dispatchFlagSlotsPerExpert,
                             .activationFlagSlotCountPerExpert = activationFlagSlotsPerExpert,
                             .gmm1TileStatusCountPerExpert = params_.tilingData->maxTilesPerExpert};
@@ -219,7 +223,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::InitGmmConfigs()
 {
     gmmExecutionConfig_ = {.blockJob = {.jobIndex = blockIdx_, .totalJobs = blockNum_},
                            .groupedMatmulMode = params_.tilingData->groupedMatmulMode,
-                           .isPerExpertWeightTensor = params_.tilingData->isPerExpertWeightTensor};
+                           .isPerExpertWeightTensor = params_.tilingData->isPerExpertWeightTensor,
+                           .sharedWeightList = params_.tilingData->sharedWeightList};
     waveCombineJob_ = {.jobIndex = blockIdx_, .totalJobs = blockNum_};
 }
 
@@ -277,6 +282,17 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::Init(
     params_.workspaceInfo = WorkspaceInfo(workspaceGM, tilingData);
     params_.peermemInfo = PeermemInfo(g_winRankAddr_[rankId_], tilingData, A_ELEMS_PER_BYTE);
     params_.tilingData = tilingData;
+    if constexpr (g_coreType == AIV) {
+        if (UseHierarchicalRoce(tilingData)) {
+            auto* count = reinterpret_cast<__gm__ int32_t*>(params_.peermemInfo.rankSyncInWorldPtr +
+                                                            RANK_SYNC_COUNTER_OFFSET_BYTES +
+                                                            aivCoreIdx_ * RANK_SYNC_COUNTER_SLOT_BYTES);
+            const uint32_t previous = static_cast<uint32_t>(ReadGmByPassDCache(count));
+            tilingData->hierarchicalSequence =
+                NextDomainSequence(previous, tilingData->arena.domain, tilingData->arena.domainBits);
+            if (tilingData->hierarchicalSequence == 0U) trap();
+        }
+    }
     epilogueOp_.Init({.yGmAddr = params_.workspaceInfo.activationQuantDataPtr,
                       .yScaleGmAddr = params_.workspaceInfo.activationQuantScalePtr,
                       .clampLimit = tilingData->clampLimit,
@@ -342,9 +358,10 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::DispatchBuffInit()
         static_cast<int64_t>(commonConfig_.worldSize * commonConfig_.moeExpertPerRank * sizeof(int32_t)),
         static_cast<int64_t>(ALIGN_32));
     if constexpr (ENABLE_A8W4 || ENABLE_A4W4) {
-        scratch.cumsumInfoGlobalTensor.SetGlobalBuffer(
-            reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.cumsumInfoPtr +
-                                              static_cast<uint64_t>(cumsumInfoTensorSize) * countWorkspace_.blockIdx));
+        scratch.cumsumInfoGlobalTensor.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(
+            params_.workspaceInfo.cumsumInfoPtr +
+            static_cast<uint64_t>(cumsumInfoTensorSize) *
+                (UseSharedRouteTable(params_.tilingData) ? 0U : countWorkspace_.blockIdx)));
     }
 
     uint32_t cumsumInfoTensorAddr = 0U;
@@ -357,7 +374,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::DispatchBuffInit()
     scratch.validTopkIndexTensor =
         LocalTensor<int32_t>(TPosition::VECCALC, validTopkIndexTensorAddr, validTopkIndexTensorSize / sizeof(int32_t));
     scratch.copyTmpBaseAddr = validTopkIndexTensorAddr + validTopkIndexTensorSize;
-    uint32_t copyTmpTotalSize = static_cast<uint32_t>(bufferConfig.bufferCount) * context.quantTokenScaleAlignBytes;
+    uint32_t copyTmpTotalSize = static_cast<uint32_t>(bufferConfig.bufferCount) * bufferConfig.copyBufferBytes;
     uint32_t expertTokenNumsOutTensorAddr = scratch.copyTmpBaseAddr + copyTmpTotalSize;
     uint32_t expertTokenNumsOutTensorSize = Ops::Base::CeilAlign(
         static_cast<int64_t>(commonConfig_.moeExpertPerRank * sizeof(int32_t)), static_cast<int64_t>(ALIGN_32));
@@ -485,6 +502,75 @@ MegaMoe<TemplateMegaMoeTypeFunc>::InitTokenUnpermuteBuffers()
         tokenUnpermuteConfig_, commonConfig_.tokenHiddenDim, tokenUnpermuteScratch_);
 }
 
+// A shared FP8 GMM1 tile produces exactly one adjacent gate/up pair.
+template <TemplateMegaMoeTypeClass>
+__aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::SharedFp8Projection(bool first, bool directInput)
+{
+    if constexpr (g_coreType == AIC) {
+        using F = fp8_e4m3fn_t;
+        using S = QuantScaleOutType;
+        using Kernel = GmmKernel::Config<false, COMBINE_NO_QUANT, F, F, bfloat16_t, S, S>;
+        const uint32_t m = commonConfig_.tokenNum;
+        const uint32_t h = commonConfig_.tokenHiddenDim, n1 = commonConfig_.gmm1OutputDim;
+        const uint32_t n = first ? n1 : h, k = first ? h : n1 / 2;
+        const uint32_t scaleK = Ops::Base::CeilDiv(k, 64U) * 2U;
+        const uint32_t tileN = first ? 256U : sharedPolicy_.gmm2TileN;
+        const uint32_t columns = Ops::Base::CeilDiv(n, tileN);
+        typename Kernel::BlockMmad mm;
+        ProblemShape shape{};
+        Get<M_VALUE>(shape) = m;
+        Get<N_VALUE>(shape) = n;
+        Get<K_VALUE>(shape) = k;
+        mm.Init(shape, {}, {}, false, false);
+        auto& ws = params_.workspaceInfo;
+        auto& weights = sharedWeightTensorListAddrs_;
+        for (uint32_t expert = 0; expert < sharedExpertNum_; ++expert) {
+            auto b =
+                GetExpertWeightAddr<F>(first ? weights.weight1 : weights.weight2, params_.tilingData->sharedWeightList,
+                                       expert, static_cast<uint64_t>(expert) * n * k);
+            auto sb = GetExpertWeightAddr<S>(first ? weights.weightScales1 : weights.weightScales2,
+                                             params_.tilingData->sharedWeightList, expert,
+                                             static_cast<uint64_t>(expert) * n * scaleK);
+            const uint64_t row = first ? 0U : static_cast<uint64_t>(expert) * m;
+            auto a = first ? (directInput ? params_.aGmAddr : ws.sharedExpertInputDataPtr)
+                           : ws.sharedExpertActivationDataPtr;
+            auto sa = first ? (directInput ? params_.inputScaleGmAddr : ws.sharedExpertInputScalePtr)
+                            : ws.sharedExpertActivationScalePtr;
+            auto out = first ? ws.sharedExpertGmm1OutPtr : ws.sharedExpertResultPtr;
+            const bool bypass = m <= GMM1_TILE_M && h == 5120U && n1 == 4608U;
+            for (uint32_t tile = blockIdx_; tile < Ops::Base::CeilDiv(m, GMM1_TILE_M) * columns; tile += blockNum_) {
+                const uint32_t r = tile / columns * GMM1_TILE_M, col = tile % columns * tileN;
+                const uint32_t rows = ((m - r) < GMM1_TILE_M ? (m - r) : GMM1_TILE_M),
+                               cols = ((n - col) < tileN ? (n - col) : tileN);
+                mm.ComputeShared(a + (row + r) * k, b + static_cast<uint64_t>(col) * k, sa + (row + r) * scaleK,
+                                 sb + static_cast<uint64_t>(col) * scaleK,
+                                 out + ((static_cast<uint64_t>(expert) * m + r) * n + col) * sizeof(bfloat16_t), rows,
+                                 cols, bypass);
+                if (!first) {
+                    auto* counts = reinterpret_cast<__gm__ int32_t*>(ws.sharedExpertGmm2TileCounterPtr) +
+                                   expert * Ops::Base::CeilDiv(m, GMM1_TILE_M) * INT_CACHELINE;
+                    NotifySharedExpertTileCompletion(r, counts);
+                }
+            }
+        }
+    }
+}
+
+template <TemplateMegaMoeTypeClass>
+__aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::SharedActivationTile(const ProblemShape& shape,
+                                                                              GMMAddrInfo& addr, uint32_t tile)
+{
+    if (params_.tilingData->sharedFp8) {
+        RunReadyGmm1ActivationTileA8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
+                                       GMM1_TILE_M, false, true>(
+            sharedEpilogueOp_, shape, addr, gmmExecutionConfig_.blockJob, tile, 0U, AscendTimer::AIV_SHARED_SWIGLU);
+    } else {
+        RunReadyGmm1ActivationTileA8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
+                                       GMM1_TILE_M, false>(sharedEpilogueOp_, shape, addr, gmmExecutionConfig_.blockJob,
+                                                           tile, 0U, AscendTimer::AIV_SHARED_SWIGLU);
+    }
+}
+
 template <TemplateMegaMoeTypeClass>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm1(int32_t& gmm1TileReadySequence)
 {
@@ -566,7 +652,8 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertActi
     Get<K_VALUE>(shape) = commonConfig_.tokenHiddenDim;
     const uint32_t tileCount =
         Ops::Base::CeilDiv(commonConfig_.tokenNum, GMM1_TILE_M) *
-        Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF, static_cast<uint32_t>(L1_TILE_N));
+        Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF,
+                           static_cast<uint32_t>(params_.tilingData->sharedFp8 ? GMM1_FUSED_TILE_N : L1_TILE_N));
     GMMAddrInfo addr{};
     for (uint32_t expert = 0; expert < sharedExpertNum_; ++expert) {
         UpdateSharedExpertGmm1GlobalBuffer<ActivationType, Weight1Type, ActivationQuantOutType, QuantScaleOutType,
@@ -576,9 +663,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertActi
         timer_.SetSlice(expert, 0U, commonConfig_.tokenNum);
         addr.timer = timer_.Enabled() ? &timer_ : nullptr;
         for (uint32_t tile = blockIdx_; tile < tileCount; tile += blockNum_) {
-            RunReadyGmm1ActivationTileA8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
-                                           GMM1_TILE_M, false>(
-                sharedEpilogueOp_, shape, addr, gmmExecutionConfig_.blockJob, tile, 0U, AscendTimer::AIV_SHARED_SWIGLU);
+            SharedActivationTile(shape, addr, tile);
         }
         timer_.ClearSlice();
     }
@@ -603,7 +688,8 @@ __aicore__ inline bool MegaMoe<TemplateMegaMoeTypeFunc>::TryRunSharedExpertActiv
         cursor.nextTile = blockIdx_;
         cursor.tileCount =
             Ops::Base::CeilDiv(commonConfig_.tokenNum, GMM1_TILE_M) *
-            Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF, static_cast<uint32_t>(L1_TILE_N));
+            Ops::Base::CeilDiv(commonConfig_.gmm1OutputDim / ACTIVATION_N_HALF,
+                               static_cast<uint32_t>(params_.tilingData->sharedFp8 ? GMM1_FUSED_TILE_N : L1_TILE_N));
     }
     // Failed readiness probes above leave consecutive Combine rows in flight.
     if (combinePipeline != nullptr) combinePipeline->Drain(timer_);
@@ -631,9 +717,7 @@ __aicore__ inline bool MegaMoe<TemplateMegaMoeTypeFunc>::TryRunSharedExpertActiv
         timer_.SetWave(AscendTimer::NO_WAVE);
         timer_.SetSlice(cursor.expert, 0U, commonConfig_.tokenNum);
         addr.timer = timer_.Enabled() ? &timer_ : nullptr;
-        RunReadyGmm1ActivationTileA8W4<QuantOutType, Weight1Type, bfloat16_t, QuantScaleOutType, QuantScaleOutType,
-                                       GMM1_TILE_M, false>(sharedEpilogueOp_, shape, addr, gmmExecutionConfig_.blockJob,
-                                                           cursor.nextTile, 0U, AscendTimer::AIV_SHARED_SWIGLU);
+        SharedActivationTile(shape, addr, cursor.nextTile);
         timer_.ClearSlice();
         cursor.nextTile += blockNum_;
         if (cursor.nextTile >= cursor.tileCount) {
@@ -700,6 +784,10 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertTail
 template <TemplateMegaMoeTypeClass>
 __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessSharedExpertGmm2()
 {
+    if (params_.tilingData->sharedFp8) {
+        SharedFp8Projection(false, false);
+        return;
+    }
     ProblemShape problemShape;
     Get<M_VALUE>(problemShape) = commonConfig_.tokenNum;
     Get<N_VALUE>(problemShape) = commonConfig_.gmm1OutputDim;
@@ -884,9 +972,24 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
         timer_.End(AscendTimer::AIV_INPUT_BUFFER_INIT);
         timer_.Start(AscendTimer::AIV_QUANT);
     }
+    if constexpr (g_coreType == AIV) {
+        if (UseHierarchicalRoce(params_.tilingData)) {
+            if (aivJob_.jobIndex == HierarchicalPackJob()) {
+                PackHierarchicalCombineWeights(commonConfig_, params_);
+                SendTopkIdsToRailServer(commonConfig_, g_winRankAddr_, sendMaskConfig_, params_, sendMaskScratch_,
+                                        HierarchicalHost(rankId_), aivJob_.jobIndex);
+                PublishHierarchicalLocalSignal(params_, HierarchicalSignal::LocalRailPacked);
+            } else if (aivJob_.jobIndex == HierarchicalSendJob()) {
+                PostHierarchicalDispatch(commonConfig_, params_, sendMaskConfig_, timer_.Enabled() ? &timer_ : nullptr);
+            }
+        }
+    }
     QuantizeLocalTokens<QuantMode, QuantOutType, ActivationType, TopkWeightsType, TopkWeightsPrefetch>(
         aivJob_, commonConfig_, params_, quantProcessConfig_, quantScratch_);
     if constexpr (g_coreType == AIV) {
+        if (UseHierarchicalRoce(params_.tilingData)) {
+            PackDispatchRows(aivJob_, commonConfig_, params_, quantProcessConfig_, quantScratch_);
+        }
         if (decodeInputReady_) {
             // Route/count owners differ from quant owners. Count readiness must
             // certify every local token/scale before any remote reader proceeds.
@@ -919,12 +1022,10 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
     if constexpr (g_coreType == AIV) {
         timer_.End(AscendTimer::AIV_RESET);
     }
-    if (sharedExpertNum_ > 0) {
+    if (sharedExpertNum_ > 0 && !(params_.tilingData->sharedFp8 && params_.inputScaleGmAddr &&
+                                  commonConfig_.tokenNum <= 128U && CombineQuantMode == COMBINE_NO_QUANT)) {
         PrepareSharedExpertInput<ActivationType, QuantScaleOutType, A_ELEMS_PER_BYTE>(
             aivJob_, commonConfig_, params_, quantProcessConfig_, sharedExpertPrepareScratch_);
-    }
-    if (UseHierarchicalRoce(params_.tilingData)) {
-        FinishHierarchicalDispatch(aivJob_, commonConfig_, params_, timer_.Enabled() ? &timer_ : nullptr);
     }
     if (decodeInputReady_) {
         // Route published old+1. The public barrier below makes slot 0's
@@ -947,6 +1048,9 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
 
     // Decode: dual-AIV Quant/Route/reset; prefill shared: Route follows the public barrier.
     exceptionDump_.UpdateStage(MegaMoeImpl::Stage::INPUT_PREPARE);
+    const bool earlyShared = params_.tilingData->sharedFp8 && params_.inputScaleGmAddr != nullptr &&
+                             commonConfig_.tokenNum <= 128U && CombineQuantMode == COMBINE_NO_QUANT;
+    if (earlyShared) SharedFp8Projection(true, true);
     ProcessInputPreparationStage();
     if constexpr (g_coreType == AIV) {
         timer_.StartUnfenced(AscendTimer::AIV_INPUT_PREP_BARRIER_WAIT);
@@ -961,11 +1065,25 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         timer_.EndUnfenced(AscendTimer::AIV_INPUT_PREP_BARRIER_WAIT);
     }
 
+    if (UseHierarchicalRoce(params_.tilingData)) {
+        FinishHierarchicalDispatch(aivJob_, commonConfig_, params_, timer_.Enabled() ? &timer_ : nullptr);
+    }
+
     int32_t gmm1TileReadySequence = 0;
     if (sharedExpertNum_ > 0U) {
         // Shared AIC/AIV0 start GMM1; AIV1 enters count/Dispatch (decode) or Route/handshake (prefill).
         exceptionDump_.UpdateStage(MegaMoeImpl::Stage::SHARED_EXPERT_GMM1);
-        ProcessSharedExpertGmm1(gmm1TileReadySequence);
+        if (params_.tilingData->sharedFp8) {
+            if (!earlyShared) SharedFp8Projection(true, false);
+            if constexpr (g_coreType == AIC) {
+                SyncFuncStatic<HardEvent::FIX_S, SYNC_EVENT_ID0>();
+                WriteGmByPassDCache(reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagSharedGmm1DonePtr) +
+                                        blockIdx_ * INT_CACHELINE,
+                                    1);
+            }
+        } else {
+            ProcessSharedExpertGmm1(gmm1TileReadySequence);
+        }
     }
 
     // Decode uses per-slot epoch/count readiness; prefill retains its rank handshake.
@@ -1008,6 +1126,12 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         ProcessSharedExpertTail();
     }
     if constexpr (g_coreType == AIV) {
+        const bool early = params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData);
+        if (early) {
+            if (GetSubBlockIdx() == 1U) PublishCoreClosure(params_, blockIdx_, true);
+            if (aivJob_.jobIndex == 32U) CloseHost(params_, rankId_, false);
+            if (aivJob_.jobIndex == 34U) CloseHost(params_, rankId_, true);
+        }
         if (UseAiv0CombineOwners(params_.tilingData) &&
             IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)) {
             // All local routed/shared prologues have returned with their final
@@ -1030,7 +1154,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                                              timer_.Enabled() ? &timer_ : nullptr, 1U);
         }
         PipeBarrier<PIPE_ALL>();
-        SyncAll<true>();
+        if (!early) SyncAll<true>();
         if (reduceOwner) {
             TraceHierarchicalCombineBoundary(commonConfig_, params_, hierarchicalCombine_,
                                              HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex),
@@ -1061,7 +1185,15 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                     TraceHierarchicalCombineBoundary(commonConfig_, params_, hierarchicalCombine_, lane,
                                                      timer_.Enabled() ? &timer_ : nullptr, 3U);
                 }
-                CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
+                if (params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData)) {
+                    if (owner)
+                        WaitUntilGmFlagEquals(ClosureSlot(params_, 96U), params_.tilingData->hierarchicalSequence);
+                    else
+                        WaitUntilGmFlagEquals(ClosureSlot(params_, 97U), params_.tilingData->hierarchicalSequence);
+                    AdvanceInputEpochLocally(params_.peermemInfo.rankSyncInWorldPtr, aivJob_);
+                } else {
+                    CrossRankSyncInHierarchicalHost(aivJob_, commonConfig_, params_);
+                }
                 if (owner) {
                     TraceHierarchicalCombineBoundary(commonConfig_, params_, hierarchicalCombine_, lane,
                                                      timer_.Enabled() ? &timer_ : nullptr, 4U);
@@ -1084,7 +1216,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                                AscendTimer::RdmaPhase::Combine, HierarchicalGateway(rankId_), scratch, lane + 1U);
             }
             PipeBarrier<PIPE_ALL>();
-            SyncAll<true>();
+            if (!(params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData))) SyncAll<true>();
         } else {
             CrossRankSyncInWorldSize(params_.peermemInfo.rankSyncInWorldPtr, rankId_, worldSize_, aivJob_);
         }

@@ -38,6 +38,7 @@ struct Params {
         GM_ADDR rankSyncInWorldPtr = window.data();
         GM_ADDR combineReduceCommitPtr = window.data() + 4096;
     } peermemInfo;
+    GM_ADDR inputScaleGmAddr = nullptr;
 };
 struct Progress {
     uint32_t sentRows = 0;
@@ -66,7 +67,7 @@ enum class RoceWaitKind { HostProducerBarrier };
 
 bool ExpectedOwner()
 {
-    return current.physical % 2U == 0U && current.physical / 2U < 8U;
+    return current.physical % 2U == 0U && current.physical / 2U < 16U;
 }
 void CheckOwner(uint32_t qp)
 {
@@ -185,7 +186,15 @@ void UnpermuteTokens(T&&...)
     ++current.unpermutes;
 }
 
+inline uint32_t GetSubBlockIdx() { return current.physical % 2; }
+template <class... T> void PublishCoreClosure(T&&...) { assert(false); }
+template <class... T> void CloseHost(T&&...) { assert(false); }
+template <class... T> int32_t* ClosureSlot(T&&...) { return nullptr; }
+template <class... T> void WaitUntilGmFlagEquals(T&&...) { assert(false); }
+template <class... T> void AdvanceInputEpochLocally(T&&...) { assert(false); }
+
 struct Kernel {
+    uint32_t blockIdx_ = current.physical / 2;
     static constexpr bool ENABLE_A8W4 = true, TopkWeightsPrefetch = false;
     static constexpr uint32_t GMM1_TILE_M = 256;
     static constexpr int CombineQuantMode = COMBINE_NO_QUANT;

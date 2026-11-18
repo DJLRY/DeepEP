@@ -1,3 +1,4 @@
+#include <algorithm>
 // Copyright (c) 2026, Lu Lu
 
 #pragma once
@@ -136,8 +137,15 @@ enum class TPosition { VECCALC };
 template <typename T>
 struct LocalTensor {
     std::vector<T> data;
+    T GetValue(uint32_t index) const { return data.at(index); }
     LocalTensor(TPosition, uint32_t, uint32_t count) : data(count) {}
 };
+template <class T> void DataCopy(LocalTensor<T>& dst, const T* src, uint32_t count) {
+    std::copy_n(src, count, dst.data.begin());
+}
+template <class T> void DataCopy(T* dst, const LocalTensor<T>& src, uint32_t count) {
+    std::copy_n(src.data.begin(), count, dst);
+}
 struct CopyParams {
     uint32_t blocks, bytes, sourceStride, destinationStride, reserved;
 };

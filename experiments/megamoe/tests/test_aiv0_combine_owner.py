@@ -32,8 +32,11 @@ def test_aiv0_reduction_waits_for_all_prologues_and_keeps_exclusive_qp_ownership
     # precede every prologue and the QP1 handoff.
     assert wave.index("ProcessInputPreparationStage();") < wave.index("SyncAll<false>();")
     assert wave.index("SyncAll<false>();") < wave.index("ProcessSharedExpertGmm1(")
-    preparation = body(kernel, "::ProcessInputPreparationStage()")
-    assert "FinishHierarchicalDispatch(" in preparation
+    assert (
+        wave.index("SyncAll<false>();")
+        < wave.index("FinishHierarchicalDispatch(")
+        < wave.index("derived.ProcessMoeExpertStages(")
+    )
     stages = wave[wave.index("    // 阶段 3：") : wave.index("    // 恢复入口时")]
     dispatch = (kernels / "stage/mega_moe_hierarchical_dispatch.hpp").read_text(encoding="utf-8")
     fixture = (directory / "aiv0_combine_owner_test.cpp").read_text(encoding="utf-8")

@@ -167,7 +167,13 @@ class Runtime:
                             else 0,
                         ]
                     )
-                local_values.append(int(udma) + 2 * int(combine_only) + 4 * int(dense_qps) + 8 * int(self.use_roce))
+                local_values.append(
+                    (16 << 8 if self.use_roce else 0)
+                    + int(udma)
+                    + 2 * int(combine_only)
+                    + 4 * int(dense_qps)
+                    + 8 * int(self.use_roce)
+                )
                 if store_group:
                     values = group.all_gather(local_values, "runtime configuration")
                 else:

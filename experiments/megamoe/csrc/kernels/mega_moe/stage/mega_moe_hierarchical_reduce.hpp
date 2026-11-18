@@ -70,11 +70,27 @@ __aicore__ inline void InitializeHierarchicalReducedCombine(const MoeStageCommon
     if (progress.initialized) {
         return;
     }
-    const uint32_t owners = HIERARCHICAL_COMBINE_QPS;
-    const uint32_t first = common.tokenNum * lane / owners;
-    const uint32_t end = common.tokenNum * (lane + 1U) / owners;
-    InitializeHierarchicalCombineProgressRange(common, params, progress, first, end, timer);
-    progress.nextRow = first * common.topK;
+    const uint32_t owners = HierarchicalCombineOwnerCount(params.tilingData);
+    if (!params.peermemInfo.compactPtr) {
+        const uint32_t first = common.tokenNum * lane / owners, end = common.tokenNum * (lane + 1U) / owners;
+        InitializeHierarchicalCombineProgressRange(common, params, progress, first, end, timer);
+        progress.nextRow = 0U;
+        for (uint32_t t = first; t < end; ++t) progress.tokens[progress.owned++] = t;
+        return;
+    }
+    auto* plan = reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.compactPtr);
+    const uint32_t count = ReadGmByPassDCache(plan);
+    const bool contiguous = UseAiv0CombineOwners(params.tilingData);
+    const uint32_t begin = contiguous ? count * lane / owners : lane;
+    const uint32_t end = contiguous ? count * (lane + 1U) / owners : count;
+    for (uint32_t i = begin; i < end; i += contiguous ? 1U : owners) {
+        const uint32_t token = ReadGmByPassDCache(plan + 1 + common.tokenNum + i);
+        const uint32_t mask = ReadGmByPassDCache(plan + 1 + token);
+        progress.tokens[progress.owned++] = token;
+        progress.pendingTopkMasks[token] = mask;
+        progress.expectedRows += CombineMaskCount(mask);
+    }
+    progress.initialized = true;
 }
 
 // One complete token is a nonpreemptible task. AIV0 owners finish all routed
@@ -195,12 +211,10 @@ __aicore__ inline bool TryProgressHierarchicalReducedCombine(const MoeStageCommo
     const uint32_t pendingBefore = progress.expectedRows - progress.sentRows;
     uint32_t scannedRows = 0U;
     timing.StartScan();
-    const uint32_t owners = HIERARCHICAL_COMBINE_QPS;
-    const uint32_t first = common.tokenNum * lane / owners;
-    const uint32_t end = common.tokenNum * (lane + 1U) / owners;
-    uint32_t token = progress.nextRow / common.topK;
+    uint32_t cursor = progress.nextRow;
     uint32_t posts = 0U;
-    for (uint32_t checked = 0U; checked < end - first && posts < maxPosts; ++checked) {
+    for (uint32_t checked = 0U; checked < progress.owned && posts < maxPosts; ++checked) {
+        const uint32_t token = progress.tokens[cursor];
         const uint32_t mask = progress.pendingTopkMasks[token];
         bool ready = mask != 0U;
         uint32_t observed = 0U;
@@ -226,11 +240,11 @@ __aicore__ inline bool TryProgressHierarchicalReducedCombine(const MoeStageCommo
             progress.sentRows += CombineMaskCount(mask);
             ++posts;
         }
-        if (++token == end) {
-            token = first;
+        if (++cursor == progress.owned) {
+            cursor = 0;
         }
     }
-    progress.nextRow = token * common.topK;
+    progress.nextRow = cursor;
     timing.Finish(pendingBefore, progress.expectedRows - progress.sentRows, posts, scannedRows);
     return posts != 0U;
 }
@@ -247,10 +261,8 @@ __aicore__ inline void TraceHierarchicalCombineBoundary(const MoeStageCommonConf
         return;
     }
     InitializeHierarchicalReducedCombine(common, params, progress, lane, timer);
-    const uint32_t owners = HIERARCHICAL_COMBINE_QPS;
-    const uint32_t first = common.tokenNum * lane / owners;
-    const uint32_t end = common.tokenNum * (lane + 1U) / owners;
-    for (uint32_t token = first; token < end; ++token) {
+    for (uint32_t i = 0; i < progress.owned; ++i) {
+        const uint32_t token = progress.tokens[i];
         const int64_t start = GetSystemCycle();
         const uint32_t mask = progress.pendingTopkMasks[token];
         uint32_t observed = 0U;

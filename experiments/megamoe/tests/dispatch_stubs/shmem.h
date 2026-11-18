@@ -91,6 +91,7 @@ inline void DeliverPosted(uint32_t qp = 0U)
     for (auto& item : queued)
         if (qp == 0U || item.qp == qp) Deliver(item);
 }
+inline std::vector<uint32_t> tails;
 inline bool IsPayloadCommit(uint32_t offset)
 {
     return offset >= payloadCommit && offset < payloadCommit + 8U * 512U && (offset - payloadCommit) % 512U == 0U;
@@ -151,12 +152,13 @@ inline int aclshmem_int32_test(int32_t* address, int comparison, int32_t value)
     }
     const auto offset = Offset(reinterpret_cast<uint8_t*>(address), sizeof(int32_t));
     Check(comparison == ACLSHMEM_CMP_EQ && static_cast<uint32_t>(value) == sequence, "incorrect invocation wait");
-    if (IsPayloadCommit(offset) && ReadWord(local, offset) != sequence && completeIncomingPayload) {
+    const bool payloadReady = IsPayloadCommit(offset) || std::find(tails.begin(), tails.end(), offset) != tails.end();
+    if (payloadReady && ReadWord(local, offset) != sequence && completeIncomingPayload) {
         completeIncomingPayload();
         return 0;
     }
     if (ReadWord(local, offset) != sequence) return 0;
-    if (IsPayloadCommit(offset)) ++waits;
+    if (payloadReady) ++waits;
     if (offset == metadataMarker || offset == metaCommit) ++metadataWaits;
     RoceTest::signalObserved = true;
     return 1;

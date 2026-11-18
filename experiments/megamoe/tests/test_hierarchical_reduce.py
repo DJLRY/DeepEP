@@ -41,6 +41,7 @@ def test_production_weighted_gateway_reduction_and_unpermute(tmp_path):
             "-Wextra",
             "-Werror",
             "-ffp-contract=off",
+            "-fno-strict-aliasing",  # Device register views alias signed/unsigned vector registers.
             f"-I{directory}",
             f"-I{directory / 'layout_stubs'}",
             f"-I{directory / 'combine_vf_stubs'}",
