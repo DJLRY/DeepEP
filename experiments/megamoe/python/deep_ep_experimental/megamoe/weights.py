@@ -1,5 +1,9 @@
 """Prepared expert weights. Updates run outside capture under caller-owned stream ordering."""
 
+from functools import wraps
+from threading import RLock
+
+from . import api
 from .api import _SharedFp8Pair, _check_fp4_weight_format, _interleave_gate_up_128, transform_weights_for_mega_moe
 
 
@@ -26,7 +30,10 @@ def _reorder(pair, inverse):
     nz = torch_npu.npu_format_cast(
         reorder(nd), 29, customize_dtype=torch.float8_e4m3fn, input_dtype=torch_npu.float4_e2m1fn_x2
     )
-    return nz, reorder(scale.view(torch.uint8)).view(torch.float8_e8m0fnu)
+    reordered = reorder(scale.view(torch.uint8))
+    if reordered.data_ptr() == scale.data_ptr():
+        reordered = reordered.clone()
+    return nz, reordered.view(torch.float8_e8m0fnu)
 
 
 def _validate(l1, l2, planar):
@@ -52,6 +59,7 @@ def _validate(l1, l2, planar):
             or scale.device != w.device
             or not w.is_contiguous()
             or not scale.is_contiguous()
+            or torch_npu.get_npu_format(scale) not in (0, 2)
             or scale.dtype != torch.float8_e8m0fnu
             or tuple(scale.shape) != (*w.shape[:2], (w.shape[-1] * (2 if fp4 else 1) + 63) // 64, 2)
         ):
@@ -107,7 +115,12 @@ def _single(pair, layout):
 
     if layout != "nd" and w.dtype == torch.uint8 and w.storage_offset() != 0:
         raise ValueError("prepared list weights require independent zero-offset storage")
-    return w.unsqueeze(0), s.unsqueeze(0)
+    expanded = w.unsqueeze(0), s.unsqueeze(0)
+    if layout != "nd" and w.dtype == torch.uint8:
+        _check_fp4_weight_format(expanded[0], "list weight")
+        if expanded[0].data_ptr() != w.data_ptr():
+            raise ValueError("adding the expert dimension must preserve prepared NZ storage")
+    return expanded
 
 
 def _records(l1, l2, shared, layout, planar):
@@ -119,6 +132,17 @@ def _records(l1, l2, shared, layout, planar):
     planes = [None] * len(groups[0]) if planar is None else _expert_group(planar)
     if planes is None:
         raise ValueError("planar_l1 must match the routed list")
+    import torch_npu
+
+    def raw_signature(entry):
+        return tuple((t.shape, t.dtype, t.device, t.stride(), torch_npu.get_npu_format(t)) for t in entry)
+
+    if not (len(planes) == len(groups[0]) == len(groups[1])):
+        raise ValueError("list projections and planar_l1 must have the same expert count")
+    for group in (*groups, planes) if planar is not None else groups:
+        expected = raw_signature(group[0])
+        if any(raw_signature(pair) != expected for pair in group[1:]):
+            raise ValueError("all list experts must share one shape, dtype, stride, device and format")
     records = [
         _prepare(_single(x, layout), _single(y, layout), shared, layout, _single(p, layout) if p is not None else None)
         for x, y, p in zip(*groups, planes, strict=True)
@@ -126,20 +150,45 @@ def _records(l1, l2, shared, layout, planar):
     signature = _signature(records[0])
     if any(_signature(record) != signature for record in records):
         raise ValueError("all list experts must share one shape, dtype, stride and device")
-    _check_nz_storage(records)
     return True, records
 
 
-def _check_nz_storage(records):
+def _outside_capture():
+    if api.npu_api().is_current_stream_capturing():
+        raise RuntimeError("expert weight preparation and updates require execution outside graph capture")
+
+
+def _mutation(method):
+    @wraps(method)
+    def wrapped(self, *args, **kwargs):
+        with self._lock:
+            _outside_capture()
+            return method(self, *args, **kwargs)
+
+    return wrapped
+
+
+def _slots(record, dual):
+    for pair in record[: 3 if dual else 2]:
+        yield from pair
+
+
+def _extent(tensor):
     import torch
 
-    if records[0][0][0].dtype == torch.uint8:
-        for row in range(3):
-            weights = [record[row][0] for record in records]
-            if any(w.storage_offset() for w in weights) or len(
-                {w.untyped_storage().data_ptr() for w in weights}
-            ) != len(weights):
-                raise ValueError("each NZ expert weight needs independent zero-offset storage")
+    storage = tensor.untyped_storage()
+    start = tensor.data_ptr()
+    if tensor.dtype == torch.uint8:
+        if tensor.storage_offset():
+            raise ValueError("each NZ weight needs independent zero-offset storage")
+        return start, start + storage.nbytes()
+    return start, start + tensor.numel() * tensor.element_size()
+
+
+def _validate_slots(records, dual):
+    intervals = sorted(_extent(t) for r in records for t in _slots(r, dual))
+    if any(end > start for (_, end), (start, _) in zip(intervals, intervals[1:])):
+        raise ValueError("expert weight and scale storage intervals overlap")
 
 
 def _signature(record):
@@ -148,18 +197,48 @@ def _signature(record):
 
 class PreparedWeights:
     def __init__(self, l1, l2, shared, layout, planar):
+        _outside_capture()
+        self._lock = RLock()
         self.shared = shared
         self.list_mode, self._records = _records(l1, l2, shared, layout, planar)
+        import torch
+
+        self._dual = not shared and self._records[0][0][0].dtype == torch.uint8
+        _validate_slots(self._records, self._dual)
+        self._remember_storage()
         self.count = len(self._records) if self.list_mode else self._records[0][0][0].shape[0]
         self.l1, self.l2 = WeightHandle(self), WeightHandle(self)
         self._tables = {}
         self._retired = []
+        self._retirement_batches = []
+        self._exported = {}
         self._valid = True
         self._pending = set()
+        self._staged_aliases = {}
         self._dirty_tables = False
         if self.list_mode:
             self._publish_tables()
         self.commit_prepared_update()
+
+    def _addresses(self):
+        return tuple(
+            (t.untyped_storage().data_ptr(), t.data_ptr()) for r in self._records for t in _slots(r, self._dual)
+        )
+
+    def _remember_storage(self):
+        self._addresses_at_bind = self._addresses()
+        self.storage_bases = {base for base, _ in self._addresses_at_bind}
+
+    def _check_bindings(self):
+        if any(
+            t.data_ptr() != ptr or t.untyped_storage().data_ptr() != base
+            for views in self._exported.values()
+            for pair in views.values()
+            for t, ptr, base in pair
+        ):
+            raise RuntimeError("exported expert view storage was rebound")
+        if self._addresses() != self._addresses_at_bind:
+            raise RuntimeError("prepared weight storage was rebound")
 
     def _publish_tables(self):
         import torch
@@ -178,39 +257,69 @@ class PreparedWeights:
         first, second, planar = self._records[0]
         return (first if fused or self.shared else planar), second, self._tables.get(fused)
 
-    def expert_views(self, expert):
+    def expert_views(self, expert=None, *, layout="planar"):
+        if layout not in ("planar", "fused"):
+            raise ValueError("layout must be planar or fused")
+        if expert is None:
+            first = 2 if layout == "planar" else 0
+            if not self.list_mode:
+                return self._records[0][first], self._records[0][1]
+            views = [self.expert_views(i) for i in range(self.count)]
+            return tuple(
+                tuple([view[key][j] for view in views] for j in range(2))
+                for key in ("planar_l1" if first == 2 else "l1", "l2")
+            )
         if not 0 <= expert < self.count:
             raise IndexError("expert out of range")
+        if expert in self._exported:
+            return {name: tuple(entry[0] for entry in pair) for name, pair in self._exported[expert].items()}
         record = self._records[expert if self.list_mode else 0]
         i = 0 if self.list_mode else expert
+        import torch
+
         views = {}
         for name, pair in zip(("l1", "l2", "planar_l1"), record):
             slices = tuple(t[i] for t in pair)
             if any(v.untyped_storage().data_ptr() != t.untyped_storage().data_ptr() for v, t in zip(slices, pair)):
                 raise RuntimeError("backend did not return a zero-copy expert view")
+            if slices[0].dtype == torch.uint8:
+                _check_fp4_weight_format(slices[0], "exported expert view")
             views[name] = slices
+        self._exported[expert] = {
+            name: tuple((t, t.data_ptr(), t.untyped_storage().data_ptr()) for t in pair) for name, pair in views.items()
+        }
         return views
 
     def _versions(self):
         return tuple(t._version if not t.is_inference() else None for r in self._records for p in r for t in p)
 
     def check_versions(self):
+        self._check_bindings()
         if not self._valid or self._versions() != self._snapshot:
             raise RuntimeError("expert weights changed without a complete update")
         return True
 
+    @_mutation
     def commit_prepared_update(self):
         """Publish a complete externally ordered update to all weight representations."""
+        self._check_bindings()
         if self._dirty_tables:
             self._publish_tables()
             self._dirty_tables = False
+        if self._retired:
+            event = api.npu_api().Event()
+            event.record(api.npu_api().current_stream(self._records[0][0][0].device))
+            self._retirement_batches.append((event, self._retired))
+            self._retired = []
         self._snapshot = self._versions()
         self._pending.clear()
+        self._staged_aliases.clear()
         self._valid = True
 
+    @_mutation
     def release_retired(self):
         """Call only after the framework has drained older readers and copies."""
-        self._retired.clear()
+        self._retirement_batches = [(e, refs) for e, refs in self._retirement_batches if not e.query()]
 
     def _update(self, indices, records, replace):
         if (
@@ -222,33 +331,56 @@ class PreparedWeights:
         for i, r in zip(indices, records, strict=True):
             if _signature(self._records[i]) != _signature(r):
                 raise ValueError("replacement must preserve weight layout")
+        _validate_slots(records, self._dual)
         if replace:
             future = self._records.copy()
             for i, r in zip(indices, records):
                 future[i] = r
-            _check_nz_storage(future)
+            _validate_slots(future, self._dual)
         if self._pending.difference(indices):
             raise RuntimeError("retry all experts from the incomplete update")
+        self._check_bindings()
         self._valid = False
         self._pending.update(indices)
         self._dirty_tables |= replace
         self._retired.extend(records)
-        for i, new in zip(indices, records):
-            old = self._records[i]
-            if replace:
-                self._retired.append(old)
-                self._records[i] = new
-            else:
-                for dst, src in zip(old, new):
-                    for d, s in zip(dst, src):
-                        d.copy_(s)
+        if replace:
+            self._retired.extend(self._records[i] for i in indices)
+            for i in indices:
+                self._exported.pop(i, None)
+            self._records = future
+            self._remember_storage()
+        else:
+            copies = [
+                (dst, src)
+                for i, new in zip(indices, records)
+                for dst, src in zip(_slots(self._records[i], self._dual), _slots(new, self._dual))
+                if _extent(dst) != _extent(src)
+            ]
+            targets = [_extent(dst) for dst, _ in copies]
+            staged = []
+            for dst, src in copies:
+                begin, end = _extent(src)
+                interval = (begin, end)
+                if interval in self._staged_aliases:
+                    src = self._staged_aliases[interval]
+                elif any(begin < stop and start < end for start, stop in targets):
+                    # Keep the pre-write value across a partial failure and retry.
+                    src = src.clone()
+                    self._staged_aliases[interval] = src
+                    self._retired.append(src)
+                staged.append((dst, src))
+            for dst, src in staged:
+                dst.copy_(src)
         self.commit_prepared_update()
 
+    @_mutation
     def update(self, l1, l2, *, input_layout="nd", planar_l1=None):
         if self.list_mode:
-            raise ValueError("use update_experts on a list owner")
+            return self.update_experts(range(self.count), l1, l2, input_layout=input_layout, planar_l1=planar_l1)
         self._update([0], [_prepare(l1, l2, self.shared, input_layout, planar_l1)], False)
 
+    @_mutation
     def update_experts(self, experts, l1, l2, *, replace=False, input_layout="nd", planar_l1=None):
         if not self.list_mode:
             raise ValueError("update_experts requires a list owner")
@@ -257,10 +389,17 @@ class PreparedWeights:
             raise ValueError("supply lists of changed expert tensors")
         self._update(list(experts), records, replace)
 
-    def refresh_gmm1(self, source="planar", experts=None):
+    @_mutation
+    def refresh_gmm1(self, indices=None, experts=None, *, source_layout=None, source=None):
+        if isinstance(indices, str):
+            source, indices = indices, experts
+        elif experts is not None:
+            indices = experts
+        source = source_layout or source or "planar"
+        self._check_bindings()
         if source not in ("planar", "fused"):
             raise ValueError("source must be planar or fused")
-        indices = list(range(self.count) if experts is None else experts)
+        indices = list(range(self.count) if indices is None else indices)
         if (
             not indices
             or len(set(indices)) != len(indices)
@@ -271,16 +410,15 @@ class PreparedWeights:
             raise RuntimeError("restore the incomplete weight update before refreshing GMM1")
         self._valid = False
         self._pending.update(indices if self.list_mode else [0])
-        for i in indices:
-            views = self.expert_views(i)
-            first, planar = views["l1"], views["planar_l1"]
-            if first[0].data_ptr() == planar[0].data_ptr():
+        for i in indices if self.list_mode else [0]:
+            first, _, planar = self._records[i]
+            if not self._dual:
                 continue
             src, dst = (planar, first) if source == "planar" else (first, planar)
-            updated = _reorder(tuple(t.unsqueeze(0) for t in src), source == "fused")
+            updated = _reorder(src, source == "fused")
             self._retired.append(updated)
-            for d, s in zip(dst, updated):
-                d.copy_(s[0])
+            for d, value in zip(dst, updated):
+                d.copy_(value)
         self.commit_prepared_update()
 
 

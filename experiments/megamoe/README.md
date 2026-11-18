@@ -84,7 +84,7 @@ H=1024～8192 且为64的倍数，I=256～4096 且为128的倍数，1≤K≤min(
 
 `owner = prepare_weights_for_mega_moe(l1, l2, shared=False, input_layout="nd")` 接受连续权重对或两组逐专家的 (weight, scale) 列表。两个投影传 `owner.l1, owner.l2`。routed FP4 也可从 `planar_nz` 生成 fused 布局，或用 `prepared` 和 `planar_l1` 导入两份已有布局。路由 ID 使用 EPLB 映射后的物理专家号。
 
-框架在 capture 外按设备事件先排空旧读者，再更新权重和映射。连续 owner 用 `update`，列表用 `update_experts(indices, l1, l2, replace=True)` 更换存储并保留表地址。通过 `expert_views(i)` 写入一份 GMM1 后调用 `refresh_gmm1(source="planar")` 或 `source="fused"` 同步另一份，全部权重与 scale 已写完时调用 `commit_prepared_update()`。最后一次旧图读取和异步复制完成后可调用 `release_retired()`。
+框架在 capture 外按设备事件先排空旧读者，再更新权重和映射。连续 owner 用 `update`，列表用 `update_experts(indices, l1, l2, replace=True)` 更换存储并保留表地址。通过 `expert_views(layout="planar")` / `expert_views(layout="fused")` 可取得整组 W1、W2 及各自 scale，`expert_views(i)` 仍可取单专家视图。列表可用 `refresh_gmm1(indices, source_layout="planar")` 局部刷新，连续 owner 整批刷新。写入一份 GMM1 后调用 `refresh_gmm1(source="planar")` 或 `source="fused"` 同步另一份，全部权重与 scale 已写完时调用 `commit_prepared_update()`。最后一次旧图读取和异步复制完成后可调用 `release_retired()`。
 
 ### BS96 双机验收
 
@@ -560,9 +560,11 @@ A8W8 仅保留单机 MTE 路径。
 
 每卡打包 Top-k ID 和权重后先经配对 gateway 发送元数据。目标形状在机内按 4 mesh × 4 lane 分两级交换，转发前检查整条 stripe 的包尾。每个来源按 512 B 分包，每包包含 127 个路由项和一个完整序号。索引核写入逐专家来源行，builder 用逐来源直方图生成共享前缀和专家行数。配对来源同时生成 Compact Combine 的 token 列表和 top-k mask。
 
-Dispatch 的 8 个 QP 按实际 token 区间 `[B*i/8, B*(i+1)/8)` 分工。每包 480 B 激活或 scale 数据和 32 B trailer，最后一个字保存当前计划域的完整序号。HNS 按行检查所有包，允许先搬就绪 token。两个 AIV1 在配对网关所有非空 lane 的末包到达后，分别通知本机一半 rank。XSCALE 通过每个 lane 的独立 commit 确认可见性。两种后端均由发送 owner 回收自己的 CQ。
+目标形状的 Top-k AllGather 先投递完整来源记录，再按 4 个 mesh 来源检查整条 stripe 的所有 marker。AIV0 在本核 reset 完成后按 host 制表。每条记录占 `ceil(BS*K/127)*512` 字节。制表 UB 在对齐的 prefix 后放 16 条记录和 16 组 256 B 直方图；第二个 host 等前一轮 VF 释放后复用。配对来源的索引写回完成后复用压紧 ID，生成升序 token 列表和 mask。四记录转发与最多八行 trailer 快照分时使用核尾保留区。
 
-网关将同一 token 的专家行按 top-k 次序用 FP32 加权，16 个 QP owner 将对应 partial 送回源卡。BS96 的专用 AIV1 owner 对 compact 序号按 16 交错分工，BS128 和默认模型的 AIV0 owner 按连续区间分工。空 QP 同样发送 commit。匹配预量化快路径时分别汇总 Dispatch reader 和本地 Combine producer 的完成信号。输出核按 token 获取所依赖的 QP，合并本地贡献、远端 partial 和 shared 结果后写回 BF16。通用形状使用 host 屏障。每轮 kernel 返回前各 owner 排空发送，两端使用相同的协议和窗口布局。
+Dispatch 的 8 个 QP 按实际 token 区间 `[B*i/8, B*(i+1)/8)` 分工。每包 480 B 激活或 scale 数据和 32 B trailer，最后一个字保存当前计划域的完整序号。HNS 按行检查所有包，允许先搬就绪 token。两个 AIV1 在配对网关所有非空 lane 的末包到达后，分别通知本机一半 rank。双机启动校验 HNS_1825、协议版本 4 及实际 QP/worker 配置。发送 owner 回收自己的 CQ。两台机器均需重建并安装同一套 core、扩展与设备库。
+
+网关将同一 token 的专家行按 top-k 次序用 FP32 加权，16 个 QP owner 将对应 partial 送回源卡。BS96 的专用 AIV1 owner 对 compact 序号按 16 交错分工，BS128 和默认模型的 AIV0 owner 按连续区间分工。空 QP 同样发送 commit。HNS 的目标 BS32/96 在 16～32 对核、BS128 在 28 对核且输入含 FP8 scale 时分别汇总 Dispatch reader 和本地 Combine producer 的完成信号。读者闭合后，owner 在本 QP 全部 partial 已投递时即可提交。28 对核时输出可逐 token 等待，其他核数组合在输出前汇合。输出核按 token 获取所依赖的 QP，合并本地贡献、远端 partial 和 shared 结果后写回 BF16。通用形状使用 host 屏障。每轮 kernel 返回前各 owner 排空发送，两端使用相同的协议和窗口布局。
 
 两机 RoCE runtime 的 `barrier()` 和 `destroy()` 先同步本卡全部 stream，再通过现有
 StoreGroup（TCPStore）或 ProcessGroup 交换完成状态；全部 rank 成功后才允许清理 SHMEM。

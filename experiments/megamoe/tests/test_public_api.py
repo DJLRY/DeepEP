@@ -75,13 +75,19 @@ class Tensor:
         base = self.data
         while isinstance(base.base, np.ndarray):
             base = base.base
-        return SimpleNamespace(data_ptr=lambda: base.ctypes.data)
+        return SimpleNamespace(data_ptr=lambda: base.ctypes.data, nbytes=lambda: base.nbytes)
 
     def data_ptr(self):
         return self.data.ctypes.data
 
     def storage_offset(self):
         return (self.data_ptr() - self.untyped_storage().data_ptr()) // self.data.itemsize
+
+    def numel(self):
+        return self.data.size
+
+    def element_size(self):
+        return self.data.itemsize
 
     def stride(self):
         return tuple(n // self.data.itemsize for n in self.data.strides)
@@ -161,13 +167,23 @@ def backend(monkeypatch):
     )
     stream = SimpleNamespace(wait_stream=lambda _: events.append("wait"), synchronize=lambda: events.append("sync"))
     npu = SimpleNamespace(
-        current_device=lambda: 0, current_stream=lambda _: stream, stream=lambda _: contextlib.nullcontext()
+        Event=lambda: SimpleNamespace(record=lambda stream: None, query=lambda: True),
+        is_current_stream_capturing=lambda: False,
+        current_device=lambda: 0,
+        current_stream=lambda _: stream,
+        stream=lambda _: contextlib.nullcontext(),
     )
     monkeypatch.setattr(api, "npu_api", lambda: npu)
     monkeypatch.setattr(
         api,
         "require_native",
-        lambda _: SimpleNamespace(megamoe_workspace_address=lambda _: 4096, megamoe_combine_reduce_version=3),
+        lambda _: SimpleNamespace(
+            megamoe_workspace_address=lambda _: 4096,
+            megamoe_combine_reduce_version=4,
+            megamoe_combine_qps=16,
+            megamoe_dispatch_qps=8,
+            megamoe_dispatch_workers=14,
+        ),
     )
 
     class Runtime:
@@ -206,6 +222,10 @@ def backend(monkeypatch):
         timer_numel=64,
         small_batch_max_tokens=256,
         hierarchical_max_tokens=256,
+        combine_reduce_version=4,
+        combine_qps=16,
+        dispatch_qps=8,
+        dispatch_workers=14,
     )
     monkeypatch.setattr(api, "_extension", lambda: ext)
     buffer = api.SymmBuffer(Group(), 4, 17, 2, 1024, 256)
@@ -774,3 +794,84 @@ def test_external_eplb_refresh_updates_both_layouts_in_place(backend):
             np.testing.assert_array_equal(result.data, expected)
         assert addresses == [t.data_ptr() for pair in (planar, fused) for t in pair]
         assert owner.check_versions()
+
+
+def test_prepared_routed_layouts_are_independent(backend):
+    from deep_ep_experimental.megamoe import prepare_weights_for_mega_moe
+
+    l1, l2 = weights()
+    for planar in (l1, (l1[0], l1[1].clone()), (l1[0][0:2], l1[1])):
+        with pytest.raises(ValueError, match="overlap"):
+            prepare_weights_for_mega_moe(l1, l2, input_layout="prepared", planar_l1=planar)
+
+
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_owner_swaps_aliasing_sources_before_first_write(backend, monkeypatch, interrupt):
+    l1, l2 = [[(w[i].clone(), s[i].clone()) for i in range(2)] for w, s in weights()]
+    l1[0][0].data.fill(1)
+    l1[1][0].data.fill(2)
+    owner = api.transform_weights_for_mega_moe(l1, l2)[0].owner
+    planar, second = owner.expert_views(layout="planar")
+    fused, _ = owner.expert_views(layout="fused")
+    before = [w.data_ptr() for w in fused[0]]
+
+    def flip(pair):
+        return tuple(list(reversed(group)) for group in pair)
+
+    if interrupt:
+        with monkeypatch.context() as patch:
+
+            def fail_copy(_):
+                raise RuntimeError("interrupted swap")
+
+            patch.setattr(owner._records[1][0][0], "copy_", fail_copy)
+            with pytest.raises(RuntimeError, match="interrupted swap"):
+                owner.update(flip(fused), flip(second), planar_l1=flip(planar), input_layout="prepared")
+        with pytest.raises(RuntimeError, match="incomplete"):
+            owner.select(True)
+    owner.update(flip(fused), flip(second), planar_l1=flip(planar), input_layout="prepared")
+    assert [w.data_ptr() for w in fused[0]] == before
+    assert [w.data.flat[0] for w in fused[0]] == [2, 1]
+    assert [w.data.flat[0] for w in planar[0]] == [2, 1]
+    owner.refresh_gmm1([1], source_layout="planar")
+    fused[0][1].data = fused[0][1].data.copy()
+    with pytest.raises(RuntimeError, match="rebound"):
+        owner.check_versions()
+
+
+def test_capture_guards_weight_mutations(backend, monkeypatch):
+    from deep_ep_experimental.megamoe import prepare_weights_for_mega_moe
+
+    owner = prepare_weights_for_mega_moe(*weights(), input_layout="planar_nz")
+    monkeypatch.setattr(api.npu_api(), "is_current_stream_capturing", lambda: True)
+    for action in (
+        owner.commit_prepared_update,
+        owner.release_retired,
+        owner.refresh_gmm1,
+        lambda: owner.update(*weights()),
+        lambda: prepare_weights_for_mega_moe(*weights()),
+    ):
+        with pytest.raises(RuntimeError, match="capture"):
+            action()
+
+
+@pytest.mark.parametrize("overlap", [False, True])
+def test_prepared_scales_can_share_disjoint_intervals(backend, overlap):
+    from deep_ep_experimental.megamoe import prepare_weights_for_mega_moe
+
+    fused, second = weights()
+    template = fused[1]
+    count = template.numel()
+    backing = np.zeros(2 * count, dtype=template.data.dtype)
+
+    def scale(start):
+        return Tensor(backing[start : start + count].reshape(template.shape), template.dtype)
+
+    planar = (fused[0].clone(), scale(count - int(overlap)))
+    planar[0].npu_format = fused[0].npu_format
+    fused = (fused[0], scale(0))
+    if overlap:
+        with pytest.raises(ValueError, match="overlap"):
+            prepare_weights_for_mega_moe(fused, second, input_layout="prepared", planar_l1=planar)
+    else:
+        assert prepare_weights_for_mega_moe(fused, second, input_layout="prepared", planar_l1=planar).check_versions()

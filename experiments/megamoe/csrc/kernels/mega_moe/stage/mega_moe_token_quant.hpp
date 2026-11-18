@@ -6,6 +6,7 @@
 
 #include "../common/mega_moe_mxfp8_utils.hpp"
 #include "../common/mega_moe_utils.hpp"
+#include "mega_moe_dispatch_packet_vf.hpp"
 
 namespace MegaMoeImpl {
 
@@ -86,6 +87,22 @@ __aicore__ inline void LoadTopkWeightsToUb(const Params& params, const QuantProc
 
 // 原型：MegaMoe::QuantProcessInRank。量化一个逻辑 AIV 任务负责的本卡 token。
 // FP8 输入只重排为原来的逐 token 通信记录；不解量化、不重复量化。
+__aicore__ inline void StoreDispatchPackets(LocalTensor<uint8_t> row, LocalTensor<bfloat16_t> input,
+                                            const Params& params, uint32_t token, uint32_t bytes)
+{
+    if (!UseHierarchicalRoce(params.tilingData)) return;
+    const uint32_t packets = DispatchPacketCount(bytes);
+    auto packet = input.template ReinterpretCast<uint8_t>();
+    PipeBarrier<PIPE_V>();
+    asc_vf_call<PackDispatchVF>(reinterpret_cast<__ubuf__ uint32_t*>(row.GetPhyAddr()),
+                                reinterpret_cast<__ubuf__ uint32_t*>(packet.GetPhyAddr()), bytes / sizeof(uint32_t),
+                                packets, params.tilingData->hierarchicalSequence);
+    SyncFuncStatic<HardEvent::V_MTE3, SYNC_EVENT_ID5>();
+    GlobalTensor<uint8_t> destination;
+    destination.SetGlobalBuffer(params.peermemInfo.dispatchPacketPtr);
+    DataCopy(destination[token * packets * RAIL_PACKET_BYTES], packet, packets * RAIL_PACKET_BYTES);
+}
+
 template <typename ActivationType>
 __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidden, const Params& params,
                                           const QuantProcessConfig& config,
@@ -111,42 +128,15 @@ __aicore__ inline void PackFp8LocalTokens(const WorkRange& range, uint32_t hidde
         WaitFlag<HardEvent::MTE2_MTE3>(event);
         DataCopyPad(output[row * config.quantTokenScaleAlignBytes], buffer,
                     {1U, config.quantTokenScaleAlignBytes, 0U, 0U, 0U});
+        if (UseHierarchicalRoce(params.tilingData)) {
+            SyncFuncStatic<HardEvent::MTE2_V, SYNC_EVENT_ID5>();
+            StoreDispatchPackets(buffer, index % DOUBLE_BUFFER == 0 ? scratch.xInTensor0 : scratch.xInTensor1, params,
+                                 row, config.quantTokenScaleAlignBytes);
+        }
         SetFlag<HardEvent::MTE3_MTE2>(event);
     }
     WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID0);
     WaitFlag<HardEvent::MTE3_MTE2>(EVENT_ID1);
-}
-
-// QuantizeLocalTokens has drained the producing DMA. Reuse its BF16 input
-// scratch for a whole padded row. The last packet reads only valid GM bytes.
-template <typename ActivationType>
-__aicore__ inline void PackDispatchRows(const AivJobContext& job, const MoeStageCommonConfig& common,
-                                        const Params& params, const QuantProcessConfig& config,
-                                        QuantProcessScratch<ActivationType>& scratch)
-{
-    const WorkRange range = TilingByJobContext(common.tokenNum, job.jobIndex, job.totalJobs, 1U);
-    const uint32_t bytes = config.quantTokenScaleAlignBytes;
-    const uint32_t packets = DispatchPacketCount(bytes);
-    GlobalTensor<uint8_t> src, dst;
-    src.SetGlobalBuffer(params.peermemInfo.quantTokenScalePtr);
-    dst.SetGlobalBuffer(params.peermemInfo.dispatchPacketPtr);
-    auto buf = scratch.xInTensor0.template ReinterpretCast<uint8_t>();
-    auto words = buf.template ReinterpretCast<int32_t>();
-    for (uint32_t token = range.start; token < range.start + range.count; ++token) {
-        Duplicate<int32_t>(words, 0, packets * RAIL_PACKET_WORDS);
-        SyncFuncStatic<HardEvent::V_MTE2, EVENT_ID0>();
-        const uint32_t full = bytes / DISPATCH_PACKET_DATA;
-        if (full != 0) DataCopy(buf, src[token * bytes], DataCopyParams{static_cast<uint16_t>(full), 15U, 0U, 1U});
-        const uint32_t tail = bytes % DISPATCH_PACKET_DATA;
-        if (tail != 0) DataCopy(buf[full * RAIL_PACKET_BYTES], src[token * bytes + full * DISPATCH_PACKET_DATA], tail);
-        SyncFuncStatic<HardEvent::MTE2_S, EVENT_ID0>();
-        for (uint32_t packet = 0; packet < packets; ++packet)
-            words.SetValue((packet + 1U) * RAIL_PACKET_WORDS - 1U, params.tilingData->hierarchicalSequence);
-        SyncFuncStatic<HardEvent::S_MTE3, EVENT_ID0>();
-        DataCopy(dst[token * packets * RAIL_PACKET_BYTES], buf, packets * RAIL_PACKET_BYTES);
-        SyncFuncStatic<HardEvent::MTE3_V, EVENT_ID0>();
-    }
-    SyncFuncStatic<HardEvent::MTE3_S, EVENT_ID0>();
 }
 
 template <int32_t QuantMode, typename QuantOutType, typename ActivationType, typename TopkWeightsType,
@@ -217,6 +207,8 @@ __aicore__ inline void QuantizeLocalTokens(const AivJobContext& job, const MoeSt
         auto xOutBytesTensor = xOutTensor.template ReinterpretCast<uint8_t>();
         DataCopyPad(dstGlobalTensor[static_cast<uint64_t>(index) * config.quantTokenScaleAlignBytes], xOutBytesTensor,
                     xCopyOutParams);
+        StoreDispatchPackets(xOutBytesTensor, xInTensor, params, tokenRange.start + index,
+                             config.quantTokenScaleAlignBytes);
         SetFlag<AscendC::HardEvent::MTE3_MTE2>(event);
     }
     WaitFlag<AscendC::HardEvent::MTE3_MTE2>(EVENT_ID0);

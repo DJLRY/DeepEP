@@ -78,6 +78,7 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
 
     monkeypatch.setattr(validation, "collective_check", check)
     buffer = MagicMock(timer_enabled=True, workspace_bytes=64, symmetric_buffer_bytes=128, num_max_tokens_per_rank=2)
+    buffer._roce_config = dict(combine_reduce_version=4, combine_qps=16, dispatch_qps=8, dispatch_workers=14)
     buffer._domains.configs = 16
     buffer._plan.effective_wave = 6
     monkeypatch.setattr(benchmark, "loaded_libraries", lambda: {})
@@ -105,6 +106,7 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
     benchmark.main()
     assert set(buffer_options[0]) == {"num_max_tokens_per_rank", "ranks_per_node", "num_max_configs", *config["model"]}
     manifest = json.loads((output / f"rank_{rank}" / "manifest.json").read_text())
+    assert manifest["compiled_roce_config"] == buffer._roce_config
     assert manifest["implementation"] == "dispatch_qp8_combine_qp16"
 
     selected = mode == "trace" and rank in (0, 16)
@@ -148,3 +150,18 @@ def test_profile_and_trace_run_one_warmup_and_continuous_batch(
     buffer.destroy.assert_called_once()
     group.close.assert_called_once()
     group.abort.assert_not_called()
+
+
+def test_loaded_library_hashes_follow_process_maps(tmp_path):
+    import hashlib
+    from deep_ep_experimental.megamoe import benchmark
+
+    extension = tmp_path / "_C.so"
+    loaded = tmp_path / "libmegamoe device.so"
+    for path in (extension, loaded, tmp_path / "libshmem-unused.so"):
+        path.write_bytes(path.name.encode())
+    maps = tmp_path / "maps"
+    maps.write_text(f"0000-1000 r-xp 00000 00:01 123 {loaded}\n" * 2)
+    assert benchmark._library_hashes(extension, maps) == {
+        str(p): hashlib.sha256(p.read_bytes()).hexdigest() for p in (extension, loaded)
+    }

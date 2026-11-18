@@ -27,6 +27,7 @@ struct Fixture {
     struct { void* inputScaleGmAddr = nullptr; int tilingData = 0; } params_;
     struct { uint32_t blockIdx = 0; } countWorkspace_;
     int hierarchicalCombine_ = 0;
+    void ProgressGatewayHint() {}
     bool UseEarlyClosure(int) const { return false; }
     bool UseAiv0CombineOwners(int) const { return true; }
     bool IsHierarchicalCombineOwner(int, uint32_t) const { return false; }

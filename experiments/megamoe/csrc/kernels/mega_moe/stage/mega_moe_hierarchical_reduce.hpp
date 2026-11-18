@@ -213,7 +213,7 @@ __aicore__ inline bool TryProgressHierarchicalReducedCombine(const MoeStageCommo
     timing.StartScan();
     uint32_t cursor = progress.nextRow;
     uint32_t posts = 0U;
-    for (uint32_t checked = 0U; checked < progress.owned && posts < maxPosts; ++checked) {
+    for (uint32_t checked = 0U; checked < (maxPosts == 1U ? 1U : progress.owned) && posts < maxPosts; ++checked) {
         const uint32_t token = progress.tokens[cursor];
         const uint32_t mask = progress.pendingTopkMasks[token];
         bool ready = mask != 0U;

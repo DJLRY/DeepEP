@@ -7,6 +7,7 @@
 #include "../common/mega_moe_utils.hpp"
 #include "../common/ascend_timer_v2_device.hpp"
 #include "mega_moe_route_compact.hpp"
+#include "mega_moe_route_host_masks.hpp"
 #include "mega_moe_combine_vf.hpp"
 
 namespace MegaMoeImpl {
@@ -32,6 +33,31 @@ __aicore__ inline void AcquireRoutePackets(GM_ADDR record, uint32_t packets, uin
         SyncFuncStatic<HardEvent::V_S, SYNC_EVENT_ID2>();
     } while (result.GetValue(0U) != 1U);
     SyncFuncStatic<HardEvent::S_MTE2, SYNC_EVENT_ID2>();
+}
+
+__aicore__ inline void StoreCompactPlan(const MoeStageCommonConfig& common, const Params& params,
+                                        LocalTensor<int32_t>& compactIds)
+{
+    const uint32_t stride = (common.tokenNum + 7U) / 8U * 8U;
+    // Route-index output DMA has drained. The first UB slot still holds the
+    // compact IDs; the following space is free up to the RoCE reservation.
+    const uint32_t addr = (common.tokenNum * common.topK * 4U + 255U) / 256U * 256U;
+    LocalTensor<int32_t> result(TPosition::VECCALC, addr, 2U * stride + 8U);
+    auto* masks = reinterpret_cast<__ubuf__ uint32_t*>(result.GetPhyAddr());
+    auto* list = reinterpret_cast<__ubuf__ int32_t*>(masks + stride);
+    auto* count = list + stride;
+    asc_vf_call<RouteHostMasksVF<true>>(
+        reinterpret_cast<__ubuf__ uint32_t*>(compactIds.GetPhyAddr()), masks, list, count, common.tokenNum, common.topK,
+        HierarchicalHost(common.rankId) * 16U * common.moeExpertPerRank, 16U * common.moeExpertPerRank);
+    SyncFuncStatic<HardEvent::V_S, SYNC_EVENT_ID2>();
+    uint32_t n = result.GetValue(2U * stride);
+    SyncFuncStatic<HardEvent::V_MTE3, SYNC_EVENT_ID2>();
+    GlobalTensor<int32_t> plan;
+    plan.SetGlobalBuffer(reinterpret_cast<__gm__ int32_t*>(params.peermemInfo.compactPtr));
+    DataCopyPad(plan[1], result, {1U, common.tokenNum * 4U, 0U, 0U, 0U});
+    if (n) DataCopyPad(plan[1 + common.tokenNum], result[stride], {1U, n * 4U, 0U, 0U, 0U});
+    DataCopyPad(plan[0], result[2U * stride], {1U, 4U, 0U, 0U, 0U});
+    SyncFuncStatic<HardEvent::MTE3_S, SYNC_EVENT_ID2>();
 }
 
 struct SendMaskConfig {

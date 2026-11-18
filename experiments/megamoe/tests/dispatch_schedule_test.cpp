@@ -84,7 +84,14 @@ struct TokenDispatchScratch {
     std::vector<uint32_t> pending;
 };
 struct DispatchRouteBatch {};
-struct DispatchCopyProgress {};
+struct DispatchCopyProgress {
+    uint32_t deferredCount = 0;
+};
+template <class, class, bool, class... Args>
+void ProbeDeferredDispatch(Args&&...)
+{
+    assert(false);
+}
 std::vector<uint32_t> data, owners;
 std::vector<int32_t> readyCounts;
 bool drained = true;

@@ -21,7 +21,10 @@ if TYPE_CHECKING:
     from torch import Tensor
     from torch.distributed import ProcessGroup
 
+    from .weights import WeightHandle
+
     WeightPair = tuple[Tensor, Tensor]
+    WeightInput = WeightPair | list[WeightPair] | tuple[list[Tensor], list[Tensor]]
 
 
 @lru_cache(maxsize=1)
@@ -124,6 +127,8 @@ class SymmBuffer:
                     else (16 if size == 32 and ranks_per_node == 16 and num_max_tokens_per_rank <= 256 else 1)
                 )
             integer("num_max_configs", num_max_configs, 1, 4096)
+            if num_max_configs > 1 and not (size == 32 and ranks_per_node == 16 and num_max_tokens_per_rank <= 256):
+                raise ValueError("multi-domain plans require EP32 with 16 ranks per host and capacity <= 256")
             if base is not None:
                 base._ensure_alive()
                 if base._device != torch.device(f"npu:{npu_api().current_device()}"):
@@ -205,16 +210,29 @@ class SymmBuffer:
         self.ranks_per_node = ranks_per_node
         self._hierarchical_roce = ranks_per_node == 16 and size > 16
         self._sequence = 0
+        self._roce_config = {}
         self.x = self.x_sf = self.topk_idx = self.topk_weights = None
         error = None
+        config = ()
         try:
-            if self._hierarchical_roce and getattr(require_native("MegaMoE"), "megamoe_combine_reduce_version", 0) != 3:
-                raise RuntimeError("Rebuild the complete wheel for MegaMoE weighted reduction and owned QPs")
+            if self._hierarchical_roce:
+                native = require_native("MegaMoE")
+                fields = ("combine_reduce_version", "combine_qps", "dispatch_qps", "dispatch_workers")
+                config = tuple(getattr(ext, f, None) for f in fields)
+                if (
+                    config[0] != 4
+                    or None in config
+                    or config != tuple(getattr(native, "megamoe_" + f, None) for f in fields)
+                ):
+                    raise RuntimeError(
+                        "Rebuild the complete wheel: MegaMoE weighted reduction protocol/configuration mismatch"
+                    )
+                self._roce_config = dict(zip(fields, config))
             self.allocate_inputs()
         except Exception as failure:
             error = str(failure)
         # 输入分配失败先通知所有 rank，再进入 SHMEM，避免其他 rank 已在建链等待。
-        collective_check(group, "input allocation", error)
+        collective_check(group, "input allocation", error, config)
         runtime_options = dict(ranks_per_node=ranks_per_node)
         with self._lock:
             if base is None:
@@ -296,6 +314,8 @@ class SymmBuffer:
 
     def prepare(self, bs: int) -> SymmBuffer:
         """Collectively prepare/reuse one BS before timing; all ranks must call together."""
+        if npu_api().is_current_stream_capturing():
+            raise RuntimeError("collective prepare must run outside graph capture")
         error = None
         with self._lock:
             try:
@@ -304,7 +324,9 @@ class SymmBuffer:
             except Exception as failure:
                 error = str(failure)
             try:
-                collective_check(self.group, "prepare", error, (self._view_id, bs))
+                collective_check(
+                    self.group, "prepare", error, (self._view_id, bs, self._domains.next_domain, self._domains.frozen)
+                )
             except Exception:
                 if self._domains.configs > 1:
                     self._domains.failed = True
@@ -323,6 +345,21 @@ class SymmBuffer:
                     self._domains.failed = True
                 raise
         return self
+
+    def set_wave(self, wave: int):
+        """Collectively set the prepared batch's wave override (0 selects auto)."""
+        with self._lock:
+            error = None
+            try:
+                self._ensure_alive()
+                integer("wave", wave, 0, 64)
+                if self._plan is None or npu_api().is_current_stream_capturing():
+                    raise ValueError("set_wave requires a prepared plan outside capture")
+            except Exception as failure:
+                error = str(failure)
+            collective_check(self.group, "set_wave", error, (self._view_id, self._plan_bs, wave))
+            self._runtime.stream.synchronize()
+            self._plan.set_wave(wave)
 
     @property
     def workspace_bytes(self) -> int:
@@ -456,10 +493,11 @@ class _RoutedWeightPair(tuple):
 
 
 def transform_weights_for_mega_moe(
-    l1_weights: WeightPair, l2_weights: WeightPair, activation: str = "swiglu", *, shared: bool = False
-) -> tuple[WeightPair, WeightPair]:
+    l1_weights: WeightInput, l2_weights: WeightInput, activation: str = "swiglu", *, shared: bool = False
+) -> tuple[WeightPair, WeightPair] | tuple[WeightHandle, WeightHandle]:
     """Convert raw Ascend packed weights to NZ once, without quantizing again.
 
+    Per-expert lists return two handles sharing a prepared, updatable owner.
     Raw inputs use [gate | up]. Routed FP4 GMM1 prepares both planar Prefill and
     [gate128, up128] Decode layouts. Keep the returned l1 pair intact and immutable;
     the API selects its layout by actual BS without a timed conversion. Pass shared=True for
@@ -472,6 +510,11 @@ def transform_weights_for_mega_moe(
 
     if activation != "swiglu":
         raise NotImplementedError("Only SwiGLU is supported")
+    from .weights import _expert_group, prepare_weights_for_mega_moe
+
+    if _expert_group(l1_weights) is not None or _expert_group(l2_weights) is not None:
+        owner = prepare_weights_for_mega_moe(l1_weights, l2_weights, shared=shared)
+        return owner.l1, owner.l2
     transformed = []
     for name, value in (("l1_weights", l1_weights), ("l2_weights", l2_weights)):
         weight, scale = _pair(value, name)
@@ -573,7 +616,20 @@ def mega_moe(
     )
 
 
-def _run(
+def _run(x, topk_idx, topk_weights, l1_weights, l2_weights, sym_buffer, **options):
+    from contextlib import ExitStack
+    from .weights import WeightHandle
+
+    owners = [h.owner for h in (l1_weights, options.get("shared_l1_weights")) if isinstance(h, WeightHandle)]
+    if not owners:
+        return _run_locked(x, topk_idx, topk_weights, l1_weights, l2_weights, sym_buffer, **options)
+    with ExitStack() as stack:
+        for owner in sorted(set(owners), key=id):
+            stack.enter_context(owner._lock)
+        return _run_locked(x, topk_idx, topk_weights, l1_weights, l2_weights, sym_buffer, **options)
+
+
+def _run_locked(
     x,
     topk_idx,
     topk_weights,
@@ -667,6 +723,12 @@ def _run(
         if tensor is not None
     ):
         raise ValueError("out must not overlap any input or timer storage")
+    for owner in owners:
+        if any(
+            t is not None and t.untyped_storage().data_ptr() in owner.storage_bases
+            for t in (data, scales, topk_idx, topk_weights, out, timer, cumulative_stats)
+        ):
+            raise ValueError("call tensors overlap prepared expert storage")
     if topk_idx.dtype != torch.int32:
         raise TypeError("topk_idx must be int32; convert explicitly before timing")
     if w1.dtype == torch.uint8:

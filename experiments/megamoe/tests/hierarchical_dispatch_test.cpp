@@ -62,6 +62,10 @@ struct SendMaskConfig {
 struct SendMaskScratch {
     LocalTensor<int32_t> topkIdsTensor{TPosition::VECCALC, 0U, 1024U}, topkIndexTensor{TPosition::VECCALC, 0U, 1024U};
 };
+inline void StoreCompactPlan(const MoeStageCommonConfig&, const Params&, LocalTensor<int32_t>&)
+{
+    throw std::logic_error("compact vector path requires the route fixture");
+}
 inline void AcquireRoutePackets(GM_ADDR data, uint32_t count, uint32_t seq, LocalTensor<int32_t>&) {
     for (uint32_t i = 1; i <= count; ++i) {
         uint32_t tail;
@@ -413,6 +417,23 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     // Exercise arrival permutation; a stale final lane must never allow an
     // early broadcast. Arrival/receive completion do not retire outgoing CQEs.
     const std::array<uint32_t, 8> arrival{7, 3, 0, 6, 2, 5, 1, 4};
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+    selectJob(53U);
+    uint32_t remembered = 0U;
+    for (const auto lane : arrival) {
+        FinishHierarchicalDispatch({53U, 56U}, common, params, nullptr, &remembered);
+        Check((remembered & (1U << lane)) == 0U || !marker[lane], "stale lane remembered as ready");
+        Check(std::all_of(broadcasts.begin(), broadcasts.end(), [](uint32_t n) { return n == 0; }),
+              "bounded probe broadcast early");
+        if (marker[lane]) writeWord(marker[lane], sequence);
+        // Empty lanes can appear last in this permutation.
+        if (std::all_of(marker.begin(), marker.end(), [&](auto m) { return !m || ReadWord(local, m) == sequence; }))
+            break;
+    }
+    FinishHierarchicalDispatch({53U, 56U}, common, params, nullptr, &remembered);
+    FinishHierarchicalDispatch({53U, 56U}, common, params, nullptr, &remembered);
+    Check(remembered == 255U, "helper did not remember all lanes");
+#else
     uint32_t arrivals = 0U;
     completeIncomingPayload = [&] {
         Check(std::all_of(broadcasts.begin(), broadcasts.end(), [](uint32_t n) { return n == 0; }),
@@ -424,6 +445,7 @@ void CheckDispatch(uint32_t rank, uint32_t bs, uint32_t capacity, uint32_t hidde
     selectJob(53U);
     FinishHierarchicalDispatch({53U, 56U}, common, params);
     completeIncomingPayload = nullptr;
+#endif
     selectJob(55U);
     FinishHierarchicalDispatch({55U, 56U}, common, params);
     Check(waits == 2 * tails.size() && ddrBarriers == 4U, "missing collective payload acquire");

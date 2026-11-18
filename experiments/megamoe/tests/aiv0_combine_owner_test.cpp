@@ -21,7 +21,7 @@ struct State {
     uint32_t physical = 0, preDrains = 0, payloads = 0, commits = 0, waits = 0, quiets = 0;
     uint32_t hostCqCalls = 0, unpermutes = 0, expectedRows = 0;
     bool routedDone = false, sharedDone = false, drained = false, hostDone = false, exported = false;
-    bool timer = false;
+    bool timer = false, early = false, oddOwners = false, readersAcquired = false, producersAcquired = false;
 } current;
 alignas(512) std::array<uint8_t, 64U * 1024U> window{};
 std::array<uint8_t, 512> scratch{};
@@ -67,7 +67,7 @@ enum class RoceWaitKind { HostProducerBarrier };
 
 bool ExpectedOwner()
 {
-    return current.physical % 2U == 0U && current.physical / 2U < 16U;
+    return current.physical % 2U == static_cast<uint32_t>(current.oddOwners) && current.physical / 2U < 16U;
 }
 void CheckOwner(uint32_t qp)
 {
@@ -143,7 +143,8 @@ void RocePublishCommit(GM_ADDR dst, GM_ADDR src, uint32_t, uint8_t*, AscendTimer
                        uint32_t qp = 1U)
 {
     CheckOwner(qp);
-    assert(current.hostDone && phase == AscendTimer::RdmaPhase::Combine);
+    assert(phase == AscendTimer::RdmaPhase::Combine);
+    assert(current.early ? current.readersAcquired && !current.exported : current.hostDone);
     assert(src == reinterpret_cast<GM_ADDR>(HierarchicalSignalAddress({}, HierarchicalSignal::Sequence)));
 
     assert(dst == window.data() + 4096 + (current.physical / 2U) * 512U);
@@ -154,7 +155,7 @@ void RoceWaitCommit(int32_t* flag, uint32_t, AscendTimerDevice*, AscendTimer::Rd
                     uint32_t qp = 1U)
 {
     CheckOwner(qp);
-    assert(current.commits == 1U && current.hostDone);
+    assert(current.commits == 1U && (current.early ? current.readersAcquired : current.hostDone));
     assert(phase == AscendTimer::RdmaPhase::Combine);
 
     assert(reinterpret_cast<GM_ADDR>(flag) == window.data() + 4096 + (current.physical / 2U) * 512U);
@@ -183,15 +184,41 @@ template <int, typename, bool, uint32_t, typename... T>
 void UnpermuteTokens(T&&...)
 {
     assert(!ExpectedOwner());
+    assert(!current.early || current.producersAcquired);
     ++current.unpermutes;
 }
 
 inline uint32_t GetSubBlockIdx() { return current.physical % 2; }
-template <class... T> void PublishCoreClosure(T&&...) { assert(false); }
-template <class... T> void CloseHost(T&&...) { assert(false); }
-template <class... T> int32_t* ClosureSlot(T&&...) { return nullptr; }
-template <class... T> void WaitUntilGmFlagEquals(T&&...) { assert(false); }
-template <class... T> void AdvanceInputEpochLocally(T&&...) { assert(false); }
+void PublishCoreClosure(const Params&, uint32_t block, bool producers)
+{
+    assert(current.early && producers && current.physical == 2U * block + 1U);
+    assert(current.routedDone && current.sharedDone);
+}
+void CloseHost(const Params&, uint32_t, bool producers, int&)
+{
+    assert(current.early && current.physical == (producers ? 32U : 1U));
+}
+int32_t* ClosureSlot(const Params&, uint32_t slot)
+{
+    assert(slot == 96U || slot == 97U);
+    return reinterpret_cast<int32_t*>(window.data()) + slot;
+}
+void WaitUntilGmFlagEquals(int32_t* flag, uint32_t seq)
+{
+    assert(current.early && seq == 259U);
+    if (ExpectedOwner()) {
+        assert(flag == reinterpret_cast<int32_t*>(window.data()) + 96 && current.payloads == current.expectedRows);
+        current.readersAcquired = true;
+    } else {
+        assert(flag == reinterpret_cast<int32_t*>(window.data()) + 97);
+        current.producersAcquired = true;
+    }
+}
+template <class... T>
+void AdvanceInputEpochLocally(T&&...)
+{
+    assert(current.early);
+}
 
 struct Kernel {
     uint32_t blockIdx_ = current.physical / 2;
@@ -203,6 +230,7 @@ struct Kernel {
     Params params_{&tiling, {}};
     AivJobContext aivJob_{current.physical, 56U};
     MoeStageCommonConfig commonConfig_{};
+    int hostClosure_ = 0;
     Progress hierarchicalCombine_{};
     AscendTimerDevice timer_{};
     Dump exceptionDump_{};
@@ -276,4 +304,36 @@ int main()
                         assert(current.hostCqCalls == 0U);
 #endif
                     }
+#ifdef ACLSHMEMI_RDMA_K_BACKEND_HNS_1825
+    for (uint32_t bs : {32U, 96U, 128U}) {
+        for (uint32_t physical = 0; physical < 56; ++physical) {
+            current = {};
+            current.physical = physical;
+            current.early = true;
+            current.oddOwners = bs == 96;
+            current.expectedRows = (physical / 2U) % 3U;  // Include empty QPs.
+            Kernel kernel;
+            auto& t = kernel.tiling;
+            t.topoType = TOPO_TYPE_MTE_ROCE;
+            t.epWorldSize = 32;
+            t.aicNum = 28;
+            t.blockAivNum = 56;
+            t.bs = bs;
+            t.h = bs == 32 ? 3584 : 5120;
+            t.hiddenDim = bs == 32 ? 2560 : 4608;
+            t.topK = bs == 32 ? 8 : 6;
+            t.moeExpertPerRank = bs == 32 ? 12 : 13;
+            t.sharedFp8 = bs != 32;
+            t.sharedExpertNum = t.sharedFp8 ? 1U : 0U;
+            kernel.sharedExpertNum_ = t.sharedExpertNum;
+            t.groupedMatmulMode = GROUPED_MATMUL_MODE_A8W4;
+            t.combineQuantMode = COMBINE_NO_QUANT;
+            t.hierarchicalSequence = 259U;
+            kernel.params_.inputScaleGmAddr = window.data();
+            kernel.Run();
+            assert(current.commits == static_cast<uint32_t>(ExpectedOwner()));
+            assert(current.quiets == current.commits && !current.hostDone);
+        }
+    }
+#endif
 }

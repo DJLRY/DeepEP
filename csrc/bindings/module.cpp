@@ -4,6 +4,7 @@
 #include <memory>
 #include <dlfcn.h>
 #include "host/init/shmem_host_init.h"
+#include "common/megamoe_combine_config.hpp"
 #include "runtime/session.hpp"
 #ifdef DEEPEP_BUILD_EP_GMM_FUSED
 #include <pybind11/stl.h>
@@ -52,7 +53,10 @@ PYBIND11_MODULE(_C, module)
         .def_property_readonly("sparse_qp_enabled", &deepep::Session::sparse_qp_enabled)
         .def_property_readonly("peer_table", &deepep::Session::peer_table);
 #ifdef DEEPEP_BUILD_MEGAMOE
-    module.attr("megamoe_combine_reduce_version") = 3;
+    module.attr("megamoe_combine_reduce_version") = deepep::megamoe_config::PROTOCOL;
+    module.attr("megamoe_combine_qps") = deepep::megamoe_config::COMBINE_QPS;
+    module.attr("megamoe_dispatch_qps") = deepep::megamoe_config::DISPATCH_QPS;
+    module.attr("megamoe_dispatch_workers") = deepep::megamoe_config::DISPATCH_WORKERS;
     module.def(
         "create_megamoe_runtime",
         [](int rank, int size, uint64_t bytes, const std::string& endpoint, unsigned timeout, bool roce) {

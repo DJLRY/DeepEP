@@ -182,10 +182,16 @@ HOST_DEVICE uint32_t CompactOwner(const MegaMoeTilingData* t, uint32_t index, ui
 }
 HOST_DEVICE bool UseEarlyClosure(const MegaMoeTilingData* t)
 {
-    return UseSharedRouteTable(t) && t->epWorldSize == 32 && t->aicNum == 28 && t->blockAivNum == 56 &&
-           !t->topkWeightsPrefetch &&
+#ifdef ACLSHMEMI_RDMA_K_BACKEND_HNS_1825
+    return UseSharedRouteTable(t) && t->epWorldSize == 32 && t->aicNum >= 16 && t->aicNum <= 32 &&
+           t->blockAivNum == 2 * t->aicNum && !t->topkWeightsPrefetch &&
            ((t->bs == 32 && t->hiddenDim == 2560 && !t->sharedExpertNum) ||
-            ((t->bs == 96 || t->bs == 128) && t->hiddenDim == 4608 && t->sharedFp8));
+            ((t->bs == 96 || (t->bs == 128 && t->aicNum == 28)) && t->hiddenDim == 4608 && t->sharedExpertNum == 1U &&
+             t->sharedFp8));
+#else
+    (void)t;
+    return false;
+#endif
 }
 
 HOST_DEVICE bool IsHierarchicalCombineOwner(const MegaMoeTilingData* t, uint32_t physicalJob)

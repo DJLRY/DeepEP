@@ -16,13 +16,18 @@ from .performance import PERF_METHODS, SLEEP_CYCLES, alignment_config, collect_p
 
 
 def loaded_libraries():
-    import hashlib
     from . import _C
 
-    paths = {Path(_C.__file__).resolve()}
-    for line in Path("/proc/self/maps").read_text().splitlines():
+    return _library_hashes(Path(_C.__file__), Path("/proc/self/maps"))
+
+
+def _library_hashes(extension, maps):
+    import hashlib
+
+    paths = {extension.resolve()}
+    for line in maps.read_text().splitlines():
         fields = line.split(maxsplit=5)
-        if len(fields) == 6 and fields[-1].startswith("/"):
+        if len(fields) == 6 and Path(fields[-1]).is_absolute():
             path = Path(fields[-1])
             if (
                 path.is_file()
@@ -182,15 +187,9 @@ def main():
             args.waves = list(range(65)) if args.waves == "all" else [int(n) for n in args.waves.split(",")]
         except ValueError:
             parser.error("--waves accepts integers or all")
-        if (
-            args.mode != "perf"
-            or args.timer
-            or args.wave
-            or len(set(args.waves)) != len(args.waves)
-            or any(not 0 <= n <= 64 for n in args.waves)
-        ):
-            parser.error("wave sweeps require distinct values 0..64 and timer-off perf")
-    if not 0 <= args.retest_top <= len(args.waves or []) or (args.check_graph and args.mode != "accuracy"):
+        if args.mode != "perf" or args.timer or args.wave or any(not 0 <= n <= 64 for n in args.waves):
+            parser.error("wave sweeps require values 0..64 and timer-off perf")
+    if not 0 <= args.retest_top <= len(set(args.waves or [])) or (args.check_graph and args.mode != "accuracy"):
         parser.error("invalid retest count or graph mode")
     config = load_config(args.config, args.bs_values)
     if args.check_tokens < 0 or not 0 < args.relative_rmse < 1:
@@ -286,11 +285,10 @@ def run(args, config, group):
         numerical_contract=(
             "ascend_post_gmm2_host_reduce_fp32_v1" if hierarchical else "ascend_post_gmm2_route_weight_v1"
         ),
-        implementation="dispatch_qp8_combine_qp16" if hierarchical else "mte",
+        implementation="mte",
         created_utc=datetime.now(timezone.utc).isoformat(),
         build=json.loads(files("deep_ep").joinpath("_build_info.json").read_text()),
     )
-    (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     model = config["model"]
     buffer = SymmBuffer(
         group,
@@ -300,6 +298,11 @@ def run(args, config, group):
         **model,
     )
 
+    if hierarchical:
+        compiled = buffer._roce_config
+        manifest["compiled_roce_config"] = compiled
+        manifest["implementation"] = f"dispatch_qp{compiled['dispatch_qps']}_combine_qp{compiled['combine_qps']}"
+    (rank_dir / "manifest.json").write_text(json.dumps(manifest, indent=2), encoding="utf-8")
     if buffer._domains.configs > 1:
         for bs in config["bs_values"]:
             buffer.prepare(bs)
@@ -353,7 +356,7 @@ def run(args, config, group):
         buffer.topk_weights[:bs].copy_(torch.from_numpy(weights))
         buffer.validate_inputs(bs, x=activation)
         buffer.prepare(bs)
-        buffer._plan.set_wave(args.wave)
+        buffer.set_wave(args.wave)
         (case / "resources.json").write_text(
             json.dumps(
                 dict(
@@ -368,9 +371,9 @@ def run(args, config, group):
         )
         result = torch.empty((bs, model["hidden"]), device="npu", dtype=torch.bfloat16)
 
-        def call(timer=None, stats=None):
+        def call(timer=None, stats=None, output=None):
             fp8_fp4_mega_moe(
-                result,
+                result if output is None else output,
                 *prepared,
                 buffer,
                 cumulative_local_expert_recv_stats=stats,
@@ -456,6 +459,7 @@ def run(args, config, group):
             torch.npu.synchronize()
             if args.check_graph:
                 static_stats = torch.zeros_like(stats)
+                expected_y = torch.empty_like(result)
                 graph = torch.npu.NPUGraph()
                 with torch.npu.graph(graph):
                     call(stats=static_stats)
@@ -471,8 +475,8 @@ def run(args, config, group):
                     buffer.topk_idx[:bs].copy_(torch.from_numpy(vi))
                     buffer.topk_weights[:bs].copy_(torch.from_numpy(vw))
                     eager_stats = torch.zeros_like(stats)
-                    call(stats=eager_stats)
-                    expected_y = result.clone()
+                    call(stats=eager_stats, output=expected_y)
+                    result.fill_(float("nan"))
                     static_stats.zero_()
                     graph.replay()
                     torch.npu.synchronize()
@@ -514,7 +518,7 @@ def run(args, config, group):
 
             def profile_wave(wave, target, warmup):
                 target.mkdir(exist_ok=True)
-                buffer._plan.set_wave(wave)
+                buffer.set_wave(wave)
                 for _ in range(warmup):
                     call()
                 torch.npu.synchronize()
@@ -540,9 +544,13 @@ def run(args, config, group):
                 return report
 
             if args.waves:
-                reports = [profile_wave(wave, case / f"wave_{wave}", config["warmup"]) for wave in args.waves]
-                for report in sorted(reports, key=lambda item: item["mean_us"])[: args.retest_top]:
-                    wave = report["requested_wave"]
+                by_wave = {}
+                for trial, wave in enumerate(args.waves):
+                    directory = f"wave_{wave}" if wave not in by_wave else f"wave_{wave}_trial_{trial}"
+                    report = profile_wave(wave, case / directory, config["warmup"])
+                    by_wave.setdefault(wave, []).append(report["mean_us"])
+                ordered = sorted(by_wave, key=lambda w: sum(by_wave[w]) / len(by_wave[w]))
+                for wave in ordered[: args.retest_top]:
                     profile_wave(wave, case / f"retest_{wave}", config["warmup"])
             else:
                 profile_wave(args.wave, case, 0)

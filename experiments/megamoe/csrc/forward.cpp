@@ -56,9 +56,6 @@ MegaMoeDispatchBufferConfig DispatchConfig(const MegaMoeTilingData& t, uint32_t 
     const uint64_t total = static_cast<uint64_t>(t.numMaxTokensPerRank);
     const uint64_t aligned = AlignUp(total, uint64_t{256});
     c.copyBufferBytes = DispatchCopyBytes(t);
-    TORCH_CHECK(!MegaMoeImpl::UseSharedRouteTable(&t) ||
-                    c.copyBufferBytes >= MegaMoeImpl::CalcRailTopkIdsSlotDataBytes(t.bs, t.topK) + 256,
-                "Insufficient dispatch UB for the per-source route histogram");
     const uint32_t fixed =
         AlignUp(t.epWorldSize * t.moeExpertPerRank * 4U, 32U) + AlignUp(t.moeExpertPerRank * 4U, 32U);
     c.routeItemsPerBatch = static_cast<int32_t>(std::min<uint64_t>(aligned, BASE_RECV_ROUTE_ITEMS_PER_BATCH));
@@ -292,13 +289,19 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
 #ifndef DEEPEP_MEGAMOE_ROCE
     TORCH_CHECK(!hierarchical, "Rebuild MegaMoE with a RoCE-enabled SHMEM SDK (XSCALE or HNS_1825)");
 #endif
-    TORCH_CHECK(!hierarchical || p.ub > MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES,
-                "Not enough UB for MegaMoE RoCE scratch");
-    const uint32_t stage_ub = hierarchical ? p.ub - MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES : p.ub;
+    const uint32_t packets = MegaMoeImpl::DispatchPacketCount(AlignUp(t.h, 256U) + AlignUp(CeilDiv(t.h, 32U), 32U));
+    t.sharedExpertNum = static_cast<uint32_t>(shared_experts);
+    const uint32_t stripe = MegaMoeImpl::UseRouteAllGather(&t)
+                                ? static_cast<uint32_t>(4U * MegaMoeImpl::CalcRailTopkIdsSlotDataBytes(t.bs, t.topK))
+                                : 0U;
+    const uint32_t reserved =
+        AlignUp(MegaMoeImpl::HIERARCHICAL_ROCE_UB_BYTES + std::max(stripe, 8U * packets * 32U + 32U), 256U);
+    TORCH_CHECK(!hierarchical || p.ub > reserved, "Not enough UB for RoCE and Dispatch probes");
+    TORCH_CHECK(!hierarchical || packets * 512U <= 2U * t.h, "packet staging exceeds retired BF16 input");
+    const uint32_t stage_ub = hierarchical ? p.ub - reserved : p.ub;
     TORCH_CHECK(!hierarchical || stage_ub >= MegaMoeImpl::CalcGatewayCombineReduceUbBytes(&t),
                 "Not enough UB for gateway readiness and FP32 reduction");
     t.roceScratchUbOffset = hierarchical ? stage_ub : 0U;
-    t.sharedExpertNum = static_cast<uint32_t>(shared_experts);
     t.combineSyncSlotCountPerExpert = 0;
     t.topkWeightsPrefetch = 0;
     t.maxTilesPerExpert = 0;
@@ -323,6 +326,14 @@ MegaMoeTilingData MakeTiling(int64_t bs, int64_t h, int64_t hidden_dim, int64_t 
     t.dispatchBufferConfig = DispatchConfig(t, stage_ub);
     SetSendMaskConfigs(t, stage_ub);
     SetUnpermuteConfigs(t, stage_ub);
+    if (MegaMoeImpl::UseSharedRouteTable(&t)) {
+        const uint64_t record = MegaMoeImpl::CalcRailTopkIdsSlotDataBytes(t.bs, t.topK);
+        const uint64_t table = AlignUp<uint64_t>(32ULL * t.moeExpertPerRank * 4U, 256U);
+        const uint64_t masks = 2U * AlignUp<uint64_t>(t.bs, 8U) + 8U;
+        const uint64_t plan = AlignUp<uint64_t>(static_cast<uint64_t>(t.bs) * t.topK * 4U, 256U) + masks * 4U;
+        TORCH_CHECK(plan <= stage_ub, "insufficient UB for compact token plan");
+        TORCH_CHECK(table + 16U * record + 16U * 256U <= stage_ub, "insufficient UB for host route histogram");
+    }
     return t;
 }
 

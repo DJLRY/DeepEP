@@ -168,7 +168,7 @@ class Runtime:
                         ]
                     )
                 local_values.append(
-                    (16 << 8 if self.use_roce else 0)
+                    (int(getattr(native, "megamoe_combine_qps", 0)) << 8 if self.use_roce else 0)
                     + int(udma)
                     + 2 * int(combine_only)
                     + 4 * int(dense_qps)
@@ -220,13 +220,14 @@ class Runtime:
                         if sorted(host_ranks) != expected:
                             raise ValueError("ranks_per_node=16 requires contiguous groups of 16 ranks per Linux host")
                     if self.use_roce:
-                        if any(value[8] == 0 for value in values):
+                        backends = {value[8] for value in values}
+                        if 0 not in backends and len(backends) > 1:
+                            raise ValueError("Ranks disagree on SHMEM RDMA backend")
+                        if backends != {2}:
                             raise RuntimeError(
-                                "MegaMoE cross-host ranks_per_node=16 requires an XSCALE or HNS_1825 SHMEM SDK "
+                                "MegaMoE cross-host ranks_per_node=16 requires HNS_1825 SHMEM SDK "
                                 "matching the wheel; rebuild SHMEM with --rdma-backend and rebuild the wheel"
                             )
-                        if any(value[8] != values[0][8] for value in values):
-                            raise ValueError("Ranks disagree on SHMEM RDMA backend")
             self.rank, self.world_size = rank, size
             self.capacity = capacity
             self.notify_lock = threading.RLock()

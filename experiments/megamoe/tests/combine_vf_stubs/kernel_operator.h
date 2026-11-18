@@ -11,7 +11,7 @@ constexpr uint32_t GetVecLen()
 {
     return 256U;
 }
-enum class CMPMODE { EQ, NE };
+enum class CMPMODE { EQ, NE, LT };
 namespace Reg {
 enum class MaskPattern { ALL };
 enum class MaskMergeMode { ZEROING, MERGING };
@@ -96,12 +96,26 @@ void Gather(RegTensor<T>& dst, T* src, const RegTensor<uint32_t>& offsets, const
             dst.lanes[i] = src[offsets.lanes[i]];
         }
 }
+template <class T>
+void ShiftRights(RegTensor<T>& dst, const RegTensor<T>& src, int16_t n, const MaskReg& mask)
+{
+    for (size_t i = 0; i < dst.lanes.size(); ++i)
+        if (mask.lanes[i]) dst.lanes[i] = src.lanes[i] >> n;
+}
+template <class T>
+void And(RegTensor<T>& dst, const RegTensor<T>& a, const RegTensor<T>& b, const MaskReg& mask)
+{
+    for (size_t i = 0; i < dst.lanes.size(); ++i)
+        if (mask.lanes[i]) dst.lanes[i] = a.lanes[i] & b.lanes[i];
+}
 template <typename T, CMPMODE Mode>
 void Compares(MaskReg& dst, const RegTensor<T>& src, T expected, const MaskReg& mask)
 {
     dst = {};
     for (size_t i = 0; i < src.lanes.size(); ++i)
-        dst.lanes[i] = mask.lanes[i] && (Mode == CMPMODE::EQ ? src.lanes[i] == expected : src.lanes[i] != expected);
+        dst.lanes[i] = mask.lanes[i] && (Mode == CMPMODE::EQ   ? src.lanes[i] == expected
+                                         : Mode == CMPMODE::LT ? src.lanes[i] < expected
+                                                               : src.lanes[i] != expected);
 }
 template <typename T, MaskMergeMode Merge = MaskMergeMode::ZEROING>
 void Add(RegTensor<T>& dst, const RegTensor<T>& left, const RegTensor<T>& right, const MaskReg& mask)
@@ -137,8 +151,28 @@ void StoreUnAlign(T*& dst, const RegTensor<T>& src, UnalignRegForStore&, uint32_
     std::copy_n(src.lanes.begin(), count, dst);
     dst += count;
 }
+enum class GatherMaskMode { STORE_REG };
+enum class SpecialPurposeReg { AR };
+inline uint32_t packedLanes;
+template <SpecialPurposeReg>
+void ClearSpr()
+{
+    packedLanes = 0;
+}
+template <class T, GatherMaskMode>
+void GatherMask(RegTensor<T>& dst, const RegTensor<T>& src, const MaskReg& m)
+{
+    packedLanes = 0;
+    for (uint32_t i = 0; i < src.lanes.size(); ++i)
+        if (m.lanes[i]) dst.lanes[packedLanes++] = src.lanes[i];
+}
+template <class T>
+void StoreUnAlign(T*& dst, const RegTensor<T>& src, UnalignRegForStore& stream)
+{
+    StoreUnAlign<T, PostLiteral::POST_MODE_UPDATE>(dst, src, stream, packedLanes);
+}
 template <typename T>
-void StoreUnAlignPost(T*, UnalignRegForStore&, int)
+void StoreUnAlignPost(T*, UnalignRegForStore&, int = 0)
 {
 }
 template <typename T, LoadDist Dist>

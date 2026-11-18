@@ -16,7 +16,10 @@ PYBIND11_MODULE(_C, module)
 {
     using deepep::megamoe::Plan;
     module.attr("api_protocol") = 17;
-    module.attr("combine_reduce_version") = 3;
+    module.attr("combine_reduce_version") = deepep::megamoe_config::PROTOCOL;
+    module.attr("combine_qps") = deepep::megamoe_config::COMBINE_QPS;
+    module.attr("dispatch_qps") = deepep::megamoe_config::DISPATCH_QPS;
+    module.attr("dispatch_workers") = deepep::megamoe_config::DISPATCH_WORKERS;
     module.attr("small_batch_max_tokens") = MegaMoeImpl::W4A8_SMALL_BATCH_MAX_TOKENS;
     module.attr("hierarchical_max_tokens") = MegaMoeImpl::HIERARCHICAL_MAX_TOKENS;
     module.def("buffer_size", &deepep::megamoe::buffer_size, py::arg("world"), py::arg("experts"), py::arg("tokens"),

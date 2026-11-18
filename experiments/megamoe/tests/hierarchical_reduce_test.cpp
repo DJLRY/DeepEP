@@ -227,6 +227,11 @@ void DataCopy(GlobalTensor<T> dst, LocalTensor<T> src, uint32_t count)
     std::memcpy(dst.data, src.data, count * sizeof(T));
 }
 template <typename T>
+void Duplicate(LocalTensor<T> dst, T value, uint32_t count)
+{
+    std::fill_n(dst.data, count, value);
+}
+template <typename T>
 void DataCopy(LocalTensor<T> dst, LocalTensor<T> src, uint32_t count)
 {
     std::memmove(dst.data, src.data, count * sizeof(T));
@@ -386,6 +391,13 @@ inline int64_t GetSystemCycle()
     return ++ReduceTest::cycle;
 }
 }  // namespace AscendC
+
+template <auto Function>
+void asc_vf_call(uint32_t* ids, uint32_t* masks, int32_t* tokens, int32_t* count, uint32_t rows, uint32_t topK,
+                 uint32_t first, uint32_t width)
+{
+    Function(ids, masks, tokens, count, rows, topK, first, width);
+}
 
 template <auto Function>
 void asc_vf_call(uint32_t* tails, uint32_t* result, uint32_t packets, uint32_t topk, uint32_t mask, uint32_t sequence)
@@ -550,12 +562,84 @@ inline void WaitUntilGmFlagEquals(int32_t* address, int32_t expected)
 }  // namespace MegaMoeImpl
 #include "../csrc/kernels/mega_moe/stage/mega_moe_hierarchical_reduce.hpp"
 #include "../csrc/kernels/mega_moe/stage/mega_moe_route_histogram.hpp"
+#include "../csrc/kernels/mega_moe/stage/mega_moe_dispatch_packet_vf.hpp"
 #include "../csrc/kernels/mega_moe/stage/mega_moe_unpermute.hpp"
 
 namespace MegaMoeImpl {
 /* PRODUCTION_WEIGHT_PACKER */
+/* DISPATCH_ROW_TYPES */
+struct TokenDispatchConfig {
+    uint32_t quantTokenScaleAlignBytes;
+};
+template <class T>
+struct TokenDispatchScratch {
+    LocalTensor<int32_t> validTopkIndexTensor;
+    uint32_t gatewayReady = 0;
+};
+std::vector<DispatchRow> copiedRows;
+template <class A, class Q, bool Prefetch>
+void IssueDispatchRow(const TokenDispatchConfig&, const Params&, GM_ADDR*, TokenDispatchScratch<A>&,
+                      DispatchCopyProgress&, const DispatchRow& row)
+{
+    copiedRows.push_back(row);
+}
+#define ACLSHMEMI_RDMA_K_BACKEND_HNS_1825 1
+/* PRODUCTION_DISPATCH_QUEUE */
+#undef ACLSHMEMI_RDMA_K_BACKEND_HNS_1825
 }
 using namespace MegaMoeImpl;
+
+void CheckDeferredRows()
+{
+    using namespace ReduceTest;
+    MegaMoeTilingData tiling{};
+    tiling.epWorldSize = 32;
+    tiling.dispatchRanksPerNode = 16;
+    tiling.topoType = TOPO_TYPE_MTE_ROCE;
+    tiling.topK = 2;
+    tiling.hierarchicalSequence = 259;
+    tiling.roceScratchUbOffset = 8192;
+    constexpr uint32_t packets = 2;
+    std::vector<uint8_t> heap(32 * 1024);
+    std::vector<uint8_t> second(heap.size());
+    Params params{&tiling, {}};
+    params.peermemInfo.rankSyncInWorldPtr = heap.data();
+    params.peermemInfo.relayPayloadPtr = heap.data() + 8192;
+    params.peermemInfo.gatewayPayloadReadyPtr = heap.data();
+    GM_ADDR peers[32]{};
+    peers[0] = heap.data();
+    peers[1] = second.data();
+    auto mark = [&](auto& memory, int token, int packet) {
+        auto* tail = memory.data() + 8192 + ((token * packets + packet + 1) * 512) - 4;
+        std::memcpy(tail, &tiling.hierarchicalSequence, 4);
+    };
+    TokenDispatchConfig config{640U};
+    std::array<int32_t, 9> routes;
+    TokenDispatchScratch<int> scratch{LocalTensor<int32_t>(routes.data())};
+    DispatchCopyProgress progress{};
+    for (int i = 0; i < 9; ++i) {
+        routes[i] = 2 * i;
+        mark(heap, i, 1);
+        if (i != 2) mark(heap, i, 0);
+    }
+    CopyTokensAndMetaForDispatch<int, int, false>(config, params, peers, scratch, 100, 16, 0, 9, progress);
+    Check(progress.deferredCount == 1 && copiedRows.size() == 8, "late row blocked other rows");
+    routes.fill(13);
+    mark(second, 6, 0);
+    mark(second, 6, 1);
+    CopyTokensAndMetaForDispatch<int, int, false>(config, params, peers, scratch, 50, 17, 0, 1, progress);
+    Check(progress.deferredCount == 1 && copiedRows.back().destination == 50, "late source blocked another source");
+    mark(heap, 2, 0);
+    ProbeDeferredDispatch<int, int, false>(config, params, peers, scratch, progress);
+    Check(!progress.deferredCount && copiedRows.back().route == 4 && copiedRows.back().source == 16 &&
+              copiedRows.back().destination == 102 && copiedRows.size() == 10,
+          "deferred row lost original coordinates");
+    std::memcpy(heap.data(), &tiling.hierarchicalSequence, 4);
+    const auto before = flagDmas;
+    CopyTokensAndMetaForDispatch<int, int, false>(config, params, peers, scratch, 81, 16, 0, 1, progress);
+    Check(flagDmas == before && copiedRows.back().destination == 81, "complete gateway probed packet tails");
+    copiedRows.clear();
+}
 
 void CheckCase(uint32_t sourceRank, uint32_t bs, uint32_t capacity, uint32_t topk, uint32_t hidden, uint32_t pattern,
                uint32_t sequence, bool shared)
@@ -723,7 +807,10 @@ void CheckCase(uint32_t sourceRank, uint32_t bs, uint32_t capacity, uint32_t top
         const size_t beforeIncomplete = posts.size();
         for (activeLane = 0; activeLane < qps; ++activeLane)
             TryProgressHierarchicalReducedCombine(gwCommon, params, state[activeLane], activeLane, scratch, &timer);
-        Check(posts.size() == beforeIncomplete, "partial packet row reduced or posted");
+        for (size_t p = beforeIncomplete; p < posts.size(); ++p) {
+            const auto sent = (posts[p].source - gateway.combinePartialSendPtr) / (hidden * 4U);
+            Check(published[sent] == masks[sent] && sent != token, "partial packet row reduced or posted");
+        }
         words[missing * 128U + 127U] = sequence;
         Check(GatewayCombinePacketReadyMask(params, token, uint32_t{1} << k) == (uint32_t{1} << k),
               "complete packet row not ready");
@@ -899,6 +986,73 @@ void CheckRouteHistograms()
     }
 }
 
+void CheckHostRouteHistograms()
+{
+    using namespace ReduceTest;
+    auto* ids = reinterpret_cast<uint32_t*>(ub.data());
+    constexpr uint32_t stride = 256, items = 193;
+    auto* bins = reinterpret_cast<uint16_t*>(ids + 16 * stride);
+    auto* table = reinterpret_cast<uint32_t*>(bins + 16 * 128);
+    for (uint32_t experts : {12U, 13U}) {
+        std::vector<uint32_t> expected(experts * 32);
+        for (uint32_t host : {1U, 0U}) {
+            for (uint32_t s = 0; s < 16; ++s) {
+                auto* record = ids + s * stride;
+                for (uint32_t j = 0; j < stride; ++j) {
+                    record[j] = j % 11 == 0 ? ~0U : (j * 3 + s * host + s) % (experts + 3);
+                    if (j < items && record[j] < experts) ++expected[record[j] * 32 + host * 16 + s];
+                }
+            }
+            CountRouteSourceVF(ids, bins, items, 0U, 16U, stride);
+            TransposeRouteBinsVF(reinterpret_cast<uint32_t*>(bins), table, host * 16, experts);
+        }
+        Check(std::equal(expected.begin(), expected.end(), table), "incorrect 16-source histogram transpose");
+    }
+}
+
+void CheckRoutePlansAndPackets()
+{
+    using namespace ReduceTest;
+    auto* ids = reinterpret_cast<uint32_t*>(ub.data());
+    auto* masks = ids + 1024;
+    auto* list = reinterpret_cast<int32_t*>(masks + 256);
+    auto* count = list + 256;
+    for (uint32_t rows : {32U, 65U, 96U, 128U}) {
+        for (uint32_t row = 0; row < rows; ++row)
+            for (uint32_t k = 0; k < 6; ++k) ids[row * 6 + k] = row % 3 == 0 ? 0xffffffffU : (row + k) * 7U % 416U;
+        RouteHostMasksVF<true>(ids, masks, list, count, rows, 6, 208, 208);
+        int32_t n = 0;
+        for (uint32_t row = 0; row < rows; ++row) {
+            uint32_t expected = 0;
+            for (uint32_t k = 0; k < 6; ++k)
+                if (ids[row * 6 + k] >= 208 && ids[row * 6 + k] < 416) expected |= 1U << k;
+            Check(masks[row] == expected, "incorrect host mask");
+            if (expected) Check(list[n++] == static_cast<int32_t>(row), "unstable compact token order");
+        }
+        Check(*count == n, "incorrect compact count");
+        RouteHostMasksVF<false>(ids, masks, nullptr, nullptr, rows, 6, 208, 208);
+        for (uint32_t row = 0; row < rows; ++row) {
+            uint32_t expected = 0;
+            for (uint32_t k = 0; k < 6; ++k)
+                if (ids[row * 6 + k] < 208) expected |= 1U << k;
+            Check(masks[(rows + 7U) / 8U * 8U + row] == expected, "incorrect local mask for output");
+        }
+    }
+    for (uint32_t words : {120U, 121U, 912U, 1320U}) {
+        for (uint32_t i = 0; i < words; ++i) ids[i] = i + 1;
+        const uint32_t packets = (words + 119U) / 120U;
+        auto* dst = ids + 2048;
+        std::fill_n(dst, packets * 128U, ~0U);
+        PackDispatchVF(ids, dst, words, packets, 259U);
+        for (uint32_t p = 0; p < packets; ++p)
+            for (uint32_t j = 0; j < 128; ++j)
+                Check(dst[p * 128 + j] == (j == 127                         ? 259U
+                                           : j < 120 && p * 120 + j < words ? ids[p * 120 + j]
+                                                                            : 0U),
+                      "incorrect dispatch payload, padding or sequence");
+    }
+}
+
 void CheckFusedRowNumerics()
 {
     using namespace ReduceTest;
@@ -947,7 +1101,10 @@ void CheckFusedRowNumerics()
 int main()
 {
     try {
+        CheckDeferredRows();
+        CheckRoutePlansAndPackets();
         CheckRouteHistograms();
+        CheckHostRouteHistograms();
         CheckBatchSnapshots();
         CheckFusedRowNumerics();
         for (uint32_t rank : {0U, 21U})

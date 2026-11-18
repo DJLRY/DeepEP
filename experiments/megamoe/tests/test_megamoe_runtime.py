@@ -96,9 +96,10 @@ def test_megamoe_bootstrap(monkeypatch, backend, case):
         (32, 16, "qp-mismatch", "QP configuration"),
         (16, 16, "no-rdma", None),
         (32, 8, "no-rdma", None),
-        (32, 16, "no-rdma", "requires an XSCALE or HNS_1825"),
-        (32, 16, "sdk-mismatch", "requires an XSCALE or HNS_1825"),
-        (32, 16, "peer-no-rdma", "requires an XSCALE or HNS_1825"),
+        (32, 16, "no-rdma", "requires HNS_1825"),
+        (32, 16, "xscale", "requires HNS_1825"),
+        (32, 16, "sdk-mismatch", "requires HNS_1825"),
+        (32, 16, "peer-no-rdma", "requires HNS_1825"),
         (32, 16, "backend-mismatch", "disagree on SHMEM RDMA backend"),
         (32, 16, "interleaved", "contiguous groups of 16"),
         (32, 16, "one-host", "contiguous groups of 16"),
@@ -115,7 +116,8 @@ def test_megamoe_roce_collective_bootstrap(monkeypatch, world, ranks_per_node, c
         Runtime=lambda *args: pytest.fail("Unexpected core runtime"),
         runtime_busy=lambda: False,
         create_megamoe_runtime=lambda *args: created.append(args) or SimpleNamespace(close=lambda **kwargs: None),
-        shmem_rdma_backend="NONE" if case == "no-rdma" else "XSCALE",
+        shmem_rdma_backend="NONE" if case == "no-rdma" else ("XSCALE" if case == "xscale" else "HNS_1825"),
+        megamoe_combine_qps=16,
         shmem_sdk_matches=case != "sdk-mismatch",
     )
     monkeypatch.setattr(_runtime, "require_native", lambda operation: native)
@@ -145,7 +147,7 @@ def test_megamoe_roce_collective_bootstrap(monkeypatch, world, ranks_per_node, c
                 if case == "peer-no-rdma":
                     peer[8] = 0
                 elif case == "backend-mismatch":
-                    peer[8] = 2
+                    peer[8] = 1
                 elif case == "config-mismatch":
                     peer[7] = 8
                 elif case == "qp-mismatch":

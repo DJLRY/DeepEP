@@ -61,7 +61,11 @@ void checkPlanDomains()
         t.sharedExpertNum = dsv ? 1 : 0;
         t.sharedFp8 = dsv;
         assert(UseSharedRouteTable(&t));
+#ifdef ACLSHMEMI_RDMA_K_BACKEND_HNS_1825
         assert(UseEarlyClosure(&t) == (bs == 32 || dsv));
+#else
+        assert(!UseEarlyClosure(&t));
+#endif
         assert(UseAiv0CombineOwners(&t) == (bs != 96));
         for (uint32_t count = 1; count <= bs; ++count)
             for (uint32_t lane = 0; lane < 16; ++lane)

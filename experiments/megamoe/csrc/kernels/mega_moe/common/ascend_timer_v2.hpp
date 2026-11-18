@@ -73,7 +73,29 @@ enum DynamicTimingType {
 
 enum class RdmaPhase : uint32_t { DispatchMeta = 0, DispatchPayload = 1, Combine = 2 };
 
-enum class RelayStep : uint32_t { PacketWait = 0, TopkLoad, RouteBuild, RoutePost, RouteComplete, CountPublish };
+enum class RelayStep : uint32_t {
+    PacketWait = 0,
+    TopkLoad,
+    RouteBuild,
+    RoutePost,
+    RouteComplete,
+    CountPublish,
+    MetaPack,
+    Clos,
+    Mesh,
+    SourceWait,
+    LocalRoute,
+    TableWait,
+    Histogram,
+    CompactPlan,
+    RouteRead,
+    FlagCheck,
+    Retry,
+    Backoff,
+    PayloadCopy,
+    Drain,
+    TilePublish
+};
 // Reuses the historical ASYNC family without changing timer buffer dimensions.
 enum class CombineRowPhase : uint32_t { Lifetime = 1, Issue = 2, ReuseWait = 3 };
 

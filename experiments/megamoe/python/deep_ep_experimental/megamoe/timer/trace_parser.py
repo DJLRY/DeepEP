@@ -78,14 +78,16 @@ def apply_input_sync_mode(events, mode):
     return result
 
 
+RELAY_WAITS = {"packet_wait", "route_complete", "source_wait", "table_wait", "dispatch_backoff"}
+
+
 def apply_wait_mode(events, include_wait):
     if include_wait:
         return events
     return [
         event
         for event in events
-        if "WAIT" not in event["name"]
-        and event.get("task", {}).get("relay_step") not in ("packet_wait", "route_complete")
+        if "WAIT" not in event["name"] and event.get("task", {}).get("relay_step") not in RELAY_WAITS
     ]
 
 
@@ -217,8 +219,16 @@ def trace_events(
             wave_metadata["display_index_semantics"] = "per_core_startup_phase_or_dependency"
         if granularity == "relay_step":
             lane += "/RELAY"
-            category = "relay_wait" if task["relay_step"] in ("packet_wait", "route_complete") else "relay"
-            display_name = f"RELAY_{task['relay_step']}_source{task['source_rank']}_experts{task['first_expert']}+{task['expert_count']}"
+            category = "relay_wait" if task["relay_step"] in RELAY_WAITS else "relay"
+            display_name = f"RELAY_{task['relay_step']}"
+            if "source_rank" in task:
+                display_name += f"_source{task['source_rank']}"
+            if "first_expert" in task:
+                display_name += f"_experts{task['first_expert']}+{task['expert_count']}"
+            if "source_host" in task:
+                display_name += f"_host{task['source_host']}"
+            if "consumer_rank" in task:
+                display_name += f"_rank{task['consumer_rank']}_rows{task['row_start']}+{task['row_count']}"
             wave_metadata["display_index_semantics"] = "per_core_relay_step"
         if granularity == "combine_run":
             lane += "/COMBINE_RUN"
@@ -297,6 +307,13 @@ def write_startup_breakdown(raw_by_rank, path: Path):
         "poll_rounds",
         "lane_count",
         "relay_step",
+        "source_host",
+        "consumer_rank",
+        "row_start",
+        "row_count",
+        "items",
+        "bytes",
+        "packets",
         "first_expert",
         "expert_count",
         "snapshot_attempts",
@@ -353,7 +370,9 @@ def write_startup_breakdown(raw_by_rank, path: Path):
                         core_type=event["core_type"],
                         sub_id=event["sub_id"],
                         event_family=family,
-                        scope="envelope" if family in parents else "phase",
+                        scope="envelope"
+                        if family in parents or task.get("relay_step") in {"local_route", "dispatch_retry", "mesh_copy"}
+                        else "phase",
                         start_us=f"{(event['start_cycle'] - base) / CYCLE_TO_US:.6f}",
                         duration_us=f"{(event['end_cycle'] - event['start_cycle']) / CYCLE_TO_US:.6f}",
                         **{key: task.get(key, "") for key in ("source_rank", "gateway_rank", "sequence")},

@@ -63,6 +63,7 @@ add_custom_command(OUTPUT "${kernel_library}"
         -lruntime -lascendcl -lshmem -lgraph_base -ltiling_api -lplatform -lregister -ldl -lstdc++ -lm
         -o "${kernel_library}"
     DEPENDS csrc/kernels/mega_moe/mega_moe.cpp csrc/kernel_launch.hpp ${kernel_headers}
+        "${PROJECT_SOURCE_DIR}/csrc/common/megamoe_combine_config.hpp"
     WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}" VERBATIM)
 add_custom_target(megamoe_device DEPENDS "${kernel_library}")
 pybind11_add_module(megamoe_ext csrc/bindings.cpp csrc/forward.cpp)

@@ -75,7 +75,29 @@ DYNAMIC_NAMES = [
 ]
 
 RDMA_PHASES = ("dispatch_meta", "dispatch_payload", "combine")
-RELAY_STEPS = ("packet_wait", "topk_load", "route_build", "route_post", "route_complete", "count_publish")
+RELAY_STEPS = (
+    "packet_wait",
+    "topk_load",
+    "route_build",
+    "route_post",
+    "route_complete",
+    "count_publish",
+    "meta_pack",
+    "clos_copy",
+    "mesh_copy",
+    "source_wait",
+    "local_route",
+    "table_wait",
+    "host_histogram",
+    "compact_plan",
+    "dispatch_route_read",
+    "dispatch_flag_check",
+    "dispatch_retry",
+    "dispatch_backoff",
+    "dispatch_payload_copy",
+    "dispatch_drain",
+    "dispatch_tile_publish",
+)
 COMBINE_RUN_STOPS = ("tensor_end", "route_gap", "producer_not_ready", "scan_budget")
 COUNT_DIAGNOSTIC_NAMES = [
     "COUNT_PROFILE_VALID",
@@ -232,11 +254,12 @@ def task_metadata(raw, core_id, logical_index):
     if family == "AIV_COMBINE_READY":
         qp, token = (first >> 32) & mask, first & mask
         pending, observed = (second >> 32) & mask, second & mask
-        if not (1 <= qp <= 8 and token < 256) or observed & ~pending:
+        if not (1 <= qp <= 16 and token < 256) or observed & ~pending:
             raise ValueError(f"invalid Combine ready snapshot: core={core_id}, slot={dynamic_index}")
         return dict(
             granularity="combine_ready",
             qp_index=qp,
+            lane_count=16,
             token_index=token,
             pending_topk_mask=pending,
             observed_ready_mask=observed,
@@ -246,17 +269,20 @@ def task_metadata(raw, core_id, logical_index):
     if family == "AIV_COMBINE_SYNC":
         qp, phase = (first >> 32) & mask, first & mask
         phases = ("before_export_sync", "after_export_sync", "before_host_barrier", "after_host_barrier")
-        if not (1 <= qp <= 8 and 1 <= phase <= len(phases) and 0 <= second <= 8192):
+        if not (1 <= qp <= 16 and 1 <= phase <= len(phases) and 0 <= second <= 8192):
             raise ValueError(f"invalid Combine sync marker: core={core_id}, slot={dynamic_index}")
-        return dict(granularity="combine_sync", qp_index=qp, sync_phase=phases[phase - 1], pending_rows=second)
+        return dict(
+            granularity="combine_sync", qp_index=qp, lane_count=16, sync_phase=phases[phase - 1], pending_rows=second
+        )
     if family == "AIV_COMBINE_REDUCE":
         qp, token = (first >> 32) & mask, first & mask
         topk_mask, hidden = (second >> 32) & mask, second & mask
-        if not (1 <= qp <= 8 and token < 256 and topk_mask and 1024 <= hidden <= 8192 and hidden % 64 == 0):
+        if not (1 <= qp <= 16 and token < 256 and topk_mask and 1024 <= hidden <= 8192 and hidden % 64 == 0):
             raise ValueError(f"invalid combine reduction metadata: core={core_id}, slot={dynamic_index}")
         return dict(
             granularity="combine_reduce",
             qp_index=qp,
+            lane_count=16,
             token_index=token,
             topk_mask=topk_mask,
             expert_rows=topk_mask.bit_count(),
@@ -266,13 +292,22 @@ def task_metadata(raw, core_id, logical_index):
         step, source = ((first >> 32) & mask), (first & mask) - 1
         if step >= len(RELAY_STEPS) or source < 0:
             raise ValueError(f"invalid relay metadata: core={core_id}, slot={dynamic_index}")
-        return dict(
-            granularity="relay_step",
-            relay_step=RELAY_STEPS[step],
-            source_rank=source,
-            first_expert=(second >> 32) & mask,
-            expert_count=second & mask,
-        )
+        name = RELAY_STEPS[step]
+        a, b = (second >> 32) & mask, second & mask
+        if step < 6:
+            return dict(granularity="relay_step", relay_step=name, source_rank=source, first_expert=a, expert_count=b)
+        if name in ("clos_copy", "mesh_copy", "host_histogram", "table_wait"):
+            unit = {"clos_copy": "bytes", "mesh_copy": "bytes", "table_wait": "packets", "host_histogram": "items"}[
+                name
+            ]
+            return dict(granularity="relay_step", relay_step=name, source_host=source, **{unit: b})
+        if name == "source_wait":
+            return dict(granularity="relay_step", relay_step=name, source_rank=source, bytes=b)
+        if name in ("dispatch_payload_copy", "dispatch_route_read"):
+            return dict(granularity="relay_step", relay_step=name, source_rank=source, row_start=a, row_count=b)
+        if name.startswith("dispatch_"):
+            return dict(granularity="relay_step", relay_step=name, consumer_rank=source, row_start=a, row_count=b)
+        return dict(granularity="relay_step", relay_step=name, source_rank=source, items=b)
     if family == "AIV_COMBINE_RUN":
         start, rows = (first >> 32) & mask, first & mask
         reason = second & 0xFF
@@ -340,7 +375,9 @@ def task_metadata(raw, core_id, logical_index):
         kind = (second >> 32) & 255
         qp = (second >> 40) & 255
         row_start = (second >> 48) & 65535
-        if not (0 <= peer < 32 and 0 <= phase < len(RDMA_PHASES) and kind in (0, 1) and qp <= 8):
+        if not (
+            0 <= peer < 32 and 0 <= phase < len(RDMA_PHASES) and kind in (0, 1) and qp <= (16 if phase == 2 else 8)
+        ):
             raise ValueError(f"invalid RDMA metadata: core={core_id}, slot={dynamic_index}")
         result = dict(
             granularity="rdma",
@@ -351,7 +388,8 @@ def task_metadata(raw, core_id, logical_index):
         )
         if qp:
             result["qp"] = qp
-            if phase == 1:
+            if phase in (1, 2):
+                result["lane_count"] = 16 if phase == 2 else 8
                 result["lane"] = qp - 1
         if row_count:
             result.update(row_start=row_start, row_count=row_count, row_end=row_start + row_count)

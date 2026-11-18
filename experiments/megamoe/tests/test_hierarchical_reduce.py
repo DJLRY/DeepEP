@@ -26,6 +26,17 @@ def test_production_weighted_gateway_reduction_and_unpermute(tmp_path):
     kernel = directory.parent / "csrc/kernels/mega_moe"
     dispatch = (kernel / "stage/mega_moe_hierarchical_dispatch.hpp").read_text(encoding="utf-8")
     fixture = (directory / "hierarchical_reduce_test.cpp").read_text(encoding="utf-8")
+    token_dispatch = (kernel / "stage/mega_moe_token_dispatch.hpp").read_text(encoding="utf-8")
+    row_types = token_dispatch[
+        token_dispatch.index("struct DispatchRow {") : token_dispatch.index("struct DispatchRouteSegment")
+    ]
+    template = "template <typename ActivationType, typename QuantScaleType, bool TopkWeightsPrefetch>\n"
+    queue = "\n".join(
+        template + function_source(token_dispatch, name)
+        for name in ("ProbeDeferredDispatch", "CopyTokensAndMetaForDispatch")
+    )
+    queue = function_source(token_dispatch, "ObserveDispatchGateway") + "\n" + queue
+    fixture = fixture.replace("/* DISPATCH_ROW_TYPES */", row_types).replace("/* PRODUCTION_DISPATCH_QUEUE */", queue)
     source = tmp_path / "hierarchical_reduce.cpp"
     source.write_text(
         fixture.replace("/* PRODUCTION_WEIGHT_PACKER */", function_source(dispatch, "PackHierarchicalCombineWeights")),

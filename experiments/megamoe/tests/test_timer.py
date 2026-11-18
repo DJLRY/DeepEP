@@ -137,7 +137,15 @@ def test_startup_details_and_combine_decisions_round_trip(raw_file, tmp_path):
             *(stats.get(name, 0) for name in p.COUNT_DIAGNOSTIC_NAMES),
         )
         for family, records in (
-            ("AIV_RELAY_STEP", [((0 << 32) | 31, (168 << 32) | 12), ((5 << 32) | 31, (168 << 32) | 12)]),
+            (
+                "AIV_RELAY_STEP",
+                [
+                    ((0 << 32) | 31, (168 << 32) | 12),
+                    ((5 << 32) | 31, (168 << 32) | 12),
+                    ((7 << 32) | 2, 512),
+                    ((15 << 32) | 19, (8 << 32) | 3),
+                ],
+            ),
             ("AIV_COMBINE_RUN", [((7 << 32) | 1, 0x302), ((7 << 32) | 16, 0x401)]),
             ("AIV_COMBINE_REDUCE", [((4 << 32) | 31, (0x85 << 32) | 3584)]),
             (
@@ -170,7 +178,14 @@ def test_startup_details_and_combine_decisions_round_trip(raw_file, tmp_path):
     assert count["args"]["last_failed_local_expert_id"] == 5
     assert count["args"]["snapshot_dma_us"] == 6 and count["args"]["diagnostic_us"] == 0.7
     relay = [e for e in visible if e["args"].get("granularity") == "relay_step"]
-    assert [e["args"]["relay_step"] for e in relay] == ["packet_wait", "count_publish"]
+    assert [e["args"]["relay_step"] for e in relay] == [
+        "packet_wait",
+        "count_publish",
+        "clos_copy",
+        "dispatch_flag_check",
+    ]
+    assert relay[2]["args"]["source_host"] == 1 and relay[2]["args"]["bytes"] == 512
+    assert relay[3]["args"]["consumer_rank"] == 18 and relay[3]["args"]["rank"] == 0
     assert relay[0]["args"]["source_rank"] == 30 and relay[0]["args"]["first_expert"] == 168
     runs = [e["args"] for e in visible if e["args"].get("granularity") == "combine_run"]
     assert runs[0]["decision"] == "defer" and runs[0]["stop_reason"] == "producer_not_ready"
@@ -588,3 +603,46 @@ def test_multi_qp_payload_trace_ranges_and_collective_wait(raw_file):
         row = next(row for row in csv.DictReader(stream) if row["event_family"] == "AIV_PAYLOAD_ALL_LANES_WAIT")
     assert json.loads(row["initial_missing_lanes"]) == [0, 7]
     assert row["poll_rounds"] == "4"
+
+
+@pytest.mark.parametrize("qp", [9, 16, 17])
+@pytest.mark.parametrize(
+    "family,lo,second",
+    [
+        ("AIV_COMBINE_READY", 0, (1 << 32) | 1),
+        ("AIV_COMBINE_SYNC", 1, 0),
+        ("AIV_COMBINE_REDUCE", 0, (1 << 32) | 5120),
+    ],
+)
+def test_combine_trace_qp_boundaries(qp, family, lo, second):
+    from deep_ep_experimental.megamoe.timer import protocol as p
+
+    class Raw:
+        def __getitem__(self, _):
+            return [(qp << 32) | lo, second]
+
+    slot = len(p.FIXED_NAMES) + p.DYNAMIC_NAMES.index(family) * p.MAX_DYNAMIC_ITER
+    if qp > 16:
+        with pytest.raises(ValueError):
+            p.task_metadata(Raw(), 0, slot)
+    else:
+        decoded = p.task_metadata(Raw(), 0, slot)
+        assert (decoded["qp_index"], decoded["lane_count"]) == (qp, 16)
+
+
+@pytest.mark.parametrize("family", ["AIV_RDMA_POST", "AIV_RDMA_RECV_WAIT", "AIV_RDMA_QUIET_WAIT"])
+@pytest.mark.parametrize("phase,qp", [(1, 0), (1, 8), (1, 9), (2, 9), (2, 16), (2, 17)])
+def test_rdma_qp_is_phase_specific(family, phase, qp):
+    class Raw:
+        def __getitem__(self, _):
+            return [(17 << 32) | (phase + 1), (qp << 40) | 4096]
+
+    slot = len(p.FIXED_NAMES) + p.DYNAMIC_NAMES.index(family) * p.MAX_DYNAMIC_ITER
+    if qp > (16 if phase == 2 else 8):
+        with pytest.raises(ValueError, match="RDMA"):
+            p.task_metadata(Raw(), 0, slot)
+    else:
+        task = p.task_metadata(Raw(), 0, slot)
+        assert task.get("qp", 0) == qp
+        if qp:
+            assert task["lane_count"] == (16 if phase == 2 else 8)

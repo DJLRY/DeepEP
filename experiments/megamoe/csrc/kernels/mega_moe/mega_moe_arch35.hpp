@@ -130,6 +130,19 @@ protected:
     MoeStageCommonConfig commonConfig_{};
     GmmExecutionConfig gmmExecutionConfig_{};
     BlockWorkspaceContext countWorkspace_{};
+    HostClosureCursor hostClosure_{};
+    uint32_t confirmedPayloadLanes_ = 0U;
+    __aicore__ inline void ProgressGatewayHint()
+    {
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+        if constexpr (g_coreType == AIC) return;
+        if (params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData) && aivJob_.jobIndex == 1U)
+            ProgressHostClosure(params_, rankId_, false, hostClosure_);
+        if (UseHierarchicalRoce(params_.tilingData))
+            FinishHierarchicalDispatch(aivJob_, commonConfig_, params_, timer_.Enabled() ? &timer_ : nullptr,
+                                       &confirmedPayloadLanes_);
+#endif
+    }
     MoeSyncWorkspaceLayout syncWorkspaceLayout_{};
     // 单次 reset 批量元素数（与 syncWorkspaceLayout_ 描述的清零区域配套）。
     int32_t resetBatchElementCount_ = 0;
@@ -345,11 +358,15 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::DispatchBuffInit()
     if constexpr (g_coreType == AIC) {
         return;
     }
-    if (GetSubBlockIdx() != 1U) {
+    if (GetSubBlockIdx() != 1U && !(countWorkspace_.shared && blockIdx_ == 0U)) {
         return;
     }
 
     const MegaMoeDispatchBufferConfig& bufferConfig = context.bufferConfig;
+#ifdef DEEPEP_MEGAMOE_TIMER
+    scratch.trace = timer_.Enabled() ? &timer_ : nullptr;
+    scratch.traceRank = rankId_;
+#endif
     scratch.revTokenElemCnt = commonConfig_.tokenHiddenDim / A_ELEMS_PER_BYTE;
     scratch.revScaleElemCnt = Ops::Base::CeilDiv(static_cast<int64_t>(commonConfig_.tokenHiddenDim),
                                                  static_cast<int64_t>(MXFP_DIVISOR_SIZE)) *
@@ -975,6 +992,10 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
     if constexpr (g_coreType == AIV) {
         if (UseHierarchicalRoce(params_.tilingData)) {
             if (aivJob_.jobIndex == HierarchicalPackJob()) {
+#ifdef DEEPEP_MEGAMOE_TIMER
+                AscendTimerRelayScope pack(timer_.Enabled() ? &timer_ : nullptr, AscendTimer::RelayStep::MetaPack,
+                                           rankId_, 0U, commonConfig_.tokenNum);
+#endif
                 PackHierarchicalCombineWeights(commonConfig_, params_);
                 SendTopkIdsToRailServer(commonConfig_, g_winRankAddr_, sendMaskConfig_, params_, sendMaskScratch_,
                                         HierarchicalHost(rankId_), aivJob_.jobIndex);
@@ -987,9 +1008,6 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
     QuantizeLocalTokens<QuantMode, QuantOutType, ActivationType, TopkWeightsType, TopkWeightsPrefetch>(
         aivJob_, commonConfig_, params_, quantProcessConfig_, quantScratch_);
     if constexpr (g_coreType == AIV) {
-        if (UseHierarchicalRoce(params_.tilingData)) {
-            PackDispatchRows(aivJob_, commonConfig_, params_, quantProcessConfig_, quantScratch_);
-        }
         if (decodeInputReady_) {
             // Route/count owners differ from quant owners. Count readiness must
             // certify every local token/scale before any remote reader proceeds.
@@ -1021,6 +1039,14 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessInputPreparation
     ResetSyncStatus<TopkWeightsPrefetch>(aivJob_, params_, resetBatchElementCount_, resetTensor_);
     if constexpr (g_coreType == AIV) {
         timer_.End(AscendTimer::AIV_RESET);
+    }
+    if constexpr (g_coreType == AIV) {
+        if (countWorkspace_.shared && aivJob_.jobIndex == 0U) {
+            PipeBarrier<PIPE_ALL>();
+            DispatchBuffInit();
+            PrepareMoeExpertTokenCountTable<true>(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_,
+                                                  timer_.Enabled() ? &timer_ : nullptr);
+        }
     }
     if (sharedExpertNum_ > 0 && !(params_.tilingData->sharedFp8 && params_.inputScaleGmAddr &&
                                   commonConfig_.tokenNum <= 128U && CombineQuantMode == COMBINE_NO_QUANT)) {
@@ -1065,8 +1091,19 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         timer_.EndUnfenced(AscendTimer::AIV_INPUT_PREP_BARRIER_WAIT);
     }
 
+    if constexpr (g_coreType == AIV) {
+        // All reset DMAs and the builder's count exports precede this barrier.
+        if (countWorkspace_.shared && aivJob_.jobIndex == 0U)
+            WriteGmByPassDCache(reinterpret_cast<__gm__ int32_t*>(params_.workspaceInfo.flagSendCntCalToUpdParamsPtr),
+                                1);
+    }
+
     if (UseHierarchicalRoce(params_.tilingData)) {
+#if defined(ACLSHMEMI_RDMA_K_BACKEND_HNS_1825)
+        ProgressGatewayHint();
+#else
         FinishHierarchicalDispatch(aivJob_, commonConfig_, params_, timer_.Enabled() ? &timer_ : nullptr);
+#endif
     }
 
     int32_t gmm1TileReadySequence = 0;
@@ -1129,10 +1166,12 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
         const bool early = params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData);
         if (early) {
             if (GetSubBlockIdx() == 1U) PublishCoreClosure(params_, blockIdx_, true);
-            if (aivJob_.jobIndex == 32U) CloseHost(params_, rankId_, false);
-            if (aivJob_.jobIndex == 34U) CloseHost(params_, rankId_, true);
+            if (aivJob_.jobIndex == 1U) CloseHost(params_, rankId_, false, hostClosure_);
+            const uint32_t producerCoordinator =
+                params_.tilingData->aicNum > 16U ? 32U : (UseAiv0CombineOwners(params_.tilingData) ? 3U : 0U);
+            if (aivJob_.jobIndex == producerCoordinator) CloseHost(params_, rankId_, true, hostClosure_);
         }
-        if (UseAiv0CombineOwners(params_.tilingData) &&
+        if ((early || UseAiv0CombineOwners(params_.tilingData)) &&
             IsHierarchicalCombineOwner(params_.tilingData, aivJob_.jobIndex)) {
             // All local routed/shared prologues have returned with their final
             // L1 credits and UB/events released. No more matrix work depends
@@ -1143,6 +1182,15 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
             DrainHierarchicalReducedCombine(commonConfig_, params_, hierarchicalCombine_,
                                             HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex),
                                             HierarchicalRoceScratch(params_), timer_.Enabled() ? &timer_ : nullptr);
+            if (early) {
+                const uint32_t lane = HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex);
+                WaitUntilGmFlagEquals(ClosureSlot(params_, 96U), params_.tilingData->hierarchicalSequence);
+                RocePublishCommit(params_.peermemInfo.combineReduceCommitPtr + lane * HIERARCHICAL_FLAG_BYTES,
+                                  reinterpret_cast<GM_ADDR>(
+                                      HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::Sequence)),
+                                  HierarchicalGateway(rankId_), HierarchicalRoceScratch(params_),
+                                  timer_.Enabled() ? &timer_ : nullptr, AscendTimer::RdmaPhase::Combine, lane + 1U);
+            }
         }
         timer_.Start(AscendTimer::AIV_EXPORT_SYNC);
         ExportCompactExpertTokenCounts(commonConfig_, countWorkspace_, params_, tokenDispatchScratch_);
@@ -1186,9 +1234,7 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                                                      timer_.Enabled() ? &timer_ : nullptr, 3U);
                 }
                 if (params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData)) {
-                    if (owner)
-                        WaitUntilGmFlagEquals(ClosureSlot(params_, 96U), params_.tilingData->hierarchicalSequence);
-                    else
+                    if (!owner)
                         WaitUntilGmFlagEquals(ClosureSlot(params_, 97U), params_.tilingData->hierarchicalSequence);
                     AdvanceInputEpochLocally(params_.peermemInfo.rankSyncInWorldPtr, aivJob_);
                 } else {
@@ -1203,20 +1249,25 @@ __aicore__ inline void MegaMoe<TemplateMegaMoeTypeFunc>::ProcessWave(Derived& de
                 auto* scratch = HierarchicalRoceScratch(params_);
                 auto* rdmaTimer = timer_.Enabled() ? &timer_ : nullptr;
                 const uint32_t lane = HierarchicalCombineLane(params_.tilingData, aivJob_.jobIndex);
-                DrainHierarchicalReducedCombine(commonConfig_, params_, hierarchicalCombine_, lane, scratch, rdmaTimer);
+                const bool posted = params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData);
+                if (!posted)
+                    DrainHierarchicalReducedCombine(commonConfig_, params_, hierarchicalCombine_, lane, scratch,
+                                                    rdmaTimer);
                 auto* commit = reinterpret_cast<__gm__ int32_t*>(params_.peermemInfo.combineReduceCommitPtr +
                                                                  lane * HIERARCHICAL_FLAG_BYTES);
-                // Every lane commits after the host barrier, including empty lanes.
-                RocePublishCommit(reinterpret_cast<GM_ADDR>(commit),
-                                  reinterpret_cast<GM_ADDR>(
-                                      HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::Sequence)),
-                                  HierarchicalGateway(rankId_), scratch, rdmaTimer, AscendTimer::RdmaPhase::Combine,
-                                  lane + 1U);
+                // The generic path commits here. Early owners already posted, including empty lanes.
+                if (!posted)
+                    RocePublishCommit(reinterpret_cast<GM_ADDR>(commit),
+                                      reinterpret_cast<GM_ADDR>(
+                                          HierarchicalSignalAddress(params_.peermemInfo, HierarchicalSignal::Sequence)),
+                                      HierarchicalGateway(rankId_), scratch, rdmaTimer, AscendTimer::RdmaPhase::Combine,
+                                      lane + 1U);
                 RoceWaitCommit(commit, params_.tilingData->hierarchicalSequence, rdmaTimer,
                                AscendTimer::RdmaPhase::Combine, HierarchicalGateway(rankId_), scratch, lane + 1U);
             }
             PipeBarrier<PIPE_ALL>();
-            if (!(params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData))) SyncAll<true>();
+            if (!(params_.inputScaleGmAddr && UseEarlyClosure(params_.tilingData) && params_.tilingData->aicNum == 28))
+                SyncAll<true>();
         } else {
             CrossRankSyncInWorldSize(params_.peermemInfo.rankSyncInWorldPtr, rankId_, worldSize_, aivJob_);
         }
